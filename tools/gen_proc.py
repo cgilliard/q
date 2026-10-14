@@ -384,6 +384,8 @@ out = f"""\
 \\   yield   ( -- )            give up the rest of the quantum
 \\   sleep   ( ticks -- )      block for at least ticks mtime ticks (10 MHz)
 \\   msleep  ( ms -- )         the same in milliseconds
+\\   join    ( tid -- )        yield until thread tid has exited
+\\   quantum! ( ticks -- )     set the time slice (default 10 ms)
 \\   texit   ( -- )            end the calling thread (what }}thread emits)
 \\   getpid  ( -- tid )
 \\   code{{ ... }}code           like thread{{ but without the trailing exit
@@ -604,6 +606,9 @@ out = f"""\
 : getpid  ( -- tid )           3 lit syscall ;
 : sleep   ( ticks -- )         4 lit syscall ;
 : msleep  ( ms -- )            2710 lit * sleep ;     \\ 10000 ticks per ms
+: join    ( tid -- )           begin dup tcb 84 lit + @ 0= dup 0= if yield then until drop ;
+                                                      \\ wait until the slot is free
+: quantum! ( ticks -- )        K 24 lit + ! ;         \\ takes effect at the next arm
 
 \\ ── kinit ─────────────────────────────────────────────────────────────────────
 
@@ -639,6 +644,217 @@ out = f"""\
 {RESTORE}
     }}code mtvec!
     arm int_on ;
+
+\\ ── tests ─────────────────────────────────────────────────────────────────────
+\\ ./tools/fam --test src/proc.fam   (lib/build.fam makes the block vanish in a
+\\ normal build).  The suite runs on thread 0 after `kinit`, so the tests are
+\\ ordered: every test that spawns joins what it spawned and leaves the table as
+\\ it found it.  Words defined inside a body are ordinary definitions (the tests
+\\ run as straight-line code).  Timing tests use `_now` from lib/test.fam.
+\\ `0=` and friends yield -1 for true.
+
+Test {{
+	kinit {{
+		kinit
+		getpid 0 lit asrt_eq
+		cur 0 lit tcb asrt_eq
+		0 lit tcb 84 lit + @ 1 lit asrt_eq         \\ thread 0 runnable
+		0 lit tcb 88 lit + @ A lit asrt_eq         \\ 10 tickets
+		K 24 lit + @ 186A0 lit asrt_eq             \\ 10 ms quantum
+		ktab ntickets A lit asrt_eq
+		ktab nsleep 0 lit asrt_eq
+		ktab findfree 1 lit tcb asrt_eq            \\ slot 1 is the first free
+		K 1C lit + @ 0 lit slotof 1000 lit + asrt_eq
+		K 14 lit + @ 0 lit slotof 1C000 lit + asrt_eq
+	}}
+	table {{
+		3 lit tcb 0 lit tcb - 1E0 lit asrt_eq
+		10 lit 0 lit do
+			i tcb 8C lit + @ i asrt_eq             \\ pid = index
+			i tcb 84 lit + @ i 0= 1 lit and asrt_eq          \\ only 0 is live
+		loop
+		1 lit slotof 0 lit slotof - 20000 lit asrt_eq
+	}}
+	rand {{
+		K C lit + @                                \\ save the seed
+		1 lit K C lit + !
+		rand 42021 lit asrt_eq
+		rand 4080601 lit asrt_eq
+		rand 9DCCA8C5 lit asrt_eq
+		K C lit + !
+	}}
+	lottery {{
+		int_off
+		ktab 0 lit pickt 0 lit tcb asrt_eq
+		ktab 9 lit pickt 0 lit tcb asrt_eq
+		ktab A lit pickt 0 lit asrt_eq             \\ no holder of ticket 10
+		\\ a second runnable thread with 3 tickets
+		3 lit 5 lit tcb 88 lit + !  1 lit 5 lit tcb 84 lit + !
+		ktab ntickets D lit asrt_eq
+		ktab 9 lit pickt 0 lit tcb asrt_eq
+		ktab A lit pickt 5 lit tcb asrt_eq
+		ktab C lit pickt 5 lit tcb asrt_eq
+		ktab D lit pickt 0 lit asrt_eq
+		ktab findfree 1 lit tcb asrt_eq
+		0 lit 5 lit tcb 84 lit + !  0 lit 5 lit tcb 88 lit + !
+		int_on
+	}}
+	sleepers {{
+		int_off
+		\\ thread 5 asleep until (lo FFFFFFFF, hi 7FFFFFFF)
+		2 lit 5 lit tcb 84 lit + !
+		-1 lit 5 lit tcb 94 lit + !  7FFFFFFF lit 5 lit tcb 98 lit + !
+		ktab nsleep 1 lit asrt_eq
+		ktab ntickets A lit asrt_eq                \\ sleeping holds no tickets
+		ktab 0 lit pickt 0 lit tcb asrt_eq
+		ktab -1 lit -1 lit mindl 7FFFFFFF lit asrt_eq -1 lit asrt_eq
+		ktab 0 lit 0 lit mindl 0 lit asrt_eq 0 lit asrt_eq
+		ktab 5 lit 7FFFFFFF lit mindl 7FFFFFFF lit asrt_eq 5 lit asrt_eq
+		ktab 0 lit 80000000 lit mindl 7FFFFFFF lit asrt_eq -1 lit asrt_eq
+		ktab -2 lit 7FFFFFFF lit wakeup            \\ one tick early: still asleep
+		5 lit tcb 84 lit + @ 2 lit asrt_eq
+		ktab -1 lit 7FFFFFFF lit wakeup            \\ due now: runnable
+		5 lit tcb 84 lit + @ 1 lit asrt_eq
+		0 lit 5 lit tcb 84 lit + !
+		int_on
+	}}
+	tinit {{
+		: tsp variable ;
+		int_off
+		thread{{ }}thread 3 lit swap F lit tcb tinit
+		F lit tcb 84 lit + @ 1 lit asrt_eq
+		F lit tcb 88 lit + @ 3 lit asrt_eq
+		F lit tcb 8C lit + @ F lit asrt_eq
+		F lit tcb 8 lit + @ F lit slotof 1C000 lit + asrt_eq    \\ sp
+		F lit tcb C lit + @ F lit slotof 1000 lit + asrt_eq     \\ gp
+		F lit tcb 6C lit + @ F lit slotof 1000 lit + asrt_eq    \\ s11
+		F lit tcb 60 lit + @ F lit slotof 20000 lit + asrt_eq   \\ s8
+		F lit tcb 68 lit + @ 0 lit tcb 68 lit + @ asrt_eq       \\ s10 shared
+		F lit tcb 4 lit + @ 0 lit asrt_eq                       \\ ra zeroed
+		0 lit F lit tcb 84 lit + !
+		int_on
+	}}
+	spawn {{
+		: cnt variable ;
+		: tpid variable ;
+		0 lit cnt !
+		thread{{ getpid tpid ! 1 lit cnt ! }}thread 1 lit spawn
+		dup 1 lit asrt_eq
+		join
+		cnt @ 1 lit asrt_eq
+		tpid @ 1 lit asrt_eq
+		1 lit tcb 84 lit + @ 0 lit asrt_eq
+		ktab ntickets A lit asrt_eq
+		ktab findfree 1 lit tcb asrt_eq
+	}}
+	stacks {{
+		: tgp variable ;
+		: mgp variable ;
+		0 lit alloc mgp !
+		thread{{ sp@ tsp !  10 lit alloc tgp ! }}thread 1 lit spawn join
+		tsp @ 1 lit slotof 1000 lit + u> assert
+		tsp @ 1 lit slotof 1C000 lit + 4 lit + u< assert
+		tgp @ 1 lit slotof 1000 lit + asrt_eq
+		0 lit alloc mgp @ asrt_eq                  \\ thread allocs do not move ours
+	}}
+	yield {{
+		yield
+		0 lit sleep
+		getpid 0 lit asrt_eq
+	}}
+	tabfull {{
+		: flag variable ;
+		0 lit flag !
+		10 lit 1 lit do
+			thread{{ begin yield flag @ until }}thread 1 lit spawn i asrt_eq
+		loop
+		thread{{ }}thread 1 lit spawn 0 lit asrt_eq  \\ 16th: table full
+		ktab ntickets 19 lit asrt_eq
+		ktab findfree 0 lit asrt_eq
+		1 lit flag !
+		10 lit 1 lit do i join loop
+		ktab ntickets A lit asrt_eq
+		ktab findfree 1 lit tcb asrt_eq
+	}}
+	preempt {{
+		: ticks K 28 lit + @ ;
+		0 lit flag !  0 lit cnt !
+		thread{{ begin cnt @ 1 lit + cnt ! flag @ until }}thread 1E lit spawn
+		ticks _now
+		begin dup _now swap - 1E8480 lit u< 0= until drop     \\ spin 200 ms, no syscalls
+		cnt @ 0 lit u> assert                      \\ the spinner ran: we were preempted
+		ticks swap - 5 lit u> assert               \\ timer traps happened
+		1 lit flag !  join
+	}}
+	quantum {{
+		0 lit flag !  0 lit cnt !
+		3E8 lit quantum!                           \\ 1000 ticks = 0.1 ms
+		thread{{ begin cnt @ 1 lit + cnt ! flag @ until }}thread A lit spawn
+		ticks _now
+		begin dup _now swap - 186A0 lit u< 0= until drop      \\ 10 ms
+		ticks swap - 32 lit u> assert              \\ > 50 traps in 10 ms
+		186A0 lit quantum!
+		1 lit flag !  join
+	}}
+	sleep {{
+		_now 32 lit msleep _now swap -             \\ 50 ms
+		dup 7A120 lit u< 0= assert
+		4C4B40 lit u< assert
+		0 lit tcb 84 lit + @ 1 lit asrt_eq
+	}}
+	idle {{
+		ticks 64 lit msleep ticks swap -           \\ 100 ms with nothing runnable
+		3 lit u< assert                            \\ wfi until the wake-up, no tick storm
+	}}
+	sleeping {{
+		thread{{ C8 lit msleep }}thread 7 lit spawn
+		A lit msleep
+		dup tcb 84 lit + @ 2 lit asrt_eq
+		ktab nsleep 1 lit asrt_eq
+		ktab ntickets A lit asrt_eq
+		join
+		ktab nsleep 0 lit asrt_eq
+	}}
+	wakeorder {{
+		: wlog variable ;
+		: wlogn variable ;
+		: wlog! ( pid -- )  wlogn @ 1 lit + dup wlogn ! wlog + c! ;
+		0 lit wlogn !  0 lit wlog !
+		thread{{ 1E lit msleep getpid wlog! }}thread 1 lit spawn
+		thread{{ A lit msleep getpid wlog! }}thread 1 lit spawn
+		thread{{ 14 lit msleep getpid wlog! }}thread 1 lit spawn
+		join join join
+		wlogn @ 3 lit asrt_eq
+		wlog 1 lit + c@ 2 lit asrt_eq
+		wlog 2 lit + c@ 3 lit asrt_eq
+		wlog 3 lit + c@ 1 lit asrt_eq
+	}}
+	periodic {{
+		\\ a sleeper that wakes every 10 ms beside two busy threads (one of them
+		\\ yielding), with the thread body in a word and a do-loop on the thread's
+		\\ own loop stack: the shape of the old src/proc_demo.fam
+		: pcnt variable ;
+		: ptick ( -- tid )
+			thread{{ A lit 0 lit do pcnt @ 1 lit + pcnt ! A lit msleep loop }}thread 64 lit spawn ;
+		0 lit flag !  0 lit pcnt !
+		thread{{ begin flag @ until }}thread 4 lit spawn
+		thread{{ begin yield flag @ until }}thread 2 lit spawn
+		_now ptick join _now swap -                \\ 10 x 10 ms
+		dup F4240 lit u< 0= assert                 \\ >= 100 ms
+		4C4B40 lit u< assert                       \\ < 500 ms: wake-ups are not starved
+		pcnt @ A lit asrt_eq
+		1 lit flag !  join join
+	}}
+	fairness {{
+		: cnt2 variable ;
+		0 lit flag !  0 lit cnt !  0 lit cnt2 !
+		thread{{ begin cnt @ 1 lit + cnt ! flag @ until }}thread 1 lit spawn
+		thread{{ begin cnt2 @ 1 lit + cnt2 ! flag @ until }}thread 7 lit spawn
+		1F4 lit msleep                             \\ 500 ms: 50 quanta, 7:1 odds
+		1 lit flag !  join join
+		cnt2 @ cnt @ u> assert
+	}}
+}}
 """
 dst = os.path.join(ROOT, "src", "proc.fam")
 open(dst, "w").write(out)
