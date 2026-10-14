@@ -1,9 +1,9 @@
 #!/bin/sh
 set -e
 
-CPU="rv32,m=false,a=false,f=false,d=false,c=false,\
+CPU="rv32,zicsr=true,m=false,a=false,f=false,d=false,c=false,\
 zawrs=false,zfa=false,zfh=false,zfhmin=false,zcb=false,\
-zcd=false,zcf=false,zcmp=false,zcmt=false,zicsr=false,zifencei=false"
+zcd=false,zcf=false,zcmp=false,zcmt=false,zifencei=false"
 MEM="128M"
 
 serial_qemu() {  # serial_qemu INFILE OUTFILE [extra qemu args...]
@@ -111,6 +111,7 @@ run bin/gen_hash bin/fam lib/stdlib.fam lib/asm.fam src/gen_hash.fam
 run bin/tabernacle.uncompressed bin/fam0 src/tabernacle.fam0
 run bin/full_node.bin bin/fam lib/stdlib.fam lib/build.fam `cat scripts/files.txt`
 
+# bypass rid stack
 head -c 20480 /dev/zero >> bin/full_node.bin
 cat resources/akjv.txt.gz >> bin/full_node.bin
 patch_config bin/tabernacle.uncompressed bin/full_node.bin

@@ -21,9 +21,9 @@
 #   q32 --net --disk=node.bin bin/tabernacle
 #   printf '47653 0 10000 1 10.0.2.2:7701\004' | q32 --net bin/tabernacle
 
-CPU="rv32,m=false,a=false,f=false,d=false,c=false,\
+CPU="rv32,zicsr=true,m=false,a=false,f=false,d=false,c=false,\
 zawrs=false,zfa=false,zfh=false,zfhmin=false,zcb=false,\
-zcd=false,zcf=false,zcmp=false,zcmt=false,zicsr=false,zifencei=false"
+zcd=false,zcf=false,zcmp=false,zcmt=false,zifencei=false"
 FILE=""
 NET=0
 DISK=""
