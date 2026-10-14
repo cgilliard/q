@@ -110,6 +110,7 @@ pack bin/fam.uncompressed bin/fam
 run bin/gen_hash bin/fam lib/stdlib.fam lib/asm.fam src/gen_hash.fam
 run bin/tabernacle.uncompressed bin/fam0 src/tabernacle.fam0
 run bin/full_node.bin bin/fam lib/stdlib.fam lib/build.fam `cat scripts/files.txt`
+run bin/proc_demo bin/fam lib/stdlib.fam lib/build.fam src/proc.fam src/proc_demo.fam
 
 # bypass rid stack
 head -c 20480 /dev/zero >> bin/full_node.bin

@@ -1,0 +1,31 @@
+\ src/proc_demo.fam — exercise src/proc.fam.
+\   threads 1, 2, 3 (1:2:4 tickets) print their pid 20 times with a busy delay
+\     between characters; thread 3 also yields after each one
+\   thread 4 prints 'S' ten times, sleeping 50 ms in between
+\   the main thread prints 'M' 20 times, sleeps 500 ms, then sleeps 10 s
+\ With a 10 ms quantum the busy threads interleave, weighted toward the thread
+\ with more tickets; the sleeper lands wherever its wake-ups fall.  Once the busy
+\ threads are done only sleepers remain, and the scheduler idles in wfi between
+\ wake-ups (host CPU drops to ~0).  The program ends when the last thread exits.
+\
+\ Build:  (the compile step from scripts/build.sh)
+\   run bin/proc_demo bin/fam lib/stdlib.fam lib/build.fam src/proc.fam src/proc_demo.fam
+\ Run:    ./tools/q32 bin/proc_demo
+
+: spin ( -- )  400000 lit 0 lit do loop ;
+: say  ( -- )  getpid 30 lit + putc spin ;
+
+: main
+    kinit
+    thread{ 14 lit 0 lit do say loop }thread        1 lit spawn drop
+    thread{ 14 lit 0 lit do say loop }thread        2 lit spawn drop
+    thread{ 14 lit 0 lit do say yield loop }thread  4 lit spawn drop
+    thread{ A lit 0 lit do 'S' lit putc 32 lit msleep loop }thread  1 lit spawn drop
+    14 lit 0 lit do 'M' lit putc spin loop
+    1F4 lit msleep
+    "\nmain: woke after 500 ms; sleeping 10 s (watch host CPU)\n" puts
+    2710 lit msleep
+    "main: woke after 10 s\n" puts
+    texit
+;
+main
