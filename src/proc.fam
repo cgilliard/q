@@ -504,3 +504,10 @@ B7230000 ,   \ lui t2,0x2
 73002030 ,   \ mret
     }code mtvec!
     arm int_on ;
+
+Test {
+	proct1 {
+		1 lit assert
+		7 lit 7 lit asrt_eq
+	}
+}
