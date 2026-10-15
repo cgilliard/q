@@ -8,6 +8,10 @@ forward (scripts/perf.sh runs the whole matrix against a quiet node).
   httpnc   a connection per request: each worker does connect, GET PATH, close, COUNT times
   ws       each of CONNECTIONS sockets sends COUNT text messages of SIZE bytes, waiting for each echo
   ticks    hold CONNECTIONS sockets for SECONDS and count the ticks each one receives
+  udp      each worker sends COUNT datagrams of SIZE bytes to the node's UDP port, waiting
+           for each echo (1 s timeout: a miss counts as lost)
+  udpflood each worker sends COUNT datagrams back to back, then collects echoes for a second:
+           what gets through and how many a second
 
 One line per run: operations per second over all workers, latency percentiles
 in ms per operation (connect + request + answer for httpnc), errors."""
@@ -71,10 +75,10 @@ def echo(c, r, payload):
         op, d = r.frame()
         if op == 1 and d.startswith(b"you said: "): return len(d)
 
-lat, errors, byts, lock = [], [0], [0], threading.Lock()
+lat, errors, byts, lost, lock = [], [0], [0], [0], threading.Lock()
 
 def worker(i):
-    mine, b, e = [], 0, 0
+    mine, b, e, miss = [], 0, 0, 0
     try:
         if MODE == "http":
             c, r = connect()
@@ -98,21 +102,51 @@ def worker(i):
                 except socket.timeout: break
             mine = [n]
             ws_send(c, 8, b""); c.close()
+        elif MODE == "udp":
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(1.0); payload = b"x" * SIZE
+            for _ in range(COUNT):
+                t = time.perf_counter(); s.sendto(payload, (HOST, PORT))
+                try:
+                    d, _ = s.recvfrom(65535); mine.append(time.perf_counter() - t); b += len(d)
+                except socket.timeout:
+                    miss += 1
+            s.close()
+        elif MODE == "udpflood":
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(1.0); payload = b"x" * SIZE
+            t0 = time.perf_counter()
+            for _ in range(COUNT): s.sendto(payload, (HOST, PORT))
+            sent_in = time.perf_counter() - t0
+            got = 0
+            while True:
+                try:
+                    d, _ = s.recvfrom(65535); got += 1; b += len(d)
+                except socket.timeout:
+                    break
+            mine = [sent_in] * got; miss = COUNT - got
+            s.close()
     except OSError as ex:
         e += 1; sys.stderr.write("worker %d: %s\n" % (i, ex))
     with lock:
-        lat.extend(mine); errors[0] += e; byts[0] += b
+        lat.extend(mine); errors[0] += e; byts[0] += b; lost[0] += miss
 
 t0 = time.perf_counter()
 ths = [threading.Thread(target=worker, args=(i,)) for i in range(CONN)]
 for th in ths: th.start()
 for th in ths: th.join()
 el = time.perf_counter() - t0
-if MODE == "ticks":
+if MODE == "udpflood":
+    n = len(lat); el = max(lat) if lat else el
+    print("%-8s c=%-2d n=%-5d size=%-4d  sent %d in %.2f s (%.0f/s), echoed %d (%.1f%% lost), %5.2f MB/s back"
+          % (MODE, CONN, COUNT, SIZE, CONN * COUNT, el, CONN * COUNT / el, n, 100.0 * lost[0] / max(CONN * COUNT, 1), byts[0] / (el + 1.0) / 1e6))
+elif MODE == "udpflood":
+    n = len(lat); el = max(lat) if lat else el
+    print("%-8s c=%-2d n=%-5d size=%-4d  sent %d in %.2f s (%.0f/s), echoed %d (%.1f%% lost), %5.2f MB/s back"
+          % (MODE, CONN, COUNT, SIZE, CONN * COUNT, el, CONN * COUNT / el, n, 100.0 * lost[0] / max(CONN * COUNT, 1), byts[0] / (el + 1.0) / 1e6))
+elif MODE == "ticks":
     print("ticks  c=%d  %.1f s: %d ticks over all sockets (%.2f per socket per second), errors %d"
           % (CONN, SECS, sum(lat), sum(lat) / max(CONN, 1) / SECS, errors[0]))
 else:
     lat.sort(); n = len(lat)
     pc = lambda p: lat[min(n - 1, int(p * n))] * 1000 if n else float("nan")
-    print("%-6s c=%-2d n=%-5d size=%-4d path=%-6s  %8.0f ops/s  p50 %6.2f ms  p90 %6.2f  p99 %6.2f  max %7.1f  %5.2f MB/s  errors %d  (%d ops in %.1f s)"
-          % (MODE, CONN, COUNT, SIZE, PATH, n / el, pc(0.5), pc(0.9), pc(0.99), lat[-1] * 1000 if n else 0, byts[0] / el / 1e6, errors[0], n, el))
+    print("%-8s c=%-2d n=%-5d size=%-4d path=%-6s  %8.0f ops/s  p50 %6.2f ms  p90 %6.2f  p99 %6.2f  max %7.1f  %5.2f MB/s  errors %d  lost %d  (%d ops in %.1f s)"
+          % (MODE, CONN, COUNT, SIZE, PATH, n / el, pc(0.5), pc(0.9), pc(0.99), lat[-1] * 1000 if n else 0, byts[0] / el / 1e6, errors[0], lost[0], n, el))

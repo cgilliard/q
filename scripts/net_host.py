@@ -5,6 +5,8 @@ loopback as 10.0.2.2 under slirp):
   TCP echo on 127.0.0.1:47655
   a knocker: every 0.3 s connect to 127.0.0.1:47653 (forwarded to the guest's
   47653), send "knock", expect it back — the guest's TCP server test
+  a UDP knocker: every 0.3 s a datagram to 127.0.0.1:47653 (forwarded to the
+  guest's 47653), expecting it back — the guest's UDP endpoint test
   an HTTP prober: every 0.3 s connect to 127.0.0.1:47656 (forwarded to the
   guest's 47656), GET / and check the page, upgrade to a WebSocket and check
   the accept key, send "ping" and expect "you said: ping", close — each step
@@ -120,6 +122,19 @@ def http_probe_once():
     finally:
         c.close()
 
+def udp_knocker():
+    """every 0.3 s a datagram to 127.0.0.1:47653 (forwarded to the guest's
+    47653), expecting it back: the guest's UDP endpoint test (src/udpsrv.fam)"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(1)
+    while True:
+        try:
+            s.sendto(b"udp knock", ("127.0.0.1", 47653))
+            s.recvfrom(64)
+        except OSError:
+            pass
+        time.sleep(0.3)
+
 def http_prober():
     while True:
         try:
@@ -128,6 +143,6 @@ def http_prober():
             pass
         time.sleep(0.3)
 
-for f in (udp_echo, tcp_echo, http_prober):
+for f in (udp_echo, tcp_echo, http_prober, udp_knocker):
     threading.Thread(target=f, daemon=True).start()
 knocker()

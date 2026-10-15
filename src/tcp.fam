@@ -419,9 +419,9 @@ Test {
 			28 lit + nip nip nip ;
 		: tin ( flags seq ack dlen -- )  tbuild tpk @ swap tcpin ;
 		: tntx ( -- n )  net @ 20 lit + @ ;
-		: tfr ( i -- th )  F lit and etx 22 lit + ;
+		: tfr ( i -- th )  7F lit and etx 22 lit + ;
 		: tlast ( -- th )  tntx 1 lit - tfr ;
-		: tdone ( -- )  tntx net @ 8 lit + @ 1002 lit + h! ;             \ the fake NIC completes everything
+		: tdone ( -- )  tntx net @ 8 lit + @ 2002 lit + h! ;             \ the fake NIC completes everything
 		: tsetup ( -- )
 			efake
 			0A00020F lit FFFFFF00 lit 0A000202 lit ipgw ! ipmask ! ipaddr !

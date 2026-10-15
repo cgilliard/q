@@ -137,7 +137,7 @@ Test {
 	}
 	\ an echo request for us is answered to its sender with the same payload
 	icmp {
-		2 lit net @ 8 lit + @ 1002 lit + h!
+		2 lit net @ 8 lit + @ 2002 lit + h!
 		ipp @ 400 lit 0 lit do 0 lit over i + c! loop drop
 		45 lit ipp @ c!  26 lit ipp @ 2 lit + be16!  40 lit ipp @ 8 lit + c!  1 lit ipp @ 9 lit + c!
 		0A000209 lit ipp @ C lit + be32!  0A00020F lit ipp @ 10 lit + be32!

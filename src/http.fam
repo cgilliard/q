@@ -419,9 +419,9 @@ Bench {
 		: bfake ( -- )
 			30 lit alloc net !
 			110 lit alloc dup 44 lit nzero net @ !
-			5000 lit alloc FFF lit + FFFFF000 lit and dup 1000 lit nzero
-			dup net @ 4 lit + !  2000 lit + net @ 8 lit + !
-			8000 lit alloc net @ C lit + !  8000 lit alloc net @ 10 lit + !
+			7000 lit alloc FFF lit + FFFFF000 lit and dup 1800 lit nzero
+			dup net @ 4 lit + !  3000 lit + net @ 8 lit + !
+			40000 lit alloc net @ C lit + !  40000 lit alloc net @ 10 lit + !
 			0 lit net @ 1C lit + !  0 lit net @ 20 lit + !
 			ntxinit
 			2 lit net @ @ 100 lit + c!  1 lit net @ @ 105 lit + c! ;
@@ -442,7 +442,7 @@ Bench {
 			tps @ C lit 0 lit cksum bpk @ 14 lit + 2 lit pick 14 lit + rot cksum ckfin bpk @ 24 lit + be16!
 			bsq @ over + bsq !
 			28 lit + bpk @ swap tcpin drop drop ;
-		: bdone ( -- )  net @ 20 lit + @ net @ 8 lit + @ 1002 lit + h! ;         \ the scratch NIC completes everything
+		: bdone ( -- )  net @ 20 lit + @ net @ 8 lit + @ 2002 lit + h! ;         \ the scratch NIC completes everything
 		: back ( -- )  10 lit 0 lit 0 lit bseg ;                                   \ the peer acks everything
 		\ bopen ( -- )  a connection from the next port: SYN, ACK, accepted
 		: bopen

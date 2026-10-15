@@ -107,9 +107,9 @@ Test {
 		: efake ( -- )
 			30 lit alloc net !
 			110 lit alloc dup 44 lit nzero net @ !
-			5000 lit alloc FFF lit + FFFFF000 lit and dup 1000 lit nzero
-			dup net @ 4 lit + !  2000 lit + net @ 8 lit + !
-			8000 lit alloc net @ C lit + !  8000 lit alloc net @ 10 lit + !
+			7000 lit alloc FFF lit + FFFFF000 lit and dup 1800 lit nzero
+			dup net @ 4 lit + !  3000 lit + net @ 8 lit + !
+			40000 lit alloc net @ C lit + !  40000 lit alloc net @ 10 lit + !
 			0 lit net @ 1C lit + !  0 lit net @ 20 lit + !
 			ntxinit
 			\ the MAC the fake reports: 02:00:00:00:00:01 at dev+0x100
@@ -164,7 +164,7 @@ Test {
 	}
 	\ ethsend: a known neighbour, the gateway for the rest, an ARP request otherwise
 	ethsend {
-		2 lit net @ 8 lit + @ 1002 lit + h!                          \ the fake consumed the 2 frames so far
+		2 lit net @ 8 lit + @ 2002 lit + h!                          \ the fake consumed the 2 frames so far
 		"hello" ethbuf 5 lit mcopy
 		0A000209 lit 800 lit 5 lit ethsend assert
 		2 lit etx dup "QRSTUV" emac assert  dup ethtype 800 lit asrt_eq  dup E lit + c@ 'h' lit asrt_eq drop

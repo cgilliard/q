@@ -1,0 +1,94 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/udpsrv.fam — the node's UDP endpoint: a socket on the node's port that
+\ answers every datagram with the same bytes back to its sender.  This is the
+\ path nodes will talk to each other on, so it is the one to measure: the
+\ bench below gives its cost per datagram without a network, scripts/perf.sh
+\ (udp, udpflood in scripts/load.py) what a peer sees through the port forward.
+\
+\   usinit ( port -- )       after udpinit: the socket (0 if none left)
+\   usturn ( -- )            once per loop turn: every queued datagram answered
+\   usin / usout             datagrams received / answered (variables)
+\ With src/tcp.fam's tlog set, a line per second on the UART when the counts
+\ changed.  Needs src/udp.fam and src/http.fam (hcmp in the test) before it.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: ussk variable ;  : usb variable ;  : usin variable ;  : usout variable ;
+: usl variable ;  : usli variable ;
+
+: usinit ( port -- )  udpbind ussk !  600 lit alloc usb !  0 lit usin !  0 lit usout ! ;
+
+: usturn ( -- )
+	ussk @ if
+		begin ussk @ usb @ 600 lit udprecv dup 0< 0= while
+			usin @ 1 lit + usin !
+			udpfrom ussk @ -rot usb @ 4 lit pick udpsend if usout @ 1 lit + usout ! then
+			drop
+		repeat drop
+		tlog @ if tms usl @ - 3E8 lit u< 0= if tms usl !
+			usin @ usli @ <> if usin @ usli !  tlp "udp: " puts usin @ u. " in, " puts usout @ u. " out" puts tln then
+		then then
+	then ;
+
+\ ──────────────────────────────────────────────────────────────────────────────
+\ Tests: two datagrams on the scratch NIC (udgram from src/udp.fam's tests),
+\ then the host's UDP knocker (scripts/net_host.py) at our forwarded 47653.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+Test {
+	usecho {
+		efake
+		0A00020F lit FFFFFF00 lit 0A000202 lit ipgw ! ipmask ! ipaddr !
+		800 lit alloc txf !  80 lit alloc dup arpt ! 20 lit 0 lit do 0 lit over i 2 lit lshift + ! loop drop  0 lit arpn !
+		8 lit alloc dup bcast ! 6 lit 0 lit do FF lit over i + c! loop drop
+		0A000209 lit "QRSTUV" arpadd
+		udpinit  E99 lit usinit  ussk @ 0 lit <> assert
+		E99 lit udgram  up @ 25 lit udpin  up @ 25 lit udpin
+		usturn
+		usin @ 2 lit asrt_eq  usout @ 2 lit asrt_eq  net @ 20 lit + @ 2 lit asrt_eq
+		1 lit etx dup "QRSTUV" emac assert
+		dup 22 lit + be16@ E99 lit asrt_eq  dup 24 lit + be16@ 15B3 lit asrt_eq  dup 26 lit + be16@ 11 lit asrt_eq
+		2A lit + "datagram!" 9 lit hcmp assert
+		usturn  usin @ 2 lit asrt_eq
+	}
+	uslive {
+		netinit if
+			0A00020F lit FFFFFF00 lit 0A000202 lit ethinit assert
+			udpinit  BA25 lit usinit
+			mtime@ drop
+			begin
+				narm netpoll usturn
+				usout @ if -1 lit else
+					mtime@ drop over - 1C9C380 lit u< if nbit 186A0 lit wait drop 0 lit else -1 lit then
+				then
+			until drop
+			usin @ 0= if " (no udp knocker on the host: skipped) " puts else usout @ 0 lit <> assert then
+			ussk @ udpclose
+		then
+	}
+}
+
+\ ──────────────────────────────────────────────────────────────────────────────
+\ Bench: a 64-byte datagram as an Ethernet frame through netin (the IP
+\ checksum checked, queued), then usturn answers it (copied, checksummed, sent
+\ to the scratch NIC): the node's cost per datagram without a network.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+Bench {
+	udpecho {
+		: bufr variable ;  : bul variable ;
+		bsetup  udpinit  E99 lit usinit
+		800 lit alloc bufr !  bufr @ 80 lit nzero
+		netmac bufr @ 6 lit mcopy  "QRSTUV" bufr @ 6 lit + 6 lit mcopy  800 lit bufr @ C lit + be16!
+		bufr @ E lit +
+		45 lit over c!  5C lit over 2 lit + be16!  40 lit over 8 lit + c!  11 lit over 9 lit + c!
+		0A000209 lit over C lit + be32!  0A00020F lit over 10 lit + be32!
+		dup 14 lit 0 lit cksum ckfin over A lit + be16!
+		15B3 lit over 14 lit + be16!  E99 lit over 16 lit + be16!  48 lit over 18 lit + be16!  0 lit over 1A lit + be16!
+		dup 1C lit + 40 lit 0 lit do i over i + c! loop drop
+		drop  6A lit bul !
+		bgo
+		3E8 lit 0 lit do bufr @ bul @ netin usturn bdone loop
+		3E8 lit bops
+		usout @ 3E8 lit = 0= if bskip then
+	}
+}

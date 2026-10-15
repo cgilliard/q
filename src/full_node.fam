@@ -2,7 +2,8 @@
 \ src/full_node.fam — the node.  One thread, one loop over its devices: the
 \ kernel first (src/proc.fam kinit: the trap vector, the timer and the PLIC
 \ doorbells that `wait` needs), then every turn takes the frames in, serves
-\ HTTP and WebSocket (src/http.fam) on port 8080, runs TCP's timers, and
+\ HTTP and WebSocket (src/http.fam) on port 8080 and the UDP endpoint
+\ (src/udpsrv.fam) on 3737 as each frame comes in, runs TCP's timers, and
 \ sleeps until a doorbell or 100 ms.
 \ ──────────────────────────────────────────────────────────────────────────────
 
@@ -10,14 +11,14 @@ kinit
 evinit
 evnet? @ if
 	0A00020F lit FFFFFF00 lit 0A000202 lit ethinit drop
-	udpinit  20 lit tcpinit  1F90 lit 20 lit httpinit
+	udpinit  E99 lit usinit  20 lit tcpinit  1F90 lit 20 lit httpinit
 	\ a 'q' waiting on the UART after the boot config (scripts/boot.sh QUIET=1) turns the trace off
 	10000005 lit c@ 1 lit and if getc 'q' lit = if 0 lit else -1 lit then else -1 lit then dup tlog ! hlog !
 	hlog @ if "q: serving http on port 8080; every connection, request, frame and TCP event is logged below, [uptime in ms]\n" puts
 	else "q: serving http on port 8080, trace off\n" puts then
 	begin
 		evarm
-		netpoll
+		begin netrx while netin netrel usturn repeat       \ datagrams are answered as they come, not after the drain
 		httpturn
 		tcptick
 		0 lit F4240 lit evwait drop

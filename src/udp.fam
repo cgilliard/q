@@ -12,8 +12,8 @@
 \   udpin   ( buf len -- )                a received packet (from ipin), queued
 \                                         on its port's socket or dropped
 \
-\ A socket queues up to 8 datagrams of up to 1524 bytes; when the queue is
-\ full new ones are dropped.  Datagrams larger than that are dropped.  Needs
+\ A socket queues up to 64 datagrams of up to 1524 bytes (a burst between two
+\ turns of the loop); when the queue is full new ones are dropped.  Datagrams larger than that are dropped.  Needs
 \ src/ip.fam before it.
 \ ──────────────────────────────────────────────────────────────────────────────
 
@@ -26,7 +26,7 @@
 
 : udpinit ( -- )
 	80 lit alloc dup usk ! 20 lit 0 lit do 0 lit over i 2 lit lshift + ! loop drop
-	8 lit 0 lit do 3000 lit alloc usk @ i 4 lit lshift + 4 lit + ! loop
+	8 lit 0 lit do 18000 lit alloc usk @ i 4 lit lshift + 4 lit + ! loop
 	10 lit alloc ups ! ;
 
 : udpfind ( port -- sock|0 )
@@ -42,14 +42,14 @@
 
 : udpclose ( sock -- )  0 lit swap ! ;
 
-\ uslot ( sock idx -- slot )  slot idx & 7 of the socket's ring
-: uslot  7 lit and 600 lit * swap 4 lit + @ + ;
+\ uslot ( sock idx -- slot )  slot idx & 63 of the socket's ring
+: uslot  3F lit and 600 lit * swap 4 lit + @ + ;
 
 : udpin ( buf len -- )
 	drop dup ub !  dup c@ F lit and 2 lit lshift + uu !
 	uu @ 2 lit + be16@ udpfind ?dup if us !
 		uu @ 4 lit + be16@ 8 lit - ud !
-		ud @ 5F4 lit u> 0=  us @ C lit + @ us @ 8 lit + @ - 8 lit u<  and if
+		ud @ 5F4 lit u> 0=  us @ C lit + @ us @ 8 lit + @ - 40 lit u<  and if
 			us @ us @ C lit + @ uslot
 			ub @ C lit + be32@ over !  uu @ be16@ over 4 lit + !  ud @ over 8 lit + !
 			uu @ 8 lit + swap C lit + ud @ mcopy
@@ -115,9 +115,9 @@ Test {
 		ubuf @ c@ 'd' lit asrt_eq  ubuf @ 8 lit + c@ '!' lit asrt_eq
 		udpfrom 15B3 lit asrt_eq 0A000209 lit asrt_eq
 		dup ubuf @ 100 lit udprecv -1 lit asrt_eq
-		A lit 0 lit do up @ 25 lit udpin loop                    \ 10 in: 8 kept
-		dup C lit + @ over 8 lit + @ - 8 lit asrt_eq
-		8 lit 0 lit do dup ubuf @ 4 lit udprecv 9 lit asrt_eq loop   \ the length is the whole, the copy the cap
+		42 lit 0 lit do up @ 25 lit udpin loop                   \ 66 in: 64 kept
+		dup C lit + @ over 8 lit + @ - 40 lit asrt_eq
+		40 lit 0 lit do dup ubuf @ 4 lit udprecv 9 lit asrt_eq loop  \ the length is the whole, the copy the cap
 		ubuf @ 4 lit + c@ 'g' lit asrt_eq
 		dup ubuf @ 100 lit udprecv -1 lit asrt_eq
 		udpclose
