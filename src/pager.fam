@@ -27,6 +27,10 @@
 \                                 (blocking on the disk's doorbell)
 \ Setup:
 \   pgopen   ( ds -- flag )       open, formatting an empty disk; -1 when done
+\   pgbase   variable             the sector the pages start at (page 0's meta
+\                                 is there): set before pgopen; 0 for a disk
+\                                 of its own, 0x10000 (32 MiB in) on the
+\                                 node's disk, past its boot image
 \   pgwipe   ( -- )               erase both metas (the next pgopen formats)
 \   pgtx pgroot pgnext pgnfree pgnpend   ( -- n )   state, for tests and tools
 \
@@ -60,6 +64,7 @@
 \ ──────────────────────────────────────────────────────────────────────────────
 
 : pg variable ;
+: pgbase variable ;
 
 : pgdie ( msg -- )   \ an invariant broke: say so and stop the node (exit 1)
 	0A lit putc puts 0A lit putc
@@ -169,7 +174,7 @@ E3EAC5FE ,   \ bltu a1,a2,next
 	pg @ 34 lit + dup @ 1 lit + dup rot ! over C lit + ! ;
 
 : pgload ( pgno slot -- )
-	pgds 2 lit pick 3 lit lshift 2 lit pick 8 lit + @ 8 lit vreadn dwait
+	pgds 2 lit pick 3 lit lshift pgbase @ + 2 lit pick 8 lit + @ 8 lit vreadn dwait
 	1 lit <> if "pager: read failed" pgdie then drop
 	tuck !  0 lit over 4 lit + !  drop ;
 
@@ -247,7 +252,7 @@ E3EAC5FE ,   \ bltu a1,a2,next
 	else drop then drop ;
 
 : pgwmeta ( -- )        \ the buffer to the slot for txnid+1, then flush
-	pgds pgtx 1 lit + 1 lit and 3 lit lshift pgmeta 8 lit vwriten dwait
+	pgds pgtx 1 lit + 1 lit and 3 lit lshift pgbase @ + pgmeta 8 lit vwriten dwait
 	1 lit <> if "pager: meta write failed" pgdie then drop
 	pgflush ;
 
@@ -263,7 +268,7 @@ E3EAC5FE ,   \ bltu a1,a2,next
 	0 lit pg @ 54 lit + !
 	pgndirty ?dup if 0 lit do
 		i pgdslot dup 4 lit + @ 1 lit and if             \ still dirty (not freed since)
-			pgds over @ 3 lit lshift 2 lit pick 8 lit + @ 8 lit vqwrite nip over C lit + !
+			pgds over @ 3 lit lshift pgbase @ + 2 lit pick 8 lit + @ 8 lit vqwrite nip over C lit + !
 			pg @ 54 lit + dup @ 1 lit + swap !
 		then drop
 	loop then
@@ -324,11 +329,11 @@ E3EAC5FE ,   \ bltu a1,a2,next
 	loop
 	pg @ 30 lit + @ 10 lit pgzero
 	0 lit pg @ 34 lit + !  0 lit pg @ 28 lit + !  0 lit pg @ 40 lit + !  0 lit pg @ 58 lit + !
-	pgds @ 104 lit + @ if 1FFFFFFF lit else pgds @ 100 lit + @ 3 lit rshift then pg @ 48 lit + !
+	pgds @ 104 lit + @ if 1FFFFFFF lit else pgds @ 100 lit + @ 3 lit rshift then pgbase @ 3 lit rshift - pg @ 48 lit + !
 	0 lit pg @ C lit + !  0 lit pg @ 10 lit + !  2 lit pg @ 14 lit + !
 	0 lit pg @ 18 lit + !  0 lit pg @ 20 lit + !
 	2 lit 0 lit do                                               \ the newer valid meta wins
-		pgds i 3 lit lshift pgmeta 8 lit vreadn dwait
+		pgds i 3 lit lshift pgbase @ + pgmeta 8 lit vreadn dwait
 		1 lit <> if "pager: meta read failed" pgdie then drop
 		pgmetaok if pgmeta 4 lit + @ pgtx u> if pgmeta@ then then
 	loop
@@ -339,8 +344,8 @@ E3EAC5FE ,   \ bltu a1,a2,next
 
 : pgwipe ( -- )
 	pgmeta 400 lit pgzero
-	pgds 0 lit pgmeta 8 lit vwriten dwait 1 lit <> if "pager: wipe failed" pgdie then drop
-	pgds 8 lit pgmeta 8 lit vwriten dwait 1 lit <> if "pager: wipe failed" pgdie then drop
+	pgds pgbase @ pgmeta 8 lit vwriten dwait 1 lit <> if "pager: wipe failed" pgdie then drop
+	pgds pgbase @ 8 lit + pgmeta 8 lit vwriten dwait 1 lit <> if "pager: wipe failed" pgdie then drop
 	pgflush ;
 
 \ ──────────────────────────────────────────────────────────────────────────────
@@ -358,6 +363,7 @@ Test {
 			loop 2drop ;
 		dsinit pds !
 		pds @ if
+			0 lit pgbase !
 			pds @ pgopen assert  pgwipe
 			pds @ pgopen assert                                \ formats
 			pgtx 1 lit asrt_eq  pgroot 0 lit asrt_eq  pgnext 2 lit asrt_eq
@@ -482,7 +488,7 @@ Bench {
 	pghit {
 		: pdirty ( n -- root )  pgnew drop swap 1 lit - ?dup if 0 lit do pgnew 2drop loop then ;
 		dsinit ?dup if
-			pgopen drop pgwipe pgds pgopen drop
+			0 lit pgbase !  pgopen drop pgwipe pgds pgopen drop
 			pgwbeg pgnew drop
 			bgo
 			2710 lit 0 lit do dup pgget drop loop

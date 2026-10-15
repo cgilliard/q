@@ -2,7 +2,7 @@
 # Write the node (bin/full_node.bin, from scripts/build.sh) to the start of the
 # disk image tabernacle boots from (DISK, data/disk.img by default).  The
 # image is sparse, 128 GiB when made here:
-# the node keeps its chain and state 32 MiB in (src/store.fam's dbbase), and
+# the node keeps its store 32 MiB in (pgbase, set in src/full_node.fam), and
 # rewriting the boot image leaves them alone -- a new build keeps its chain.
 set -e
 IMG=${DISK:-./data/disk.img}

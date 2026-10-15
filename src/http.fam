@@ -12,10 +12,11 @@
 \                              tlog does the same one layer down)
 \
 \ What it serves, for now: GET / is the page (built at init from the pieces in
-\ hpage: a hello and a WebSocket log, closed cleanly on
+\ hpage: a hello, a WebSocket log and a store box, the socket closed cleanly on
 \ unload so Firefox does not count a reload as a failed socket), a GET carrying a Sec-WebSocket-Key is
-\ upgraded, anything else is a 404.  On a socket a text or binary message is
-\ answered with "you said: " and the message, a ping with a pong, a close with
+\ upgraded, anything else is a 404.  On a socket a text or binary message
+\ starting "kv " is a store command (src/kv.fam kvcmd answers it), any other
+\ is answered with "you said: " and the message, a ping with a pong, a close with
 \ a close; every second every socket gets a tick with the uptime.  Connections
 \ are kept alive; a request over 2 KiB without its end, or a frame over 2 KiB,
 \ closes the connection.
@@ -25,7 +26,7 @@
 \ bytes: a response goes out across turns when the send ring is full)
 \ +14 request buffer (0x800)  +18 scratch for the 101 (0x100).
 \ SHA-1 and base64 (the upgrade's accept key) are here too.  Needs src/tcp.fam
-\ (and what it needs); the live test needs src/netin.fam.
+\ and src/kv.fam (and what they need); the live test needs src/netin.fam.
 \ ──────────────────────────────────────────────────────────────────────────────
 
 : hsl variable ;  : hsn variable ;  : hlsn variable ;
@@ -112,14 +113,21 @@
 : hpage
 	hbody @ hp !
 	"<!doctype html><html><head><meta charset='utf-8'><title>q</title>" h+
-	"<style>body{font-family:monospace;margin:2em;max-width:60em}#log{white-space:pre-wrap;border:1px solid #888;padding:1em;height:20em;overflow:auto}</style></head><body>" h+
+	"<style>body{font-family:monospace;margin:2em;max-width:60em}#log,#kv{white-space:pre-wrap;border:1px solid #888;padding:1em;height:14em;overflow:auto}</style></head><body>" h+
 	"<h1>hello from q</h1><p>Served by the fam node on QEMU riscv32 over its own TCP. The box is a WebSocket: the node sends a tick every second and echoes what you send.</p>" h+
 	"<p><input id='in' size='40' placeholder='type and press enter'> <button id='go'>send</button> <span id='st'>connecting...</span></p><div id='log'></div>" h+
 	"<script>var log=document.getElementById('log'),st=document.getElementById('st'),inp=document.getElementById('in');" h+
 	"function add(s){log.textContent+=s+'\\n';log.scrollTop=log.scrollHeight}" h+
 	"var ws=new WebSocket('ws://'+location.host+'/ws');ws.onopen=function(){st.textContent='connected'};ws.onclose=function(){st.textContent='closed'};" h+
-	"ws.onmessage=function(e){add(e.data)};function send(){if(inp.value){ws.send(inp.value);inp.value=''}}" h+
+	"ws.onmessage=function(e){if(e.data.slice(0,4)==='kv: ')kadd(e.data);else add(e.data)};function send(){if(inp.value){ws.send(inp.value);inp.value=''}}" h+
 	"document.getElementById('go').onclick=send;inp.onkeydown=function(e){if(e.key==='Enter')send()};" h+
+	"</script><h2>store</h2><p>Keys and values go into the node's B+tree on its disk: set one, get it back, list by prefix. They outlive a reboot.</p>" h+
+	"<p><input id='k' size='16' placeholder='key'> <input id='v' size='32' placeholder='value'> <button id='set'>set</button> <button id='get'>get</button> <button id='del'>del</button> <button id='ls'>list</button></p><div id='kv'></div>" h+
+	"<script>var kv=document.getElementById('kv'),k=document.getElementById('k'),v=document.getElementById('v');" h+
+	"function kadd(s){kv.textContent+=s+'\\n';kv.scrollTop=kv.scrollHeight}function cmd(c){ws.send('kv '+c)}" h+
+	"document.getElementById('set').onclick=function(){cmd('set '+k.value+' '+v.value)};document.getElementById('get').onclick=function(){cmd('get '+k.value)};" h+
+	"document.getElementById('del').onclick=function(){cmd('del '+k.value)};document.getElementById('ls').onclick=function(){cmd('list '+k.value)};" h+
+	"v.onkeydown=function(e){if(e.key==='Enter')cmd('set '+k.value+' '+v.value)};k.onkeydown=function(e){if(e.key==='Enter')cmd('get '+k.value)};" h+
 	"window.addEventListener('pagehide',function(){ws.close()});window.addEventListener('beforeunload',function(){ws.close()});</script></body></html>\n" h+
 	hp @ hbody @ - hbn ! ;
 
@@ -239,11 +247,15 @@
 		hwl @ ?dup if 0 lit do hrb @ hwh @ + i + dup c@ hrb @ hwh @ 4 lit - + i 3 lit and + c@ xor swap c! loop then
 	then
 	hrb @ c@ F lit and
-	hlog @ if hls "frame op " puts dup u. ", " puts hwl @ u. " bytes" puts dup 8 lit = if " -> close back, closed" puts else dup 9 lit = if " -> pong" puts else " -> echoed" puts then then tln then
+	hlog @ if hls "frame op " puts dup u. ", " puts hwl @ u. " bytes" puts dup 8 lit = if " -> close back, closed" puts else dup 9 lit = if " -> pong" puts else " -> answered" puts then then tln then
 	dup 1 lit = over 2 lit = or if
 		hnmsg @ 1 lit + hnmsg !
-		htb @ 4 lit + hp !  "you said: " h+  hrb @ hwh @ + hp @ hwl @ mcopy
-		htb @ 4 lit + hwl @ A lit + rot wsend
+		hwl @ 3 lit u< 0=  hrb @ hwh @ + be16@ 6B76 lit = and  hrb @ hwh @ + 2 lit + c@ 20 lit = and if   \ "kv ": the store
+			hrb @ hwh @ + 3 lit + hwl @ 3 lit - htb @ 4 lit + 7F0 lit kvcmd  htb @ 4 lit + swap rot wsend
+		else
+			htb @ 4 lit + hp !  "you said: " h+  hrb @ hwh @ + hp @ hwl @ mcopy
+			htb @ 4 lit + hwl @ A lit + rot wsend
+		then
 	else dup 8 lit = if
 		hncls @ 1 lit + hncls !  htb @ 0 lit 8 lit wsend  hclose  drop
 	else dup 9 lit = if hrb @ hwh @ + hwl @ A lit wsend drop
@@ -316,6 +328,8 @@ Test {
 			tps @ C lit 0 lit cksum tpk @ 14 lit + htl @ 14 lit + rot cksum ckfin tpk @ 24 lit + be16!
 			tpk @ swap tcpin ;
 		: hcmp ( a s n -- flag )  -1 lit swap 0 lit do 2 lit pick i + c@ 2 lit pick i + c@ <> if drop 0 lit then loop nip nip ;
+		: tend ( -- a )  tlast dup 12 lit - be16@ + 1C lit - ;        \ the last 8 bytes of the last segment's payload
+		: tn0 variable ;
 		tsetup  1F90 lit 4 lit httpinit
 		"abc" 3 lit hdg @ sha1
 		hdg @ be32@ A9993E36 lit asrt_eq  hdg @ 10 lit + be32@ 9CD0D89D lit asrt_eq
@@ -326,8 +340,9 @@ Test {
 		0 lit htb @ hdec htb @ - 1 lit asrt_eq  htb @ c@ '0' lit asrt_eq
 		4D2 lit htb @ hdec htb @ - 4 lit asrt_eq  htb @ "1234" 4 lit hcmp assert
 	}
-	\ a client on the scratch NIC: the page, a 404, the upgrade, a message, a ping, a close;
-	\ then one that never finishes its request
+	\ a client on the scratch NIC: the page (two segments: 2 KiB < hrlen < 2730, which the
+	\ pipelined part's arithmetic assumes), a 404, the upgrade, a message, a store command,
+	\ a ping, a close; then one that never finishes its request
 	httpserve {
 		tsetup  1F90 lit 4 lit httpinit
 		2 lit 3E8 lit 0 lit 0 lit tin  tlast 4 lit + be32@ tiss !  10 lit 3E9 lit tiss @ 1 lit + 0 lit tin
@@ -335,25 +350,26 @@ Test {
 		18 lit 3E9 lit tcc @ 14 lit + @ "GET / HTTP/1.1\r\nHost: q\r\n\r\n" 1B lit hin
 		tntx 1 lit asrt_eq
 		httpturn
-		hnreq @ 1 lit asrt_eq  tntx 2 lit asrt_eq  hrlen @ 5B4 lit u< assert                \ one segment
-		tlast dup D lit + c@ 18 lit asrt_eq  dup 14 lit + "HTTP/1.1 200 OK\r\n" 11 lit hcmp assert
-		14 lit + hrlen @ + 8 lit - "</html>\n" 8 lit hcmp assert
+		hnreq @ 1 lit asrt_eq  tntx 3 lit asrt_eq  hrlen @ 800 lit u> hrlen @ AAA lit u< and assert   \ two segments
+		1 lit tfr dup D lit + c@ 10 lit asrt_eq  14 lit + "HTTP/1.1 200 OK\r\n" 11 lit hcmp assert
+		tlast D lit + c@ 18 lit asrt_eq  tend "</html>\n" 8 lit hcmp assert
 		0 lit hslot 8 lit + @ 0 lit asrt_eq                                             \ consumed
 		10 lit 404 lit tcc @ 14 lit + @ 0 lit tin                                      \ all acked
-		\ four requests in one segment: three answers fit the ring, the fourth waits for the ACK
+		\ four requests in one segment: one answer and part of the next fit the ring, the rest wait for ACKs
 		4 lit 0 lit do "GET / HTTP/1.1\r\nHost: q\r\n\r\n" tbf @ i 1B lit * + 1B lit mcopy loop
 		18 lit 404 lit tcc @ 14 lit + @ tbf @ 6C lit hin
-		httpturn  hnreq @ 5 lit asrt_eq  tntx 6 lit asrt_eq
-		0 lit hslot 10 lit + @ hrlen @ 4 lit * 1000 lit - asrt_eq
+		httpturn  hnreq @ 3 lit asrt_eq  0 lit hslot 10 lit + @ hrlen @ 2 lit * 1000 lit - asrt_eq
 		10 lit 470 lit tcc @ 14 lit + @ 0 lit tin
-		httpturn  tntx 7 lit asrt_eq  0 lit hslot 10 lit + @ 0 lit asrt_eq
-		tlast 14 lit + hrlen @ 4 lit * 1000 lit - + 8 lit - "</html>\n" 8 lit hcmp assert
+		httpturn  hnreq @ 5 lit asrt_eq  0 lit hslot 10 lit + @ hrlen @ 4 lit * 2000 lit - asrt_eq
 		10 lit 470 lit tcc @ 14 lit + @ 0 lit tin
+		httpturn  0 lit hslot 10 lit + @ 0 lit asrt_eq  tend "</html>\n" 8 lit hcmp assert
+		10 lit 470 lit tcc @ 14 lit + @ 0 lit tin
+		tntx tn0 !
 		18 lit 470 lit tcc @ 14 lit + @ "GET /nope HTTP/1.1\r\n\r\n" 16 lit hin
-		httpturn  tntx 8 lit asrt_eq  tlast 14 lit + "HTTP/1.1 404" C lit hcmp assert
+		httpturn  tntx tn0 @ 1 lit + asrt_eq  tlast 14 lit + "HTTP/1.1 404" C lit hcmp assert
 		10 lit 486 lit tcc @ 14 lit + @ 0 lit tin
 		18 lit 486 lit tcc @ 14 lit + @ "GET /ws HTTP/1.1\r\nHost: q\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n" 8E lit hin
-		httpturn  tntx 9 lit asrt_eq
+		httpturn  tntx tn0 @ 2 lit + asrt_eq
 		tlast 14 lit + dup "HTTP/1.1 101 Switching Protocols\r\n" 22 lit hcmp assert
 		61 lit + "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n" 20 lit hcmp assert
 		0 lit hslot 4 lit + @ 1 lit asrt_eq  hnws @ 1 lit asrt_eq
@@ -362,19 +378,25 @@ Test {
 		81 lit tbf @ c!  85 lit tbf @ 1 lit + c!  37 lit tbf @ 2 lit + c!  FA lit tbf @ 3 lit + c!  21 lit tbf @ 4 lit + c!  3D lit tbf @ 5 lit + c!
 		7F lit tbf @ 6 lit + c!  9F lit tbf @ 7 lit + c!  4D lit tbf @ 8 lit + c!  51 lit tbf @ 9 lit + c!  58 lit tbf @ A lit + c!
 		18 lit 514 lit tcc @ 14 lit + @ tbf @ B lit hin
-		httpturn  tntx A lit asrt_eq  hnmsg @ 1 lit asrt_eq
+		httpturn  tntx tn0 @ 3 lit + asrt_eq  hnmsg @ 1 lit asrt_eq
 		tlast 14 lit + dup c@ 81 lit asrt_eq  dup 1 lit + c@ F lit asrt_eq  2 lit + "you said: Hello" F lit hcmp assert
 		10 lit 51F lit tcc @ 14 lit + @ 0 lit tin
+		\ "kv get kvt/z" (a zero mask): the store answers, "kv: " first, whether or not there is one
+		81 lit tbf @ c!  8C lit tbf @ 1 lit + c!  4 lit 0 lit do 0 lit tbf @ 2 lit + i + c! loop  "kv get kvt/z" tbf @ 6 lit + C lit mcopy
+		18 lit 51F lit tcc @ 14 lit + @ tbf @ 12 lit hin
+		httpturn  tntx tn0 @ 4 lit + asrt_eq  hnmsg @ 2 lit asrt_eq
+		tlast 14 lit + dup c@ 81 lit asrt_eq  2 lit + "kv: " 4 lit hcmp assert
+		10 lit 531 lit tcc @ 14 lit + @ 0 lit tin
 		\ a ping: a pong
 		89 lit tbf @ c!  80 lit tbf @ 1 lit + c!
-		18 lit 51F lit tcc @ 14 lit + @ tbf @ 6 lit hin
-		httpturn  tntx B lit asrt_eq  tlast 14 lit + be16@ 8A00 lit asrt_eq
-		10 lit 525 lit tcc @ 14 lit + @ 0 lit tin
+		18 lit 531 lit tcc @ 14 lit + @ tbf @ 6 lit hin
+		httpturn  tntx tn0 @ 5 lit + asrt_eq  tlast 14 lit + be16@ 8A00 lit asrt_eq
+		10 lit 537 lit tcc @ 14 lit + @ 0 lit tin
 		\ a close: a close back, then our FIN; the slot is free
 		88 lit tbf @ c!
-		18 lit 525 lit tcc @ 14 lit + @ tbf @ 6 lit hin
-		httpturn  tntx D lit asrt_eq  hncls @ 1 lit asrt_eq
-		B lit tfr 14 lit + be16@ 8800 lit asrt_eq  tlast D lit + c@ 11 lit asrt_eq
+		18 lit 537 lit tcc @ 14 lit + @ tbf @ 6 lit hin
+		httpturn  tntx tn0 @ 7 lit + asrt_eq  hncls @ 1 lit asrt_eq
+		tntx 2 lit - tfr 14 lit + be16@ 8800 lit asrt_eq  tlast D lit + c@ 11 lit asrt_eq
 		tcc @ @ 5 lit asrt_eq  0 lit hslot @ 0 lit asrt_eq
 		\ a second client that never finishes its request: dropped when the buffer is full
 		15B4 lit tsrcpt !

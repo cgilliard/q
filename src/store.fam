@@ -1009,6 +1009,7 @@ Test {
 		: sget ( txn n -- vlen )  k! sbuf @ 100 lit get ;
 		dsinit sds !
 		sds @ if
+			0 lit pgbase !
 			sds @ pgopen drop pgwipe sds @ pgopen drop stinit
 			10 lit alloc sk !  40 lit alloc sv !  3000 lit alloc sbuf !
 			0 lit txbeg stx !
@@ -1156,7 +1157,7 @@ Bench {
 			loop drop bsk @ 4 lit ;
 		: bput ( txn n -- )  bk! bsv @ 20 lit put ;
 		dsinit ?dup if
-			pgopen drop pgwipe pgds pgopen drop stinit
+			0 lit pgbase !  pgopen drop pgwipe pgds pgopen drop stinit
 			10 lit alloc bsk !  40 lit alloc bsv !  3000 lit alloc bsb !
 			bgo
 			28 lit 0 lit do
