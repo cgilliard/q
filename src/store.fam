@@ -1,0 +1,709 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/store.fam — the key-value store: a copy-on-write B+tree on src/pager.fam
+\ with LMDB-shaped transactions.  One key space; namespaces are key prefixes.
+\
+\   stinit   ( -- )                        once, after pgopen
+\   txbeg    ( write? -- txn )             a transaction: readers see the last
+\                                          commit and are never blocked; one
+\                                          writer at a time
+\   txcommit ( txn -- )   txabort ( txn -- )
+\   get      ( txn key klen buf cap -- vlen | -1 )   copy the value (at most
+\                                          cap bytes) and return its length
+\   put      ( txn key klen val vlen -- )  insert or replace
+\   del      ( txn key klen -- flag )      -1 if it was there
+\   curopen  ( txn -- cur )   curclose ( cur -- )
+\   curfirst ( cur -- flag )               the smallest key; 0 = empty tree
+\   curseek  ( cur key klen -- flag )      the first key >= key; -1 = exact
+\   curnext  ( cur -- flag )               0 = past the end
+\   curkey   ( cur buf cap -- klen | -1 )  curval ( cur buf cap -- vlen | -1 )
+\
+\ Keys are byte strings up to 511 bytes, ordered bytewise then by length.
+\ Values up to 1 KiB live in the leaf; larger ones go to a chain of overflow
+\ pages (4 bytes link + 4088 payload each) and the leaf keeps a 4-byte
+\ reference, so the leaf fanout never collapses.  A transaction may dirty 64
+\ pages (the pager's pool), which caps one value near 200 KiB.
+\
+\ Page: +0 type (1 leaf, 2 branch, 3 overflow)  +4 nkeys  +8 upper (the cell
+\ area grows down from 4096)  +16 slot[i] = page offset of cell i, in key
+\ order.  Leaf cell: +0 klen(16) +2 flags(16: bit0 overflow) +4 vlen +8 key,
+\ then the value bytes or the overflow page number.  Branch cell: +0 klen +4
+\ child +8 key; cell 0's key is empty, so child i holds keys >= key i and
+\ < key i+1.  Cells are 4-byte multiples; a deleted cell's bytes stay until the
+\ page is compacted (when an insert needs the room).
+\
+\ A put copies the root-to-leaf path once per transaction (pgcow), splits a
+\ full leaf in half and pushes the separator up, splitting branches as needed.
+\ A del removes the cell; an emptied leaf is unlinked and a root with one child
+\ collapses.  Underfull pages are not merged (space returns when they empty).
+\
+\ Cursors hold page numbers and indices per level, never addresses.  In a
+\ write transaction a cursor is valid until the next put or del.  The store is
+\ called from one thread (the loop); its scratch state is global.  One read
+\ transaction per thread at a time.  Needs src/pager.fam (and what it needs).
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: st variable ;      \ +0 txns(16 x 16)  +4 cursors(16 x 0x50)  +8 scratch page
+                     \ +C path(8 x 8: pgno, idx)  +10 key scratch (512)
+
+: stdie ( msg -- )  pgdie ;
+
+: umin ( a b -- min )  2dup u> if swap then drop ;
+
+\ ── pages ─────────────────────────────────────────────────────────────────────
+
+\ pgsearch ( page key klen -- idx found )  binary search of a page's cells:
+\ idx is the first cell with key >= the search key (nkeys if none), found is
+\ -1 when cell idx's key is equal.  Machine code: the per-level cost of a get.
+: pgsearch
+03260100 ,   \ lw a2,0(sp)          ( klen )
+83254100 ,   \ lw a1,4(sp)          ( key )
+03258100 ,   \ lw a0,8(sp)          ( page )
+13014100 ,   \ addi sp,sp,4         ( results: idx at 4(sp), found at 0(sp) )
+93020000 ,   \ li t0,0              ( lo )
+03234500 ,   \ lw t1,4(a0)          ( hi = nkeys )
+63F46208 ,   \ loop: bgeu t0,t1,none
+B3836200 ,   \ add t2,t0,t1
+93D31300 ,   \ srli t2,t2,0x1       ( mid )
+139E2300 ,   \ slli t3,t2,0x2
+330EAE00 ,   \ add t3,t3,a0
+032E0E01 ,   \ lw t3,16(t3)         ( slot[mid] )
+330EAE00 ,   \ add t3,t3,a0         ( cell )
+835F0E00 ,   \ lhu t6,0(t3)         ( cl = cell klen )
+930E8E00 ,   \ addi t4,t3,8         ( ck = cell key )
+138F0F00 ,   \ mv t5,t6
+6364CF00 ,   \ bltu t5,a2,cmp       ( n = min(cl, klen) )
+130F0600 ,   \ mv t5,a2
+93860E00 ,   \ cmp: mv a3,t4
+13870500 ,   \ mv a4,a1
+93070F00 ,   \ mv a5,t5
+63820702 ,   \ byte: beqz a5,len
+03C80600 ,   \ lbu a6,0(a3)
+83480700 ,   \ lbu a7,0(a4)
+63681803 ,   \ bltu a6,a7,right
+63EA0803 ,   \ bltu a7,a6,left
+93861600 ,   \ addi a3,a3,1
+13071700 ,   \ addi a4,a4,1
+9387F7FF ,   \ addi a5,a5,-1
+6FF01FFE ,   \ j byte
+63ECCF00 ,   \ len: bltu t6,a2,right
+636EF601 ,   \ bltu a2,t6,left
+23227100 ,   \ sw t2,4(sp)          ( equal: idx = mid )
+130EF0FF ,   \ li t3,-1
+2320C101 ,   \ sw t3,0(sp)          ( found )
+6F00C001 ,   \ j done
+93821300 ,   \ right: addi t0,t2,1  ( lo = mid + 1 )
+6FF05FF8 ,   \ j loop
+13830300 ,   \ left: mv t1,t2       ( hi = mid )
+6FF0DFF7 ,   \ j loop
+23225100 ,   \ none: sw t0,4(sp)    ( idx = lo )
+23200100 ,   \ sw zero,0(sp)
+;            \ done:
+
+: pgfreesp ( page -- n )  dup 8 lit + @ swap 4 lit + @ 2 lit lshift - 10 lit - ;
+: pgcell   ( page i -- cell )  2 lit lshift over + 10 lit + @ + ;
+: lcellsz  ( cell -- n )
+	dup h@ over 2 lit + h@ 1 lit and if 4 lit else over 4 lit + @ then
+	+ 8 lit + 3 lit + FFFFFFFC lit and nip ;
+: bcellsz  ( cell -- n )  h@ 8 lit + 3 lit + FFFFFFFC lit and ;
+: cellsz   ( page cell -- n )  swap @ 1 lit = if lcellsz else bcellsz then ;
+
+\ cellins ( page idx size -- cell )  open slot idx and carve size bytes
+: cellins
+	2 lit pick 8 lit + @ swap -                      \ page idx upper'
+	2 lit pick 4 lit + @                             \ page idx upper' n
+	begin dup 3 lit pick u> while                    \ slot[n] = slot[n-1] down to idx
+		dup 2 lit lshift 4 lit pick + 10 lit +
+		dup 4 lit - @ swap !
+		1 lit -
+	repeat drop
+	over 2 lit lshift 3 lit pick + 10 lit + over swap !   \ slot[idx] = upper'
+	dup 3 lit pick 8 lit + !                         \ upper = upper'
+	2 lit pick 4 lit + dup @ 1 lit + swap !          \ nkeys++
+	nip + ;
+
+\ celldel ( page idx -- )  close slot idx (the cell's bytes stay)
+: celldel
+	over 4 lit + @ 1 lit -                           \ page idx last
+	begin 2dup swap u> while
+		over 2 lit lshift 3 lit pick + 10 lit +
+		dup 4 lit + @ swap !
+		swap 1 lit + swap
+	repeat
+	2drop
+	4 lit + dup @ 1 lit - swap ! ;
+
+: ccp variable ;  : ccs variable ;  : ccu variable ;
+\ pgcmpct ( page -- )  rebuild the page without its dead cells
+: pgcmpct
+	ccp !  st @ 8 lit + @ ccs !  1000 lit ccu !
+	ccp @ ccs @ 10 lit mcopy
+	ccp @ 4 lit + @ ?dup if 0 lit do
+		ccp @ i pgcell                               \ cell
+		ccp @ over cellsz ccu @ swap - ccu !
+		ccs @ ccu @ + ccp @ 2 lit pick cellsz mcopy
+		ccu @ ccs @ i 2 lit lshift + 10 lit + !
+	loop then
+	ccu @ ccs @ 8 lit + !
+	ccs @ ccp @ 1000 lit mcopy ;
+
+\ pginit ( pgno addr type -- pgno addr )  a fresh tree page
+: pginit  over !  0 lit over 4 lit + !  1000 lit over 8 lit + ! ;
+
+\ ── overflow chains ───────────────────────────────────────────────────────────
+
+: ovp variable ;
+: owv variable ;  : owc variable ;  : owp variable ;  : owf variable ;
+: orb variable ;  : orc variable ;
+
+: ovwrite ( val vlen -- first )
+	owc ! owv !  0 lit owp !  0 lit owf !
+	begin
+		pgnew 3 lit pginit                           \ pgno addr
+		owv @ over 8 lit + owc @ FF8 lit umin mcopy
+		owc @ FF8 lit umin dup owv @ + owv !  owc @ swap - owc !
+		drop                                         \ pgno
+		owf @ 0= if dup owf ! then
+		owp @ if dup owp @ pgget 4 lit + ! then      \ link the previous page here
+		owp !
+		owc @ 0=
+	until
+	owf @ ;
+
+: ovread ( pgno buf cap -- )
+	orc ! orb !
+	begin ?dup while
+		dup pgget                                    \ pgno page
+		dup 8 lit + orb @ orc @ FF8 lit umin mcopy
+		orc @ FF8 lit umin dup orb @ + orb !  orc @ swap - orc !
+		4 lit + @ nip
+	repeat ;
+
+: ovfree ( pgno -- )  begin ?dup while dup pgget 4 lit + @ swap pgfree repeat ;
+
+\ ── transactions ──────────────────────────────────────────────────────────────
+
+: root@ ( txn -- root )  4 lit + @ ;
+: root! ( root txn -- )  4 lit + ! ;
+: wtx?  ( txn -- flag )  @ 2 lit = ;
+
+: txfree ( -- txn )
+	0 lit 10 lit 0 lit do
+		dup 0= if i 4 lit lshift st @ @ + dup @ 0= if nip else drop then then
+	loop
+	dup 0= if "store: no free transaction record" stdie then ;
+
+: txbeg ( write? -- txn )
+	txfree swap if
+		pgwtx if "store: a write transaction is already open" stdie then
+		pgwbeg 2 lit over !  pgroot over root!
+	else
+		pgrbeg over root!  1 lit over !
+	then ;
+
+: txcommit ( txn -- )
+	dup wtx? if dup root@ pgcommit else pgrend then 0 lit swap ! ;
+: txabort ( txn -- )
+	dup wtx? if pgabort else pgrend then 0 lit swap ! ;
+
+\ ── the path: root to leaf, one (pgno, idx) per level ─────────────────────────
+
+: depth variable ;   : lidx variable ;   : lfound variable ;
+: pathpg  ( i -- pgno )   3 lit lshift st @ C lit + @ + @ ;
+: pathpg! ( pgno i -- )   3 lit lshift st @ C lit + @ + ! ;
+: pathix  ( i -- idx )    3 lit lshift st @ C lit + @ + 4 lit + @ ;
+: pathix! ( idx i -- )    3 lit lshift st @ C lit + @ + 4 lit + ! ;
+: leafpg  ( -- pgno )     depth @ 1 lit - pathpg ;
+
+: dk variable ;  : dkl variable ;  : dcow variable ;
+\ descend ( txn key klen cow? -- )  fill the path for key; with cow?, copy every
+\ page on it (pgcow) and point each parent at its copy.  Leaves lidx/lfound.
+: descend
+	dcow ! dkl ! dk !
+	dup root@ dcow @ if pgcow drop 2dup swap root! then nip    \ pgno
+	0 lit depth !
+	begin
+		dup depth @ pathpg!
+		dup pgget                                            \ pgno page
+		dup @ 1 lit = if
+			dk @ dkl @ pgsearch lfound ! dup lidx ! depth @ pathix!
+			depth @ 1 lit + depth !  -1 lit
+		else
+			dk @ dkl @ pgsearch if else 1 lit - then         \ pgno ci
+			dup depth @ pathix!
+			over pgget over pgcell 4 lit + @                 \ pgno ci child
+			dcow @ if
+				pgcow drop                                   \ pgno ci child'
+				dup 3 lit pick pgget 3 lit pick pgcell 4 lit + !   \ parent cell -> child'
+			then
+			nip nip
+			depth @ 1 lit + depth !  0 lit
+		then
+	until drop ;
+
+\ ── get ───────────────────────────────────────────────────────────────────────
+
+: gbuf variable ;  : gcap variable ;
+
+\ lcopy ( cell -- vlen )  the cell's value into gbuf (at most gcap bytes)
+: lcopy
+	dup 4 lit + @ swap                                       \ vlen cell
+	dup 8 lit + over h@ +                                    \ vlen cell vaddr
+	swap 2 lit + h@ 1 lit and if
+		ovp 4 lit mcopy  ovp @ gbuf @ gcap @ ovread
+	else
+		gbuf @ 2 lit pick gcap @ umin mcopy
+	then ;
+
+: get ( txn key klen buf cap -- vlen|-1 )
+	gcap ! gbuf !
+	2 lit pick root@ 0= if 2drop drop -1 lit else
+		0 lit descend
+		lfound @ if leafpg pgget lidx @ pgcell lcopy else -1 lit then
+	then ;
+
+\ ── put ───────────────────────────────────────────────────────────────────────
+
+: pt variable ;  : pk variable ;  : pkl variable ;  : pv variable ;  : pvl variable ;  : pov variable ;
+: bk variable ;  : bkl variable ;  : bc variable ;  : blv variable ;  : bpg variable ;  : bsz variable ;
+: bsa variable ;  : bsn variable ;  : bsh variable ;  : bskl variable ;
+: lsp variable ;  : lsn variable ;  : lsa variable ;  : lsh variable ;  : lvl variable ;
+
+\ lcell! ( cell key klen val n vlen ovf -- )  write a leaf cell; n bytes of
+\ value data (the bytes, or the 4-byte overflow page number)
+: lcell!
+	6 lit pick 2 lit + h!                                    \ flags
+	5 lit pick 4 lit + !                                     \ vlen
+	2 lit pick 5 lit pick h!                                 \ klen
+	4 lit pick 8 lit + 3 lit pick +                          \ cell key klen val n dst
+	swap mcopy                                               \ value
+	rot 8 lit + swap mcopy ;                                 \ key
+
+: bcell! ( cell -- )  bkl @ over h!  bc @ over 4 lit + !  bk @ swap 8 lit + bkl @ mcopy ;
+
+\ newroot ( -- )  the root split: a branch over the old root and bsn
+: newroot
+	pgnew 2 lit pginit                                       \ pgno addr
+	dup 0 lit 8 lit cellins 0 lit over h! pt @ root@ swap 4 lit + !
+	dup 1 lit bsz @ cellins bcell!
+	drop pt @ root! ;
+
+\ bsplit ( -- )  halve the branch bpg: the right half moves to a new branch,
+\ the pending cell (bk/bc) goes to its side, and the right half's first key
+\ is promoted: it becomes the pending cell for the level above.
+: bsplit
+	pgnew 2 lit pginit bsa ! bsn !
+	bpg @ 4 lit + @ 1 lit rshift bsh !
+	bpg @ bsh @ pgcell h@ bskl !
+	bpg @ 4 lit + @ bsh @ do
+		bpg @ i pgcell dup bcellsz                           \ cell sz
+		bsa @ i bsh @ - 2 lit pick cellins swap mcopy
+	loop
+	bsh @ bpg @ 4 lit + !  bpg @ pgcmpct
+	blv @ pathix 1 lit + dup bsh @ u> if bsh @ - bsa @ swap else bpg @ swap then
+	bsz @ cellins bcell!
+	bsa @ 0 lit pgcell dup 8 lit + st @ 10 lit + @ bskl @ mcopy  0 lit swap h!
+	st @ 10 lit + @ bk !  bskl @ bkl !  bsn @ bc !  blv @ 1 lit - blv ! ;
+
+\ brins ( key klen child lvl -- )  insert a separator after the path's child at
+\ level lvl, splitting the branch when full and carrying the promoted key up;
+\ level -1 is a new root
+: brins
+	blv ! bc ! bkl ! bk !
+	begin
+		bkl @ 8 lit + 3 lit + FFFFFFFC lit and bsz !
+		blv @ 0< if newroot -1 lit else
+			blv @ pathpg pgget bpg !
+			bpg @ pgfreesp bsz @ 4 lit + u< if bpg @ pgcmpct then          \ the cell and its slot
+			bpg @ pgfreesp bsz @ 4 lit + u< if bsplit 0 lit else
+				bpg @ blv @ pathix 1 lit + bsz @ cellins bcell! -1 lit
+			then
+		then
+	until ;
+
+: lcsz ( -- size )  pkl @ 8 lit + pov @ if 4 lit else pvl @ then + 3 lit + FFFFFFFC lit and ;
+
+\ lsplit ( size page -- size page' )  halve the leaf; page' is the half the
+\ pending key belongs to, lidx its index there; the separator goes up
+: lsplit
+	lsp !
+	pgnew 1 lit pginit lsa ! lsn !
+	lsp @ 4 lit + @ 1 lit rshift lsh !
+	lsp @ 4 lit + @ lsh @ do
+		lsp @ i pgcell dup lcellsz
+		lsa @ i lsh @ - 2 lit pick cellins swap mcopy
+	loop
+	lsh @ lsp @ 4 lit + !  lsp @ pgcmpct
+	lsa @ 0 lit pgcell dup 8 lit + swap h@ lsn @ lvl @ 1 lit - brins
+	lidx @ lsh @ u> if lidx @ lsh @ - lidx ! lsa @ else lsp @ then ;
+
+\ lkill ( page idx -- )  remove a leaf cell, freeing its overflow chain
+: lkill
+	2dup pgcell dup 2 lit + h@ 1 lit and if
+		dup 8 lit + over h@ + ovp 4 lit mcopy ovp @ ovfree
+	then drop celldel ;
+
+\ lins ( -- )  the pending cell into the leaf at lidx
+: lins
+	lcsz depth @ 1 lit - dup lvl ! pathpg pgget              \ size page
+	dup pgfreesp 2 lit pick 4 lit + u< if dup pgcmpct then           \ the cell and its slot
+	dup pgfreesp 2 lit pick 4 lit + u< if lsplit then
+	lidx @ 2 lit pick cellins                                \ size cell
+	pk @ pkl @ pov @ if ovp 4 lit else pv @ pvl @ then pvl @ pov @ lcell! drop ;
+
+: put ( txn key klen val vlen -- )
+	pvl ! pv ! pkl ! pk ! pt !
+	pkl @ 1FF lit u> if "store: key too long" stdie then
+	pt @ wtx? 0= if "store: put in a read transaction" stdie then
+	pvl @ 400 lit u> dup pov ! if pv @ pvl @ ovwrite ovp ! then
+	pt @ root@ 0= if pgnew 1 lit pginit drop pt @ root! then
+	pt @ pk @ pkl @ -1 lit descend
+	lfound @ if leafpg pgget lidx @ lkill then
+	lins ;
+
+\ ── del ───────────────────────────────────────────────────────────────────────
+
+\ bdel ( page idx -- )  remove a branch cell; the new first key becomes empty
+: bdel
+	2dup celldel 0= if
+		dup 4 lit + @ if 0 lit pgcell 0 lit swap h! else drop then
+	else drop then ;
+
+\ lshrink ( -- )  unlink the leaf if it emptied, and so on up; collapse a root
+\ branch left with one child
+: lshrink
+	depth @ 1 lit - lvl !
+	begin lvl @ pathpg pgget 4 lit + @ 0=  lvl @ 0 lit u> and while
+		lvl @ pathpg pgfree
+		lvl @ 1 lit - pathpg pgget lvl @ 1 lit - pathix bdel
+		lvl @ 1 lit - lvl !
+	repeat
+	lvl @ 0= if
+		0 lit pathpg pgget dup @ 2 lit = over 4 lit + @ 1 lit = and if
+			0 lit pgcell 4 lit + @  0 lit pathpg pgfree  pt @ root!
+		else drop then
+	then ;
+
+: del ( txn key klen -- flag )
+	2 lit pick pt !
+	pt @ wtx? 0= if "store: del in a read transaction" stdie then
+	pt @ root@ 0= if 2drop drop 0 lit else
+		-1 lit descend
+		lfound @ if leafpg pgget lidx @ lkill lshrink -1 lit else 0 lit then
+	then ;
+
+\ ── cursors ───────────────────────────────────────────────────────────────────
+\ record: +0 txn (0 = free)  +4 valid  +8 depth  +C path (8 x (pgno, idx))
+
+: cpg  ( cur l -- pgno )  3 lit lshift + C lit + @ ;
+: cpg! ( pgno cur l -- )  3 lit lshift + C lit + ! ;
+: cix  ( cur l -- idx )   3 lit lshift + 10 lit + @ ;
+: cix! ( idx cur l -- )   3 lit lshift + 10 lit + ! ;
+: cu variable ;  : cl variable ;  : cok variable ;
+
+: curopen ( txn -- cur )
+	0 lit 10 lit 0 lit do
+		dup 0= if i 50 lit * st @ 4 lit + @ + dup @ 0= if nip else drop then then
+	loop
+	dup 0= if "store: no free cursor" stdie then
+	tuck !  0 lit over 4 lit + ! ;
+
+: curclose ( cur -- )  0 lit swap ! ;
+
+\ cdown ( cur -- )  from level cl, follow the current indices' children to the
+\ leaf, taking index 0 at each new level
+: cdown
+	cu !
+	begin cl @ cu @ 8 lit + @ 1 lit - u< while
+		cu @ cl @ cpg pgget cu @ cl @ cix pgcell 4 lit + @
+		cl @ 1 lit + cl !
+		cu @ cl @ cpg!  0 lit cu @ cl @ cix!
+	repeat ;
+
+: curfirst ( cur -- flag )
+	dup @ root@ 0= if 0 lit over 4 lit + ! drop 0 lit else
+		dup @ root@ over 0 lit cpg!  0 lit over 0 lit cix!
+		dup @ root@ 1 lit                                    \ cur pgno d
+		begin over pgget @ 2 lit = while
+			swap pgget 0 lit pgcell 4 lit + @ swap 1 lit +
+		repeat
+		2 lit pick 8 lit + ! drop                            \ depth
+		0 lit cl !  dup cdown
+		dup dup 8 lit + @ 1 lit - cpg pgget 4 lit + @ 0 lit <>   \ cur flag
+		tuck swap 4 lit + !
+	then ;
+
+: curnext ( cur -- flag )
+	dup 4 lit + @ 0= if drop 0 lit else
+		cu !  cu @ 8 lit + @ 1 lit - cl !  -1 lit cok !
+		begin
+			cu @ cl @ cix 1 lit +  cu @ cl @ cpg pgget 4 lit + @  u< if -1 lit
+			else cl @ 0= if 0 lit cok ! -1 lit else cl @ 1 lit - cl ! 0 lit then then
+		until
+		cok @ if
+			cu @ cl @ cix 1 lit + cu @ cl @ cix!
+			cu @ cdown
+			-1 lit
+		else 0 lit cu @ 4 lit + ! 0 lit then
+	then ;
+
+: curseek ( cur key klen -- flag )
+	2 lit pick @ root@ 0= if 2drop 0 lit over 4 lit + ! drop 0 lit else
+		2 lit pick @ -rot 0 lit descend                      \ cur
+		depth @ over 8 lit + !
+		depth @ 0 lit do i pathpg over i cpg!  i pathix over i cix! loop
+		-1 lit over 4 lit + !
+		lidx @ leafpg pgget 4 lit + @ u< 0= if                \ past this leaf's last key
+			leafpg pgget 4 lit + @ ?dup if
+				1 lit - over depth @ 1 lit - cix!  dup curnext drop
+			else 0 lit over 4 lit + ! then
+		then
+		drop lfound @
+	then ;
+
+: curcell ( cur -- cell )
+	dup dup 8 lit + @ 1 lit - cpg pgget swap dup 8 lit + @ 1 lit - cix pgcell ;
+
+: curkey ( cur buf cap -- klen|-1 )
+	gcap ! gbuf !
+	dup 4 lit + @ 0= if drop -1 lit else
+		curcell dup 8 lit + gbuf @ 2 lit pick h@ gcap @ umin mcopy h@
+	then ;
+
+: curval ( cur buf cap -- vlen|-1 )
+	gcap ! gbuf !
+	dup 4 lit + @ 0= if drop -1 lit else curcell lcopy then ;
+
+\ ── setup ─────────────────────────────────────────────────────────────────────
+
+: stinit ( -- )
+	14 lit alloc st !
+	100 lit alloc dup 40 lit pgzero st @ !
+	500 lit alloc dup 140 lit pgzero st @ 4 lit + !
+	2000 lit alloc FFF lit + FFFFF000 lit and st @ 8 lit + !
+	40 lit alloc st @ C lit + !
+	200 lit alloc st @ 10 lit + ! ;
+
+\ ──────────────────────────────────────────────────────────────────────────────
+\ Tests (--disk; self-skip without one).  Keys are 4 hex digits of a number,
+\ values 32 bytes derived from it.  The big fill uses key = i*7 mod 20000, so
+\ each transaction's 500 keys cover a contiguous range (under the 64 dirty
+\ pages a transaction may hold) while the tree as a whole fills in scrambled
+\ order.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+Test {
+	stopen {
+		: sds variable ;  : sk variable ;  : sv variable ;  : sbuf variable ;  : stx variable ;  : scr variable ;
+		: k! ( n -- addr len )
+			4 lit 0 lit do
+				dup 3 lit i - 2 lit lshift rshift F lit and dup A lit u< if 30 lit + else 37 lit + then sk @ i + c!
+			loop drop sk @ 4 lit ;
+		: v! ( n -- addr len )  20 lit 0 lit do dup FF lit and i xor sv @ i + c! loop drop sv @ 20 lit ;
+		: vchk ( n -- flag )  -1 lit swap 20 lit 0 lit do dup FF lit and i xor sbuf @ i + c@ <> if swap drop 0 lit swap then loop drop ;
+		: sput ( txn n -- )  dup k! rot v! put ;
+		: sget ( txn n -- vlen )  k! sbuf @ 100 lit get ;
+		dsinit sds !
+		sds @ if
+			sds @ pgopen drop pgwipe sds @ pgopen drop stinit
+			10 lit alloc sk !  40 lit alloc sv !  3000 lit alloc sbuf !
+			0 lit txbeg stx !
+			stx @ 1 lit sget -1 lit asrt_eq
+			stx @ curopen dup curfirst 0 lit asrt_eq curclose
+			stx @ txcommit
+		then
+	}
+	putget {
+		sds @ if
+			-1 lit txbeg stx !
+			stx @ 1 lit sput  stx @ 2 lit sput  stx @ 3 lit sput
+			stx @ 2 lit sget 20 lit asrt_eq  2 lit vchk assert
+			stx @ 1 lit sget 20 lit asrt_eq  1 lit vchk assert
+			stx @ 4 lit sget -1 lit asrt_eq
+			stx @ 3 lit sget 20 lit asrt_eq  3 lit vchk assert
+			stx @ txcommit
+			0 lit txbeg stx !
+			stx @ 3 lit sget 20 lit asrt_eq  3 lit vchk assert
+			stx @ txcommit
+			sds @ pgopen drop stinit                                   \ reopen: all from the disk
+			0 lit txbeg stx !  stx @ 1 lit sget 20 lit asrt_eq  1 lit vchk assert  stx @ txcommit
+		then
+	}
+	replace {
+		sds @ if
+			-1 lit txbeg stx !
+			stx @ 1 lit k! "new" 3 lit put
+			stx @ 1 lit sget 3 lit asrt_eq  sbuf @ c@ 'n' lit asrt_eq
+			stx @ 2 lit k! del -1 lit asrt_eq
+			stx @ 2 lit k! del 0 lit asrt_eq
+			stx @ 2 lit sget -1 lit asrt_eq
+			stx @ 3 lit sget 20 lit asrt_eq
+			stx @ txcommit
+		then
+	}
+	abort {
+		sds @ if
+			-1 lit txbeg stx !  stx @ 7 lit sput  stx @ 7 lit sget 20 lit asrt_eq  stx @ txabort
+			0 lit txbeg stx !  stx @ 7 lit sget -1 lit asrt_eq  stx @ txcommit
+		then
+	}
+	\ 20000 keys over 40 transactions: splits at every level, three levels
+	fill {
+		sds @ if
+			28 lit 0 lit do
+				-1 lit txbeg stx !
+				1F4 lit 0 lit do i j 1F4 lit * + 7 lit * 4E20 lit % stx @ swap sput loop
+				stx @ txcommit
+			loop
+			0 lit txbeg stx !
+			4E20 lit 0 lit do stx @ i sget 20 lit asrt_eq i vchk assert loop
+			pgroot pgget @ 2 lit asrt_eq
+			pgroot pgget 0 lit pgcell 4 lit + @ pgget @ 2 lit asrt_eq
+			stx @ txcommit
+		then
+	}
+	\ a cursor walk visits every key, ascending
+	walk {
+		sds @ if
+			0 lit txbeg stx !  stx @ curopen scr !
+			scr @ curfirst assert
+			0 lit
+			begin
+				scr @ sbuf @ 10 lit curkey 4 lit asrt_eq
+				dup k! 2drop 4 lit 0 lit do sk @ i + c@ sbuf @ i + c@ asrt_eq loop
+				scr @ sbuf @ 100 lit curval 20 lit asrt_eq  dup vchk assert
+				1 lit +
+				scr @ curnext 0=
+			until
+			4E20 lit asrt_eq
+			scr @ curclose stx @ txcommit
+		then
+	}
+	\ seek: the first key >= the one asked for
+	seek {
+		sds @ if
+			0 lit txbeg stx !  stx @ curopen scr !
+			scr @ "0005" 4 lit curseek -1 lit asrt_eq  scr @ sbuf @ 10 lit curkey 4 lit asrt_eq
+			scr @ "00051" 5 lit curseek 0 lit asrt_eq  scr @ sbuf @ 10 lit curkey 4 lit asrt_eq  sbuf @ 3 lit + c@ '6' lit asrt_eq
+			scr @ "4E1F" 4 lit curseek -1 lit asrt_eq  scr @ curnext 0 lit asrt_eq  scr @ sbuf @ 10 lit curkey -1 lit asrt_eq
+			scr @ "4E20" 4 lit curseek 0 lit asrt_eq  scr @ sbuf @ 10 lit curkey -1 lit asrt_eq
+			scr @ sbuf @ 0 lit curseek 0 lit asrt_eq  scr @ sbuf @ 10 lit curkey 4 lit asrt_eq  sbuf @ c@ '0' lit asrt_eq
+			scr @ curclose stx @ txcommit
+		then
+	}
+	\ values past 1 KiB live in overflow chains and come back whole
+	big {
+		sds @ if
+			-1 lit txbeg stx !
+			2EE0 lit 0 lit do i 3 lit * FF lit and sbuf @ i + c! loop
+			stx @ "big" 3 lit sbuf @ 2EE0 lit put
+			sbuf @ C00 lit pgzero
+			stx @ "big" 3 lit sbuf @ 3000 lit get 2EE0 lit asrt_eq
+			-1 lit 2EE0 lit 0 lit do sbuf @ i + c@ i 3 lit * FF lit and <> if drop 0 lit then loop assert
+			sbuf @ C00 lit pgzero
+			stx @ "big" 3 lit sbuf @ 64 lit get 2EE0 lit asrt_eq             \ the length is the whole, the copy the cap
+			sbuf @ 64 lit + c@ 0 lit asrt_eq  sbuf @ 63 lit + c@ 63 lit 3 lit * FF lit and asrt_eq
+			stx @ txcommit
+			-1 lit txbeg stx !
+			stx @ "big" 3 lit "small" 5 lit put
+			pg @ 40 lit + @ 3 lit u< 0= assert                                \ the chain's 3 pages were freed
+			stx @ "big" 3 lit sbuf @ 100 lit get 5 lit asrt_eq
+			stx @ "big" 3 lit del -1 lit asrt_eq
+			stx @ txcommit
+			0 lit txbeg stx !  stx @ "big" 3 lit sbuf @ 100 lit get -1 lit asrt_eq  stx @ txcommit
+		then
+	}
+	\ a reader opened before a commit keeps its snapshot
+	snapshot {
+		sds @ if
+			0 lit txbeg stx !                                   \ key 1 is 32 bytes again since fill
+			-1 lit txbeg dup 1 lit k! "later" 5 lit put txcommit
+			stx @ 1 lit sget 20 lit asrt_eq  1 lit vchk assert
+			stx @ txcommit
+			0 lit txbeg stx !  stx @ 1 lit sget 5 lit asrt_eq  stx @ txcommit
+		then
+	}
+	\ delete everything: leaves unlink, the root collapses to an empty leaf,
+	\ and the pages come back
+	drain {
+		sds @ if
+			28 lit 0 lit do
+				-1 lit txbeg stx !
+				1F4 lit 0 lit do i j 1F4 lit * + 7 lit * 4E20 lit % stx @ swap k! del -1 lit asrt_eq loop
+				stx @ txcommit
+			loop
+			-1 lit txbeg stx !
+			stx @ curopen dup curfirst 0 lit asrt_eq curclose
+			pgroot pgget dup @ 1 lit asrt_eq 4 lit + @ 0 lit asrt_eq
+			pgnfree C8 lit u> assert
+			stx @ txabort
+		then
+	}
+}
+
+Bench {
+	\ 20000 puts over 40 transactions of 500 (setup for the rest): per put,
+	\ commits included
+	stfill {
+		: bsk variable ;  : bsv variable ;  : bsb variable ;  : bstx variable ;
+		: bk! ( n -- addr len )
+			4 lit 0 lit do
+				dup 3 lit i - 2 lit lshift rshift F lit and dup A lit u< if 30 lit + else 37 lit + then bsk @ i + c!
+			loop drop bsk @ 4 lit ;
+		: bput ( txn n -- )  bk! bsv @ 20 lit put ;
+		dsinit ?dup if
+			pgopen drop pgwipe pgds pgopen drop stinit
+			10 lit alloc bsk !  40 lit alloc bsv !  3000 lit alloc bsb !
+			bgo
+			28 lit 0 lit do
+				-1 lit txbeg bstx !
+				1F4 lit 0 lit do i j 1F4 lit * + 7 lit * 4E20 lit % bstx @ swap bput loop
+				bstx @ txcommit
+			loop
+			4E20 lit bops
+		else bskip then
+	}
+	\ get of a key in the 20000-key tree: three levels, then the copy
+	stget {
+		pgds if
+			0 lit txbeg bstx !
+			bgo
+			2710 lit 0 lit do bstx @ i 7 lit * 4E20 lit % bk! bsb @ 100 lit get drop loop
+			bstop bstx @ txcommit
+			2710 lit bops
+		else bskip then
+	}
+	\ a cursor walk over all 20000 keys, reading each value
+	stscan {
+		pgds if
+			0 lit txbeg bstx !  bstx @ curopen
+			dup curfirst drop
+			bgo
+			begin dup bsb @ 100 lit curval drop dup curnext 0= until
+			bstop curclose bstx @ txcommit
+			4E20 lit bops
+		else bskip then
+	}
+	\ 1000 puts into one transaction (replacing existing keys), then abort:
+	\ the tree work alone
+	stput1k {
+		pgds if
+			-1 lit txbeg bstx !
+			bgo
+			3E8 lit 0 lit do bstx @ i bput loop
+			bstop bstx @ txabort
+			3E8 lit bops
+		else bskip then
+	}
+	\ a transaction of 100 puts committed, ten times: per transaction
+	stcommit {
+		pgds if
+			bgo
+			A lit 0 lit do
+				-1 lit txbeg bstx !
+				64 lit 0 lit do bstx @ i j 64 lit * + bput loop
+				bstx @ txcommit
+			loop
+			A lit bops
+		else bskip then
+	}
+}

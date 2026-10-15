@@ -1,0 +1,509 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/pager.fam — copy-on-write pages over src/disk.fam: the store's foundation.
+\
+\ A page is 4 KiB (eight sectors), numbered from 0.  Pages 0 and 1 are the two
+\ meta pages (LMDB's shape): each names a transaction id, the root page of that
+\ transaction's tree, the allocation frontier and the free lists, and carries a
+\ checksum.  A commit writes the transaction's new pages, flushes, writes the
+\ meta page for the new id into the slot the OLDER meta occupies, and flushes
+\ again.  Open takes the newer meta that checks out, so a crash anywhere leaves
+\ the previous transaction intact and nothing is ever updated in place.
+\
+\ Write transaction (one at a time):
+\   pgwbeg   ( -- )               begin; reclaims pages no reader can see
+\   pgnew    ( -- pgno addr )     a fresh zeroed page, dirty
+\   pgcow    ( pgno -- pgno' addr )  a private copy of a page, the original
+\                                 freed: the step a B+tree takes on every page
+\                                 of the path it changes.  A page already made
+\                                 in this transaction comes back as itself.
+\   pgfree   ( pgno -- )          free a page (reusable once no reader needs it)
+\   pgcommit ( root -- )          make it durable with this root
+\   pgabort  ( -- )               drop every change
+\ Readers:
+\   pgrbeg   ( -- root )          snapshot: the root as of the last commit, and
+\                                 a promise that its pages stay until pgrend
+\   pgrend   ( -- )               release it (one snapshot per thread)
+\   pgget    ( pgno -- addr )     the page, through the cache; a miss reads it
+\                                 (blocking on the disk's doorbell)
+\ Setup:
+\   pgopen   ( ds -- flag )       open, formatting an empty disk; -1 when done
+\   pgwipe   ( -- )               erase both metas (the next pgopen formats)
+\   pgtx pgroot pgnext pgnfree pgnpend   ( -- n )   state, for tests and tools
+\
+\ Rules for the code above it:
+\   An address from pgget/pgnew/pgcow is good until the next pgget/pgnew/pgcow:
+\   the cache may evict a clean page to make room.  Hold page NUMBERS across
+\   calls, not addresses.  Dirty pages are never evicted, so a transaction can
+\   dirty at most the pool's 64 pages (256 KiB) before it commits.
+\
+\ Cache: 64 slots x 16 bytes (pgno, flags, addr, stamp), pages page-aligned,
+\ flags bit0 dirty, bit1 made in this transaction.  Lookup is a slot scan; the
+\ victim is an empty slot or the least recently used clean one.
+\
+\ Free space: pages freed in transaction N are PENDING until every reader's
+\ snapshot is >= N, then free.  Both lists are written into the meta page, so
+\ nothing is lost across a restart (at open every pending page is free: there
+\ are no readers).  Lists have fixed capacity; a page past it leaks rather than
+\ halting the node.  Meta page: +00 magic 'QPG1'  +04 txnid  +08 root  +0C next
+\ +10 nfree  +14 npend  +1C checksum (of the page with this word zero), then
+\ nfree page numbers and npend (txn, page) pairs: 512 + 252 fill the page.
+\
+\ State (`pg` points at it): +00 ds  +04 slots  +08 pages  +0C txnid  +10 root
+\ +14 next  +18 nfree +1C free  +20 npend +24 pend  +28 write txn (0 none)
+\ +2C meta buffer  +30 readers[16]  +34 stamp  +40 nfreed +44 freed (this txn)
+\ +48 pages on the disk  +4C,+50 next/nfree at txn begin (for abort)  +54 writes
+\ Needs src/fence.fam src/proc.fam src/disk.fam before it.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: pg variable ;
+
+: pgdie ( msg -- )   \ an invariant broke: say so and stop the node (exit 1)
+	0A lit putc puts 0A lit putc
+	B7021000 ,   \ lui  t0, 0x100           ( SiFive finisher )
+	37330100 ,   \ lui  t1, 0x13
+	13033333 ,   \ addi t1, t1, 0x333       ( FAIL -> exit 1 )
+	23A06200 ,   \ sw   t1, 0(t0)
+	6F000000 ,   \ jal  x0, .
+;
+
+: pgds    pg @ @ ;
+: pgtx    pg @ C lit + @ ;
+: pgroot  pg @ 10 lit + @ ;
+: pgnext  pg @ 14 lit + @ ;
+: pgnfree pg @ 18 lit + @ ;
+: pgnpend pg @ 20 lit + @ ;
+: pgwtx   pg @ 28 lit + @ ;
+: pgmeta  pg @ 2C lit + @ ;
+: pgslot ( i -- slot )  4 lit lshift pg @ 4 lit + @ + ;
+: pgpid   cur 8C lit + @ ;
+
+: pgzero ( addr nwords -- )  0 lit do 0 lit over i 2 lit lshift + ! loop drop ;
+
+\ ── lists ─────────────────────────────────────────────────────────────────────
+
+: pgfpush ( pgno -- )   \ onto the free list (512; past that the page leaks)
+	pgnfree dup 200 lit u< if
+		dup 1 lit + pg @ 18 lit + !
+		2 lit lshift pg @ 1C lit + @ + !
+	else 2drop then ;
+
+: pgfrd ( pgno -- )     \ onto this transaction's freed list (256)
+	pg @ 40 lit + @ dup 100 lit u< if
+		dup 1 lit + pg @ 40 lit + !
+		2 lit lshift pg @ 44 lit + @ + !
+	else 2drop then ;
+
+: pgpend+ ( tag pgno -- )   \ onto the pending list (252 pairs)
+	pgnpend dup FC lit u< if
+		dup 1 lit + pg @ 20 lit + !
+		3 lit lshift pg @ 24 lit + @ +     \ tag pgno pair
+		tuck 4 lit + ! !
+	else drop 2drop then ;
+
+\ pgoldest ( -- txnid )  the oldest snapshot any reader holds, 0 when none
+: pgoldest
+	0 lit
+	10 lit 0 lit do
+		i 2 lit lshift pg @ 30 lit + @ + @ ?dup if
+			over 0= if nip else 2dup u> if nip else drop then then
+		then
+	loop ;
+
+\ pgreclm ( -- )  pending pages no reader can see become free
+: pgreclm
+	pgoldest 0 lit                                   \ r k
+	pgnpend ?dup if 0 lit do                         \ (a zero count still runs a do loop once)
+		i 3 lit lshift pg @ 24 lit + @ +             \ r k pair
+		dup @ 3 lit pick                             \ r k pair tag r
+		dup 0= if 2drop -1 lit else swap u< 0= then  \ safe: no reader, or tag <= r
+		if 4 lit + @ pgfpush
+		else
+			over 3 lit lshift pg @ 24 lit + @ +      \ r k pair dst   (compact)
+			over @ over !  swap 4 lit + @ swap 4 lit + !
+			1 lit +
+		then
+	loop then
+	pg @ 20 lit + ! drop ;
+
+\ ── cache ─────────────────────────────────────────────────────────────────────
+
+\ pgscan ( base pgno -- slot|0 )  the 64-slot scan, machine code: a fam loop
+\ here cost 12 us per page access, which a B+tree pays once per level.
+: pgscan
+03250100 ,   \ lw a0,0(sp)          ( pgno )
+83254100 ,   \ lw a1,4(sp)          ( base )
+13014100 ,   \ addi sp,sp,4
+13860540 ,   \ addi a2,a1,1024      ( end: 64 slots x 16 )
+83A20500 ,   \ next: lw t0,0(a1)
+638AA200 ,   \ beq t0,a0,found
+93850501 ,   \ addi a1,a1,16
+E3EAC5FE ,   \ bltu a1,a2,next
+23200100 ,   \ sw zero,0(sp)        ( none: 0 )
+6F008000 ,   \ j done
+2320B100 ,   \ found: sw a1,0(sp)
+;            \ done:
+
+: pgfind ( pgno -- slot|0 )  pg @ 4 lit + @ swap pgscan ;
+
+\ pgvictim ( -- slot )  an empty slot, else the least recently used clean one
+: pgvictim
+	0 lit FFFFFFFF lit                               \ best stamp
+	40 lit 0 lit do
+		i pgslot dup @ FFFFFFFF lit = if
+			nip nip 0 lit                            \ empty: nothing beats it
+		else
+			dup 4 lit + @ 1 lit and if drop else     \ dirty: never
+				dup C lit + @ 2 lit pick u< if nip nip dup C lit + @ else drop then
+			then
+		then
+	loop drop
+	dup 0= if "pager: pool exhausted (transaction too large)" pgdie then ;
+
+: pgstamp ( slot -- slot )
+	pg @ 34 lit + dup @ 1 lit + dup rot ! over C lit + ! ;
+
+: pgload ( pgno slot -- )
+	pgds 2 lit pick 3 lit lshift 2 lit pick 8 lit + @ 8 lit vreadn dwait
+	1 lit <> if "pager: read failed" pgdie then drop
+	tuck !  0 lit over 4 lit + !  drop ;
+
+: pgget ( pgno -- addr )
+	dup pgfind ?dup if nip else dup pgvictim tuck pgload nip then
+	pgstamp 8 lit + @ ;
+
+\ ── allocation ────────────────────────────────────────────────────────────────
+
+: pgalloc ( -- pgno )
+	pgnfree ?dup if
+		1 lit - dup pg @ 18 lit + !  2 lit lshift pg @ 1C lit + @ + @
+	else
+		pgnext dup 1 lit + pg @ 14 lit + !
+		dup pg @ 48 lit + @ u< 0= if "pager: disk full" pgdie then
+	then ;
+
+: pgnew ( -- pgno addr )
+	pgalloc dup dup pgfind ?dup 0= if pgvictim then  \ pgno pgno slot: a stale clean slot
+	tuck !                                           \ for this page (a reader re-read it
+	                                                 \ after it was freed) is reused, never
+	                                                 \ doubled
+	3 lit over 4 lit + !                             \ dirty, made here
+	pgstamp 8 lit + @
+	dup 400 lit pgzero ;
+
+: pgfree ( pgno -- )
+	dup pgfind ?dup if FFFFFFFF lit over ! 0 lit swap 4 lit + ! then   \ forget it
+	pgfrd ;
+
+: pgcow ( pgno -- pgno' addr )
+	dup pgfind dup if dup 4 lit + @ 2 lit and else 0 lit then
+	if nip pgstamp dup @ swap 8 lit + @
+	else drop pgnew rot dup pgget 2 lit pick 1000 lit mcopy pgfree then ;
+
+\ ── meta pages ────────────────────────────────────────────────────────────────
+
+: pgsum ( addr -- h )   \ rotate-xor over the page
+	0 lit 400 lit 0 lit do
+		dup 5 lit lshift over 1B lit rshift or
+		2 lit pick i 2 lit lshift + @ xor nip
+	loop nip ;
+
+: pgmetaok ( -- flag )
+	pgmeta @ 51504731 lit = if
+		pgmeta 1C lit + @ 0 lit pgmeta 1C lit + !
+		pgmeta pgsum over = swap pgmeta 1C lit + !
+	else 0 lit then ;
+
+: pgmeta@ ( -- )        \ the meta buffer into the state
+	pgmeta 4 lit + @ pg @ C lit + !
+	pgmeta 8 lit + @ pg @ 10 lit + !
+	pgmeta C lit + @ pg @ 14 lit + !
+	pgmeta 10 lit + @ pg @ 18 lit + !
+	pgmeta 14 lit + @ pg @ 20 lit + !
+	pgmeta 20 lit + pg @ 1C lit + @ pgnfree 2 lit lshift mcopy
+	pgmeta 20 lit + pgnfree 2 lit lshift + pg @ 24 lit + @ pgnpend 3 lit lshift mcopy ;
+
+: pgmeta! ( root -- )   \ the state, for transaction txnid+1, into the buffer
+	pgmeta 400 lit pgzero
+	51504731 lit pgmeta !
+	pgtx 1 lit + pgmeta 4 lit + !
+	pgmeta 8 lit + !
+	pgnext pgmeta C lit + !
+	pgnfree pgmeta 10 lit + !
+	pgnpend pgmeta 14 lit + !
+	pg @ 1C lit + @ pgmeta 20 lit + pgnfree 2 lit lshift mcopy
+	pg @ 24 lit + @ pgmeta 20 lit + pgnfree 2 lit lshift + pgnpend 3 lit lshift mcopy
+	pgmeta pgsum pgmeta 1C lit + ! ;
+
+: pgflush ( -- )
+	pgds vflush dup FFFFFFFF lit <> if
+		dwait 1 lit <> if "pager: flush failed" pgdie then
+	else drop then drop ;
+
+: pgwmeta ( -- )        \ the buffer to the slot for txnid+1, then flush
+	pgds pgtx 1 lit + 1 lit and 3 lit lshift pgmeta 8 lit vwriten dwait
+	1 lit <> if "pager: meta write failed" pgdie then drop
+	pgflush ;
+
+\ ── transactions ──────────────────────────────────────────────────────────────
+
+: pgdrain ( ds -- ds )  \ every submitted request has landed (doorbell between polls)
+	begin darm vpoll dup 8 lit + @ over C lit + @ = dup 0= if over dbit 0 lit wait drop then until ;
+
+: pgwdirty ( -- )       \ write every dirty page and flush; the meta is NOT touched
+	0 lit pg @ 54 lit + !
+	40 lit 0 lit do
+		i pgslot dup 4 lit + @ 1 lit and if
+			pgds over @ 3 lit lshift 2 lit pick 8 lit + @ 8 lit vqwrite nip over C lit + !
+			pg @ 54 lit + dup @ 1 lit + swap !
+		then drop
+	loop
+	pg @ 54 lit + @ if
+		pgds vkick pgdrain drop
+		40 lit 0 lit do
+			i pgslot dup 4 lit + @ 1 lit and if
+				pgds over C lit + @ vstat nip 1 lit <> if "pager: page write failed" pgdie then
+			then drop
+		loop
+		pgflush
+	then ;
+
+: pgwbeg ( -- )
+	pgwtx if "pager: a write transaction is already open" pgdie then
+	pgreclm
+	pgtx 1 lit + pg @ 28 lit + !
+	pgnext pg @ 4C lit + !  pgnfree pg @ 50 lit + !
+	0 lit pg @ 40 lit + ! ;
+
+: pgabort ( -- )
+	40 lit 0 lit do
+		i pgslot dup 4 lit + @ 1 lit and if FFFFFFFF lit over ! 0 lit over 4 lit + ! then drop
+	loop
+	pg @ 4C lit + @ pg @ 14 lit + !  pg @ 50 lit + @ pg @ 18 lit + !
+	0 lit pg @ 40 lit + !  0 lit pg @ 28 lit + ! ;
+
+: pgcommit ( root -- )
+	pgwtx 0= if "pager: no write transaction" pgdie then
+	pgwdirty
+	pg @ 40 lit + @ ?dup if 0 lit do pgtx 1 lit + i 2 lit lshift pg @ 44 lit + @ + @ pgpend+ loop then
+	0 lit pg @ 40 lit + !
+	dup pgmeta! pgwmeta
+	pg @ 10 lit + !
+	pgtx 1 lit + pg @ C lit + !
+	40 lit 0 lit do 0 lit i pgslot 4 lit + !  i pgslot pgstamp drop loop
+	0 lit pg @ 28 lit + ! ;
+
+: pgrbeg ( -- root )  pgtx pgpid 2 lit lshift pg @ 30 lit + @ + !  pgroot ;
+: pgrend ( -- )       0 lit pgpid 2 lit lshift pg @ 30 lit + @ + ! ;
+
+\ ── open ──────────────────────────────────────────────────────────────────────
+
+: pgopen ( ds -- flag )
+	60 lit alloc pg !
+	400 lit alloc pg @ 4 lit + !                                  \ 64 slots
+	41000 lit alloc FFF lit + FFFFF000 lit and pg @ 8 lit + !     \ 64 pages
+	800 lit alloc pg @ 1C lit + !                                 \ free list
+	7E0 lit alloc pg @ 24 lit + !                                 \ pending pairs
+	2000 lit alloc FFF lit + FFFFF000 lit and pg @ 2C lit + !     \ meta buffer
+	40 lit alloc pg @ 30 lit + !                                  \ readers
+	400 lit alloc pg @ 44 lit + !                                 \ freed list
+	pg @ !
+	40 lit 0 lit do
+		i pgslot dup FFFFFFFF lit swap !  dup 0 lit swap 4 lit + !
+		pg @ 8 lit + @ i C lit lshift + swap 8 lit + !
+	loop
+	pg @ 30 lit + @ 10 lit pgzero
+	0 lit pg @ 34 lit + !  0 lit pg @ 28 lit + !  0 lit pg @ 40 lit + !
+	pgds @ 104 lit + @ if 1FFFFFFF lit else pgds @ 100 lit + @ 3 lit rshift then pg @ 48 lit + !
+	0 lit pg @ C lit + !  0 lit pg @ 10 lit + !  2 lit pg @ 14 lit + !
+	0 lit pg @ 18 lit + !  0 lit pg @ 20 lit + !
+	2 lit 0 lit do                                               \ the newer valid meta wins
+		pgds i 3 lit lshift pgmeta 8 lit vreadn dwait
+		1 lit <> if "pager: meta read failed" pgdie then drop
+		pgmetaok if pgmeta 4 lit + @ pgtx u> if pgmeta@ then then
+	loop
+	pgtx 0= if 0 lit pgmeta! pgwmeta 1 lit pg @ C lit + ! then    \ empty disk: format
+	pgnpend ?dup if 0 lit do i 3 lit lshift pg @ 24 lit + @ + 4 lit + @ pgfpush loop then   \ no readers yet
+	0 lit pg @ 20 lit + !
+	-1 lit ;
+
+: pgwipe ( -- )
+	pgmeta 400 lit pgzero
+	pgds 0 lit pgmeta 8 lit vwriten dwait 1 lit <> if "pager: wipe failed" pgdie then drop
+	pgds 8 lit pgmeta 8 lit vwriten dwait 1 lit <> if "pager: wipe failed" pgdie then drop
+	pgflush ;
+
+\ ──────────────────────────────────────────────────────────────────────────────
+\ Tests (--disk; self-skip without one) and benches.  The disk is wiped first,
+\ so earlier modules' sector writes do not matter.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+Test {
+	open {
+		: pds variable ;
+		: pfill ( addr x -- )  400 lit 0 lit do 2dup swap i 2 lit lshift + ! loop 2drop ;
+		: pchk  ( addr x -- flag )
+			-1 lit -rot 400 lit 0 lit do
+				2dup swap i 2 lit lshift + @ <> if rot drop 0 lit -rot then
+			loop 2drop ;
+		dsinit pds !
+		pds @ if
+			pds @ pgopen assert  pgwipe
+			pds @ pgopen assert                                \ formats
+			pgtx 1 lit asrt_eq  pgroot 0 lit asrt_eq  pgnext 2 lit asrt_eq
+			pgnfree 0 lit asrt_eq  pgnpend 0 lit asrt_eq  pgwtx 0 lit asrt_eq
+			pds @ pgopen assert                                \ and finds what it wrote
+			pgtx 1 lit asrt_eq  pgroot 0 lit asrt_eq  pgnext 2 lit asrt_eq
+		then
+	}
+	\ pages come from the frontier; freeing and aborting undo everything
+	alloc {
+		pds @ if
+			pgwbeg  pgwtx 2 lit asrt_eq
+			pgnew swap 2 lit asrt_eq  11111111 lit pfill
+			pgnew swap 3 lit asrt_eq  22222222 lit pfill
+			pgnext 4 lit asrt_eq
+			2 lit pgget 11111111 lit pchk assert
+			3 lit pgfree
+			3 lit pgfind 0 lit asrt_eq                         \ forgotten by the cache
+			pg @ 40 lit + @ 1 lit asrt_eq
+			pgabort
+			pgwtx 0 lit asrt_eq  pgnext 2 lit asrt_eq  2 lit pgfind 0 lit asrt_eq
+		then
+	}
+	\ a commit is durable: reopen reads it all back from the disk
+	commit {
+		pds @ if
+			pgwbeg
+			pgnew swap 2 lit asrt_eq  AAAAAAAA lit pfill
+			pgnew swap 3 lit asrt_eq  BBBBBBBB lit pfill
+			2 lit pgcommit
+			pgtx 2 lit asrt_eq  pgroot 2 lit asrt_eq  pgwtx 0 lit asrt_eq  pgnext 4 lit asrt_eq
+			2 lit pgfind 4 lit + @ 0 lit asrt_eq               \ clean now
+			pds @ pgopen assert
+			pgtx 2 lit asrt_eq  pgroot 2 lit asrt_eq  pgnext 4 lit asrt_eq
+			2 lit pgget AAAAAAAA lit pchk assert
+			3 lit pgget BBBBBBBB lit pchk assert
+		then
+	}
+	\ copy-on-write: the copy is new, the original untouched and pending; the
+	\ next transaction (no readers) gets it back
+	cow {
+		pds @ if
+			pgwbeg
+			2 lit pgcow swap 4 lit asrt_eq
+			dup AAAAAAAA lit pchk assert  CCCCCCCC lit pfill
+			4 lit pgcow swap 4 lit asrt_eq  CCCCCCCC lit pchk assert   \ already ours
+			2 lit pgget AAAAAAAA lit pchk assert
+			4 lit pgcommit
+			pgroot 4 lit asrt_eq  pgnpend 1 lit asrt_eq
+			pgwbeg
+			pgnpend 0 lit asrt_eq  pgnfree 1 lit asrt_eq
+			pgnew swap 2 lit asrt_eq drop
+			pgabort  pgnfree 1 lit asrt_eq
+		then
+	}
+	\ a reader's snapshot keeps the pages it can see from being reused
+	reader {
+		pds @ if
+			pgrbeg 4 lit asrt_eq                                     \ snapshot: txn 3
+			pgwbeg 4 lit pgcow swap 2 lit asrt_eq DDDDDDDD lit pfill 2 lit pgcommit   \ txn 4 frees 4
+			pgtx 4 lit asrt_eq  pgnpend 1 lit asrt_eq
+			4 lit pgget CCCCCCCC lit pchk assert                     \ still readable
+			pgwbeg pgnpend 1 lit asrt_eq pgnfree 0 lit asrt_eq       \ held back by the reader
+			pgnew swap 5 lit asrt_eq drop pgabort
+			pgrend
+			pgwbeg pgnpend 0 lit asrt_eq pgnfree 1 lit asrt_eq
+			pgnew swap 4 lit asrt_eq drop pgabort
+		then
+	}
+	\ a crash after the pages but before the meta: the old transaction stands
+	crash {
+		pds @ if
+			pgwbeg
+			pgnew swap 4 lit asrt_eq EEEEEEEE lit pfill
+			pgwdirty
+			pds @ pgopen assert
+			pgtx 4 lit asrt_eq  pgroot 2 lit asrt_eq  pgnfree 1 lit asrt_eq
+			4 lit pgget EEEEEEEE lit pchk assert                     \ on the disk, but free
+		then
+	}
+	\ a torn newest meta: open falls back to the older one, and the next commit
+	\ reuses the slot
+	torn {
+		pds @ if
+			pgmeta FFFFFFFF lit pfill  pds @ 0 lit pgmeta vwrite dwait 2drop   \ page 0 holds txn 4
+			pds @ pgopen assert
+			pgtx 3 lit asrt_eq  pgroot 4 lit asrt_eq  pgnfree 1 lit asrt_eq
+			pgwbeg pgnew swap 2 lit asrt_eq FFFFFFFF lit pfill 2 lit pgcommit
+			pgtx 4 lit asrt_eq
+			pds @ pgopen assert  pgtx 4 lit asrt_eq  pgroot 2 lit asrt_eq
+		then
+	}
+	\ the pool: clean pages are evicted least recently used first, dirty never
+	pool {
+		pds @ if
+			pgwbeg pgnew drop
+			46 lit 0 lit do i 64 lit + pgget drop loop
+			dup pgfind 0 lit <> assert
+			64 lit pgfind 0 lit asrt_eq
+			A9 lit pgfind 0 lit <> assert
+			drop pgabort
+		then
+	}
+	\ a page re-read (by a reader) after it was freed, then allocated again:
+	\ the stale clean slot is reused, so the page never has two slots
+	stale {
+		pds @ if
+			pgwbeg 2 lit pgcow drop pgcommit                   \ page 2 freed, pending
+			2 lit pgget drop                                   \ re-read: a clean slot for it
+			pgwbeg
+			begin pgalloc 2 lit = until  2 lit pgfpush         \ bring 2 to the top of the free list
+			pgnew swap 2 lit asrt_eq drop
+			2 lit pgfind 4 lit + @ 3 lit asrt_eq               \ its slot is the dirty new page
+			0 lit 40 lit 0 lit do i pgslot @ 2 lit = if 1 lit + then loop 1 lit asrt_eq
+			pgabort
+		then
+	}
+}
+
+Bench {
+	\ pgget on a cached page: the slot scan and the stamp
+	pghit {
+		: pdirty ( n -- root )  pgnew drop swap 1 lit - ?dup if 0 lit do pgnew 2drop loop then ;
+		dsinit ?dup if
+			pgopen drop pgwipe pgds pgopen drop
+			pgwbeg pgnew drop
+			bgo
+			2710 lit 0 lit do dup pgget drop loop
+			bstop drop pgabort
+			2710 lit bops
+		else bskip then
+	}
+	\ a cache miss: one page read through the doorbell
+	pgmiss {
+		pgds if
+			bgo
+			64 lit 0 lit do i 100 lit + pgget drop loop
+			64 lit bops
+		else bskip then
+	}
+	\ a commit of 1 / 16 / 64 dirty pages: the writes, two flushes, the meta
+	commit1 {
+		pgds if
+			bgo A lit 0 lit do pgwbeg 1 lit pdirty pgcommit loop
+			A lit bops
+		else bskip then
+	}
+	commit16 {
+		pgds if
+			bgo A lit 0 lit do pgwbeg 10 lit pdirty pgcommit loop
+			A lit bops
+		else bskip then
+	}
+	commit64 {
+		pgds if
+			bgo A lit 0 lit do pgwbeg 40 lit pdirty pgcommit loop
+			A lit bops
+		else bskip then
+	}
+}

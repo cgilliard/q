@@ -1,1 +1,1 @@
-src/fence.fam src/proc.fam src/disk.fam src/net.fam src/rng.fam src/loop.fam src/full_node.fam
+src/fence.fam src/proc.fam src/disk.fam src/net.fam src/rng.fam src/pager.fam src/store.fam src/loop.fam src/full_node.fam
