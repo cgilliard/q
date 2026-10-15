@@ -1,0 +1,94 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/loop.fam — the event loop's idle call over the disk and the NIC.
+\
+\ The node is one thread that polls its devices and blocks only when nothing is
+\ ready (src/proc.fam `wait`).  This module owns the device handles and the
+\ doorbell bookkeeping; the loop body — what to do with a frame or a finished
+\ request — stays with the program.  A turn of the loop:
+\
+\     evarm                          \ ack + re-enable both doorbells FIRST
+\     ... netrx/netrel until 0 ...   \ drain the NIC
+\     ... vpoll, vstat ...           \ reap the disk
+\     ... timers ...
+\     nothing ready?  if  0 lit ticks evwait drop  then
+\
+\ Arming before draining is what makes the wait safe: a completion that lands
+\ after the drain raises the line again (the source is enabled), and one that
+\ lands between the drain and the wait is already recorded, so `wait` returns
+\ at once.  Program-level events (bits 16 and up, via `post`) can be OR-ed into
+\ the mask evwait is given.
+\
+\   evinit  ( -- )               dsinit + netinit; a missing device is just absent
+\   evdsk   ( -- ds|0 )          the disk handle for vread/vwrite/vpoll/vstat
+\   evnet?  ( -- flag )          is there a NIC
+\   evarm   ( -- )               darm + narm for whatever is present
+\   evmask  ( -- mask )          the device event bits
+\   evwait  ( mask ticks -- events )  wait on mask | evmask; 0 ticks = forever
+\ Needs src/fence.fam src/proc.fam src/disk.fam src/net.fam before it.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: evdsk  variable ;
+: evnet? variable ;
+
+: evinit ( -- )  dsinit evdsk !  netinit evnet? ! ;
+
+: evarm ( -- )
+	evdsk @ if evdsk @ darm drop then
+	evnet? @ if narm then ;
+
+: evmask ( -- mask )
+	0 lit
+	evdsk @ if evdsk @ dbit or then
+	evnet? @ if nbit or then ;
+
+: evwait ( mask ticks -- events )  swap evmask or swap wait ;
+
+\ ──────────────────────────────────────────────────────────────────────────────
+\ Test: one turn-based loop finishing a disk read and an ARP exchange together,
+\ written the way a program's loop is.  Runs whatever devices are attached
+\ (--disk / --net) and passes vacuously with none.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+Test {
+	evloop {
+		: ddone variable ;  : ndone variable ;  : rid variable ;
+		: lb! ( a x -- a+1 )  over c! 1 lit + ;
+		evinit
+		evmask
+		evdsk @ if evdsk @ dbit over and 0 lit <> assert then
+		evnet? @ if nbit over and 0 lit <> assert then
+		drop
+		\ the work: a sector read, and a broadcast ARP probe for 10.0.2.2
+		evarm
+		evdsk @ 0= ddone !
+		evdsk @ if 200 lit alloc evdsk @ 3 lit rot vread rid ! drop then
+		evnet? @ 0= ndone !
+		evnet? @ if
+			40 lit alloc dup
+			6 lit 0 lit do FF lit lb! loop  6 lit 0 lit do netmac i + c@ lb! loop
+			8 lit lb! 6 lit lb!  0 lit lb! 1 lit lb!  8 lit lb! 0 lit lb!  6 lit lb! 4 lit lb!  0 lit lb! 1 lit lb!
+			6 lit 0 lit do netmac i + c@ lb! loop  A lit lb! 0 lit lb! 2 lit lb! F lit lb!
+			6 lit 0 lit do 0 lit lb! loop  A lit lb! 0 lit lb! 2 lit lb! 2 lit lb!
+			drop 2A lit nettx -1 lit asrt_eq
+		then
+		\ the loop: at most 20 turns, each at most 1 s
+		14 lit 0 lit do
+			ddone @ ndone @ and 0= if
+				evarm
+				evnet? @ if
+					begin netrx while
+						2A lit u< 0= if
+							dup C lit + c@ 8 lit = over D lit + c@ 6 lit = and over 15 lit + c@ 2 lit = and
+							if -1 lit ndone ! then
+						then
+						drop netrel
+					repeat
+				then
+				evdsk @ if evdsk @ vpoll rid @ vstat nip ?dup if 1 lit asrt_eq -1 lit ddone ! then then
+				ddone @ ndone @ and 0= if 0 lit 989680 lit evwait 0 lit <> assert then
+			then
+		loop
+		ddone @ -1 lit asrt_eq
+		ndone @ -1 lit asrt_eq
+	}
+}

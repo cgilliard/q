@@ -31,12 +31,13 @@ def asm(src):
 
 # ── TCB layout (bytes) ───────────────────────────────────────────────────
 #   4*n   saved x_n (n = 1..31)        0x80 pc        0x84 state (0 free,
-#   1 runnable, 2 sleeping)   0x88 tickets   0x8C pid   0x90 slot base
-#   0x94 wake lo   0x98 wake hi   size 0xA0
+#   1 runnable, 2 sleeping, 3 waiting)   0x88 tickets   0x8C pid
+#   0x90 wait mask (event subscription)   0x94 wake lo   0x98 wake hi
+#   0x9C pending events   size 0xA0
 # ── kernel block K (bytes) ───────────────────────────────────────────────
 #   0 current tcb   4 t1 stash   8 table base   C rng state   10 slot pool
 #   14 kernel sp   18 kernel s8   1C kernel s11   20 kernel gp
-#   24 quantum (mtime ticks)   28 tick count
+#   24 quantum (mtime ticks)   28 tick count   2C unclaimed IRQ events
 
 SAVE = asm("""
     csrrw   t0, mscratch, t0        # t0 = K, mscratch = thread's t0
@@ -164,7 +165,7 @@ MSCRATCH = asm("""
 """)
 
 INT_ON = asm("""
-    li      t0, 0x80                # mie.MTIE
+    li      t0, 0x880               # mie.MTIE | mie.MEIE
     csrs    mie, t0
     li      t0, 0x8                 # mstatus.MIE
     csrs    mstatus, t0
@@ -257,7 +258,8 @@ ZREGS = asm("""
     bnez    t0, 1b
 """)
 
-# ( table lo hi -- )  make every sleeper whose wake time <= now runnable
+# ( table lo hi -- )  make every sleeping or waiting thread whose deadline
+# <= now runnable; a waiting one gets its result, 0 (timed out), pushed
 WAKEUP = asm("""
     lw      a1, 0(sp)               # now hi
     lw      a0, 4(sp)               # now lo
@@ -265,21 +267,29 @@ WAKEUP = asm("""
     addi    sp, sp, 12
     li      t0, 16
 1:  lw      t1, 132(a2)
+    addi    t3, t1, -2
     li      t2, 2
-    bne     t1, t2, 2f
+    bgeu    t3, t2, 2f              # state not 2 or 3
     lw      t3, 152(a2)             # wake hi
     bltu    t3, a1, 3f
     bne     t3, a1, 2f
     lw      t3, 148(a2)             # wake lo
     bltu    a0, t3, 2f              # now < wake: not yet
-3:  li      t1, 1
+3:  li      t2, 3
+    bne     t1, t2, 4f
+    lw      t3, 8(a2)               # waiting: push 0 on its data stack
+    addi    t3, t3, -4
+    sw      zero, 0(t3)
+    sw      t3, 8(a2)
+4:  li      t1, 1
     sw      t1, 132(a2)
 2:  addi    a2, a2, 160
     addi    t0, t0, -1
     bnez    t0, 1b
 """)
 
-# ( table lo hi -- lo hi )  the earlier of (lo hi) and every sleeper's wake time
+# ( table lo hi -- lo hi )  the earlier of (lo hi) and every sleeping or
+# waiting thread's deadline
 MINDL = asm("""
     lw      a1, 0(sp)
     lw      a0, 4(sp)
@@ -287,8 +297,9 @@ MINDL = asm("""
     addi    sp, sp, 4
     li      t0, 16
 1:  lw      t1, 132(a2)
+    addi    t1, t1, -2
     li      t2, 2
-    bne     t1, t2, 2f
+    bgeu    t1, t2, 2f
     lw      t3, 152(a2)
     lw      t4, 148(a2)
     bltu    t3, a1, 3f
@@ -303,14 +314,15 @@ MINDL = asm("""
     sw      a0, 4(sp)
 """)
 
-# ( table -- n )  number of sleeping threads
-NSLEEP = asm("""
+# ( table -- n )  number of sleeping or waiting threads
+NWAIT = asm("""
     lw      a0, 0(sp)
     li      a1, 0
     li      t0, 16
 1:  lw      t1, 132(a0)
+    addi    t1, t1, -2
     li      t2, 2
-    bne     t1, t2, 2f
+    bgeu    t1, t2, 2f
     addi    a1, a1, 1
 2:  addi    a0, a0, 160
     addi    t0, t0, -1
@@ -369,13 +381,24 @@ out = f"""\
 \\ from GNU as syntax there (disassembly after each word).  Edit the generator.
 \\
 \\ Model: a thread is a word body running on its own stacks in the shared address
-\\ space.  A CLINT timer interrupt every QUANTUM ticks (and every syscall) enters
-\\ the trap handler, which saves the running thread's registers into its TCB,
-\\ switches to the kernel's stacks, runs `ktrap` (a plain fam word), and resumes
-\\ whichever TCB `ktrap` left in K.  The lottery draws a random ticket from the
-\\ runnable threads' total; the holder runs next.  Thread 0 is the program's
-\\ original context; threads 1..15 get a 128 KiB slot each (RID stack, heap +
-\\ data stack, loop stack) carved from the main heap by `kinit`.
+\\ space.  A CLINT timer interrupt every QUANTUM ticks, every syscall and every
+\\ PLIC interrupt enters the trap handler, which saves the running thread's
+\\ registers into its TCB, switches to the kernel's stacks, runs `ktrap` (a plain
+\\ fam word), and resumes whichever TCB `ktrap` left in K.  The lottery draws a
+\\ random ticket from the runnable threads' total; the holder runs next.  Thread
+\\ 0 is the program's original context; threads 1..15 get a 128 KiB slot each
+\\ (RID stack, heap + data stack, loop stack) carved from the main heap by
+\\ `kinit`.
+\\
+\\ Events: each thread has a pending-events word and a subscription mask.  Bit
+\\ n (n = 1..31) is PLIC source n: the virtio-mmio slot at 0x1000n000 is source
+\\ n, the UART is 10.  Bits 16 and up are free for software events (`post`).
+\\ A device interrupt is a doorbell: the trap claims it, disables that source at
+\\ the PLIC, and posts the bit to every thread subscribed to it; the driver
+\\ drains the device, acks it, and re-enables the source (`irqon`) before it
+\\ waits again.  `wait` returns at once when a subscribed event is already
+\\ pending, so an interrupt that lands between a driver's last poll and its
+\\ `wait` is never lost.
 \\
 \\ API (user side):
 \\   kinit                     set up the table, timer and trap vector (once)
@@ -384,21 +407,29 @@ out = f"""\
 \\   yield   ( -- )            give up the rest of the quantum
 \\   sleep   ( ticks -- )      block for at least ticks mtime ticks (10 MHz)
 \\   msleep  ( ms -- )         the same in milliseconds
+\\   wait    ( mask ticks -- events )  subscribe to mask; return the pending
+\\                             events in it, blocking up to ticks (0 = forever)
+\\                             for one; 0 on timeout
+\\   post    ( mask tid -- )   add events to thread tid (software doorbell)
+\\   irqon   ( irq -- )        enable PLIC source irq (priority 1) — re-arm
+\\   irqoff  ( irq -- )        disable it
 \\   join    ( tid -- )        yield until thread tid has exited
 \\   quantum! ( ticks -- )     set the time slice (default 10 ms)
 \\   texit   ( -- )            end the calling thread (what }}thread emits)
 \\   getpid  ( -- tid )
 \\   code{{ ... }}code           like thread{{ but without the trailing exit
 \\
-\\ Sleeping threads hold no tickets.  When nothing is runnable the scheduler arms
-\\ the timer for the earliest wake-up and waits in `wfi`; when nothing is runnable
-\\ or sleeping the program is finished.
+\\ Sleeping and waiting threads hold no tickets.  When nothing is runnable the
+\\ scheduler arms the timer for the earliest deadline and waits in `wfi`, which
+\\ returns on the timer or a PLIC interrupt; when nothing is runnable, sleeping
+\\ or waiting the program is finished.
 \\
 \\ Layout — TCB (0xA0 bytes, 16 of them):  4*n saved x_n   80 pc   84 state
-\\   (0 free, 1 runnable, 2 sleeping)   88 tickets   8C pid   90 slot base
-\\   94 wake lo   98 wake hi.
+\\   (0 free, 1 runnable, 2 sleeping, 3 waiting)   88 tickets   8C pid
+\\   90 wait mask   94 wake lo   98 wake hi   9C pending events.
 \\ Kernel block K:  0 current   4 t1 stash   8 table   C rng   10 slot pool
-\\   14 ksp   18 ks8   1C ks11   20 kgp   24 quantum   28 ticks.
+\\   14 ksp   18 ks8   1C ks11   20 kgp   24 quantum   28 ticks   2C IRQ events
+\\   that no thread was subscribed to (claimed by the next wait that asks).
 \\ Slot (0x20000 bytes): [0,1000) RID stack (s11 down)   [1000,1C000) heap (gp
 \\   up) + data stack (sp down)   [1C000,20000) loop stack (s8 down).  Slot 0
 \\   holds the kernel's own stacks.  s10 stays global so `variable` cells are
@@ -486,15 +517,62 @@ out = f"""\
 :M zregs      \\ ( tcb -- )
 {ZREGS}
 ;
-:M wakeup     \\ ( table lo hi -- )  wake sleepers due at mtime (lo hi)
+:M wakeup     \\ ( table lo hi -- )  wake sleepers and waiters due at mtime (lo hi)
 {WAKEUP}
 ;
-:M mindl      \\ ( table lo hi -- lo hi )  earlier of (lo hi) and any wake time
+:M mindl      \\ ( table lo hi -- lo hi )  earlier of (lo hi) and any deadline
 {MINDL}
 ;
-:M nsleep     \\ ( table -- n )
-{NSLEEP}
+:M nwait      \\ ( table -- n )  sleeping + waiting
+{NWAIT}
 ;
+
+\\ ── PLIC (hart 0, M-mode context 0) ──────────────────────────────────────────
+
+: claim    ( -- irq )   0C200004 lit @ ;
+: complete ( irq -- )   0C200004 lit ! ;
+: plicen   ( irq -- addr bit )  dup 5 lit rshift 4 lit * 0C002000 lit + swap 1F lit and 1 lit swap lshift ;
+: plicoff  ( irq -- )   plicen invert over @ and swap ! ;
+\\ enable first, priority last: QEMU's PLIC only re-evaluates the hart's line on
+\\ a priority or threshold write, so a source already asserted would otherwise
+\\ not interrupt until something else changed
+: plicon   ( irq -- )   dup plicen over @ or swap !  4 lit * 0C000000 lit + 1 lit swap ! ;
+
+\\ ── events ────────────────────────────────────────────────────────────────────
+
+: tpush ( x tcb -- )  8 lit + dup @ 4 lit - dup rot ! ! ;   \\ onto its data stack
+
+\\ a waiting thread whose pending events meet its mask gets them and runs
+: twake ( tcb -- )
+    dup 84 lit + @ 3 lit = if
+        dup 9C lit + @ over 90 lit + @ and ?dup if      \\ tcb hit
+            2dup swap 9C lit + dup @ rot xor swap !      \\ events ^= hit
+            over tpush
+            1 lit over 84 lit + !
+        then
+    then drop ;
+: tpost ( mask tcb -- )  swap over 9C lit + dup @ rot or swap ! twake ;
+
+\\ an interrupt: to every live thread subscribed to any of its bits; bits
+\\ nobody wanted are kept in K for the next wait that asks for them
+: ktaken variable ;
+: kpost ( mask -- )
+    0 lit ktaken !
+    dup 10 lit 0 lit do
+        i tcb dup 84 lit + @ if
+            2dup 90 lit + @ and ?dup if
+                dup ktaken @ or ktaken !
+                swap tpost
+            else drop then
+        else drop then
+    loop drop
+    ktaken @ invert and
+    K 2C lit + dup @ rot or swap ! ;
+
+\\ claim every pending PLIC interrupt: disable the source (the driver re-enables
+\\ it once it has drained the device) and post its bit
+: irq! ( -- )
+    begin claim ?dup if dup plicoff 1 lit over lshift kpost complete 0 lit else -1 lit then until ;
 
 \\ ── scheduler ─────────────────────────────────────────────────────────────────
 
@@ -514,15 +592,16 @@ out = f"""\
     swap ktab -rot mindl mtcmp! ;
 
 \\ pick the next thread into K.  Nothing runnable: wait in wfi for the earliest
-\\ wake-up (timer interrupts stay enabled in mie, so wfi returns on MTIP even
-\\ with mstatus.MIE clear).  Nothing runnable or sleeping: the program is done.
+\\ deadline or a device interrupt (both stay enabled in mie, so wfi returns on
+\\ MTIP/MEIP even with mstatus.MIE clear; the PLIC is then polled by hand since
+\\ no trap can be taken here).  Nothing runnable, sleeping or waiting: done.
 : sched ( -- )
     begin
         ktab mtime@ wakeup
         ktab ntickets dup 0= if
             drop
-            ktab nsleep 0= if bye then
-            ktab -1 lit -1 lit mindl mtcmp! wfi
+            ktab nwait 0= if bye then
+            ktab -1 lit -1 lit mindl mtcmp! wfi irq!
             0 lit
         else
             rand swap %
@@ -533,7 +612,7 @@ out = f"""\
 
 \\ ── syscalls ──────────────────────────────────────────────────────────────────
 \\ 0 yield   1 exit   2 spawn ( addr tickets -- tid )   3 getpid ( -- tid )
-\\ 4 sleep ( ticks -- )
+\\ 4 sleep ( ticks -- )   5 wait ( mask ticks -- events )   6 post ( mask tid -- )
 
 : slotof ( i -- base )  20000 lit * K 10 lit + @ + ;
 
@@ -547,6 +626,8 @@ out = f"""\
     20000 lit + over 60 lit + !         \\ s8  = slot + 0x20000 (loop stack top)
     cur 68 lit + @ over 68 lit + !      \\ s10 = the global RID floor / var base
     dup 1 lit swap 84 lit + !           \\ state = runnable
+    dup 0 lit swap 90 lit + !           \\ no subscription
+    dup 0 lit swap 9C lit + !           \\ no pending events
     swap over 80 lit + !                \\ pc = addr          ( tickets tcb )
     88 lit + ! ;                        \\ tickets
 
@@ -563,17 +644,39 @@ out = f"""\
 : sysexit ( -- )  0 lit cur 84 lit + ! ;
 : sysgpid ( -- )  cur 8C lit + @ upush ;
 
-\\ wake = mtime + ticks (64-bit), state = sleeping.  0 ticks is a yield.
+\\ deadline = mtime + ticks (64-bit) into the current TCB
+: deadlin! ( ticks -- )
+    mtime@                              \\ t lo hi
+    rot rot                             \\ hi t lo
+    over +                              \\ hi t lo'
+    tuck swap u<                        \\ hi lo' carry(-1|0)
+    rot swap -                          \\ lo' hi+carry
+    cur 98 lit + !  cur 94 lit + ! ;
+
+\\ state = sleeping until the deadline.  0 ticks is a yield.
 : syssleep ( -- )
-    upop dup 0= if drop else
-        mtime@                          \\ t lo hi
-        rot rot                         \\ hi t lo
-        over +                          \\ hi t lo'
-        tuck swap u<                    \\ hi lo' carry(-1|0)
-        rot swap -                      \\ lo' hi+carry
-        cur 98 lit + !  cur 94 lit + !
-        2 lit cur 84 lit + !
+    upop ?dup if deadlin! 2 lit cur 84 lit + ! then ;
+
+\\ subscribe to mask.  Something pending already: hand it over and carry on.
+\\ Else state = waiting until an event (twake) or the deadline (wakeup pushes 0);
+\\ 0 ticks = no deadline.
+: syswait ( -- )
+    upop upop                           \\ ticks mask
+    dup cur 90 lit + !
+    K 2C lit + @ over and ?dup if       \\ unclaimed interrupts: take them
+        dup K 2C lit + dup @ rot xor swap !
+        cur tpost
+    then
+    cur 9C lit + @ and ?dup if          \\ ticks hit
+        dup cur 9C lit + dup @ rot xor swap !
+        upush drop
+    else
+        ?dup if deadlin! else -1 lit cur 94 lit + ! -1 lit cur 98 lit + ! then
+        3 lit cur 84 lit + !
     then ;
+
+: syspost ( -- )
+    upop tcb upop over 84 lit + @ if swap tpost else 2drop then ;
 
 : syscall! ( -- )
     cur 80 lit + dup @ 4 lit + swap !   \\ resume after the ecall
@@ -583,7 +686,9 @@ out = f"""\
     dup 2 lit = if drop sysspawn else
     dup 3 lit = if drop sysgpid else
     dup 4 lit = if drop syssleep else
-    drop then then then then then ;
+    dup 5 lit = if drop syswait else
+    dup 6 lit = if drop syspost else
+    drop then then then then then then then ;
 
 : khalt  begin wfi 0 lit until ;
 
@@ -592,9 +697,10 @@ out = f"""\
 : ktrap ( -- )
     mcause@ {DBG0}
     dup 80000007 lit = if drop K 28 lit + dup @ 1 lit + swap ! else
+    dup 8000000B lit = if drop irq! else
     dup B lit = if drop syscall! else
         "proc: unexpected trap " puts u.x '\\n' lit putc khalt
-    then then
+    then then then
     sched arm ;
 
 
@@ -606,6 +712,11 @@ out = f"""\
 : getpid  ( -- tid )           3 lit syscall ;
 : sleep   ( ticks -- )         4 lit syscall ;
 : msleep  ( ms -- )            2710 lit * sleep ;     \\ 10000 ticks per ms
+: wait    ( mask ticks -- events ) 5 lit syscall ;
+: post    ( mask tid -- )      6 lit syscall ;
+\\ the PLIC enable word is shared with the trap's plicoff: update it masked
+: irqon   ( irq -- )           int_off plicon int_on ;
+: irqoff  ( irq -- )           int_off plicoff int_on ;
 : join    ( tid -- )           begin dup tcb 84 lit + @ 0= dup 0= if yield then until drop ;
                                                       \\ wait until the slot is free
 : quantum! ( ticks -- )        K 24 lit + ! ;         \\ takes effect at the next arm
@@ -616,6 +727,7 @@ out = f"""\
     \\ K block, the table, the slot pool
     40 lit alloc kblk !
     0 lit K 28 lit + !                  \\ ticks = 0
+    0 lit K 2C lit + !                  \\ no unclaimed interrupts
     A00 lit alloc K 8 lit + !           \\ 16 TCBs, zeroed, pid = index
     10 lit 0 lit do
         i tcb dup
@@ -636,6 +748,7 @@ out = f"""\
     \\ scheduler parameters
     186A0 lit K 24 lit + !              \\ quantum = 100000 ticks = 10 ms
     mtime@ drop 1 lit or K C lit + !    \\ rng seed (never 0)
+    0 lit 0C200000 lit !                \\ PLIC threshold 0: every enabled source
     \\ trap vector, then go
     K mscr!
     code{{
@@ -662,7 +775,7 @@ Test {{
 		0 lit tcb 88 lit + @ A lit asrt_eq         \\ 10 tickets
 		K 24 lit + @ 186A0 lit asrt_eq             \\ 10 ms quantum
 		ktab ntickets A lit asrt_eq
-		ktab nsleep 0 lit asrt_eq
+		ktab nwait 0 lit asrt_eq
 		ktab findfree 1 lit tcb asrt_eq            \\ slot 1 is the first free
 		K 1C lit + @ 0 lit slotof 1000 lit + asrt_eq
 		K 14 lit + @ 0 lit slotof 1C000 lit + asrt_eq
@@ -704,7 +817,7 @@ Test {{
 		\\ thread 5 asleep until (lo FFFFFFFF, hi 7FFFFFFF)
 		2 lit 5 lit tcb 84 lit + !
 		-1 lit 5 lit tcb 94 lit + !  7FFFFFFF lit 5 lit tcb 98 lit + !
-		ktab nsleep 1 lit asrt_eq
+		ktab nwait 1 lit asrt_eq
 		ktab ntickets A lit asrt_eq                \\ sleeping holds no tickets
 		ktab 0 lit pickt 0 lit tcb asrt_eq
 		ktab -1 lit -1 lit mindl 7FFFFFFF lit asrt_eq -1 lit asrt_eq
@@ -810,10 +923,10 @@ Test {{
 		thread{{ C8 lit msleep }}thread 7 lit spawn
 		A lit msleep
 		dup tcb 84 lit + @ 2 lit asrt_eq
-		ktab nsleep 1 lit asrt_eq
+		ktab nwait 1 lit asrt_eq
 		ktab ntickets A lit asrt_eq
 		join
-		ktab nsleep 0 lit asrt_eq
+		ktab nwait 0 lit asrt_eq
 	}}
 	wakeorder {{
 		: wlog variable ;
@@ -844,6 +957,63 @@ Test {{
 		4C4B40 lit u< assert                       \\ < 500 ms: wake-ups are not starved
 		pcnt @ A lit asrt_eq
 		1 lit flag !  join join
+	}}
+	waitto {{
+		\\ no event: wait times out at the deadline and returns 0
+		_now 0 lit 186A0 lit wait 0 lit asrt_eq _now swap -    \\ 10 ms
+		dup 186A0 lit u< 0= assert  4C4B40 lit u< assert
+		0 lit tcb 84 lit + @ 1 lit asrt_eq
+	}}
+	postwait {{
+		\\ a thread blocks in wait (no deadline) until main posts; it receives the
+		\\ posted bits that are in its mask, the rest stay pending
+		: wres variable ;
+		-1 lit wres !
+		thread{{ 30000 lit 0 lit wait wres ! }}thread 1 lit spawn
+		A lit msleep
+		dup tcb 84 lit + @ 3 lit asrt_eq
+		ktab nwait 1 lit asrt_eq
+		ktab ntickets A lit asrt_eq                \\ a waiter holds no tickets
+		dup tcb 90 lit + @ 30000 lit asrt_eq
+		50000 lit over post
+		join
+		wres @ 10000 lit asrt_eq
+	}}
+	pending {{
+		\\ an event posted before the wait is returned at once; taking it clears
+		\\ it; unsubscribed bits stay pending for a later wait
+		60000 lit getpid post
+		_now 20000 lit 0 lit wait 20000 lit asrt_eq _now swap - 2710 lit u< assert
+		20000 lit 1 lit wait 0 lit asrt_eq         \\ gone
+		0 lit tcb 9C lit + @ 40000 lit asrt_eq
+		40000 lit 1 lit wait 40000 lit asrt_eq
+		0 lit tcb 9C lit + @ 0 lit asrt_eq
+	}}
+	uartirq {{
+		\\ the UART's transmit-empty interrupt (PLIC source 10) as a doorbell:
+		\\ enable it, wait on bit 10, and see the trap disable the source
+		2 lit 10000001 lit c!                      \\ IER: THR empty
+		A lit irqon
+		_now 400 lit 186A0 lit wait 400 lit asrt_eq _now swap - 2710 lit u< assert
+		K 2C lit + @ 0 lit asrt_eq                 \\ claimed from the unclaimed set
+		A lit plicen swap @ and 0 lit asrt_eq      \\ disabled by the trap
+		400 lit 186A0 lit wait 0 lit asrt_eq       \\ still asserted at the device, masked
+		\\ the driver protocol: ack the device (drop its line), then re-enable the
+		\\ source; the next event is a fresh edge and interrupts again
+		0 lit 10000001 lit c!  2 lit 10000001 lit c!
+		A lit irqon
+		400 lit 186A0 lit wait 400 lit asrt_eq
+		0 lit 10000001 lit c!
+	}}
+	irqrec {{
+		\\ an interrupt that lands while its subscriber is running is recorded, so
+		\\ the next wait returns without blocking (no lost wake-up)
+		400 lit 1 lit wait drop                    \\ subscribe (times out)
+		2 lit 10000001 lit c!  A lit irqon
+		_now begin dup _now swap - 2710 lit u< 0= until drop   \\ 1 ms, no syscalls
+		0 lit 10000001 lit c!
+		0 lit tcb 9C lit + @ 400 lit asrt_eq
+		_now 400 lit 0 lit wait 400 lit asrt_eq _now swap - 2710 lit u< assert
 	}}
 	fairness {{
 		: cnt2 variable ;

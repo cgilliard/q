@@ -1,0 +1,263 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/net.fam — virtio-net (legacy virtio-mmio): raw Ethernet frames in and out,
+\ non-blocking, with the interrupt as a doorbell for the idle case.
+\
+\   netinit ( -- flag )          find the NIC, set up both queues, post 16 receive
+\                                buffers; 0 when there is no virtio-net
+\   netmac  ( -- addr )          the 6-byte MAC (config space)
+\   netrx   ( -- buf len -1 | 0 )  the next received frame (Ethernet header first),
+\                                or 0 when none is waiting.  Never blocks.
+\   netrel  ( -- )               give the buffer netrx returned back to the device
+\                                (call once per frame, after using it)
+\   nettx   ( buf len -- ok )    copy a frame into a transmit slot and kick; 0 when
+\                                all 16 slots are still with the device
+\   narm    ( -- )               ack the NIC's interrupt and enable its PLIC source
+\   nbit    ( -- mask )          the event bit `wait` returns for it
+\
+\ Doorbell protocol per event-loop turn (see src/disk.fam for why this order):
+\   narm, then drain with netrx/netrel until it returns 0, then `nbit ticks wait`
+\   only if nothing was ready.  A frame that lands after the drain raises the
+\   line again; one that lands between the drain and the wait is recorded.
+\
+\ Both queues are sized 32 (QueueNum), used as 16 two-descriptor chains each:
+\ chain i = descriptors 2i (the 10-byte legacy virtio-net header) and 2i+1 (the
+\ frame).  Buffer i lives at bufs + i*0x800: header at +0, frame at +0x10, up to
+\ 0x7F0 bytes.  Ring layout for QueueNum 32 with QueueAlign 4096:
+\   desc @ q+0 (512 B)   avail @ q+0x200 (flags, idx, ring[32])   used @ q+0x1000
+\   (flags, idx, ring[32] of {id, len})   — 0x2000 bytes per queue.
+\ Transmit slots are used round-robin; a slot is free again once the device's
+\ used index has passed it (completions are in order).  Receive buffers are
+\ re-posted one at a time by netrel.
+\
+\ State block (the `net` variable points at it, 0x30 bytes):
+\   +00 dev   +04 rxq   +08 txq   +0C rxbufs   +10 txbufs   +1C rx used cursor
+\   +20 tx submitted   +28 head of the frame netrx last returned
+\ Needs src/fence.fam and src/proc.fam compiled before it.  The rings must come
+\ from the main thread's heap (a spawned thread's arena is only 108 KiB).
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: net variable ;
+
+\ nzero ( a n -- )  zero n words
+: nzero  0 lit do dup i 4 lit * + 0 lit swap ! loop drop ;
+
+\ nfill ( q i addr len flags next -- )  write descriptor i of ring q
+: nfill
+	5 lit pick 5 lit pick 4 lit lshift +   \ q i addr len flags next d
+	tuck E lit + h!                        \ next
+	tuck C lit + h!                        \ flags
+	tuck 8 lit + !                         \ len
+	tuck !                                 \ addr lo
+	0 lit over 4 lit + !                   \ addr hi
+	2drop drop
+;
+
+\ navail+ ( q head -- )  append a chain head to the avail ring and publish it
+: navail+
+	over 202 lit + h@                      \ q head idx
+	dup 1F lit and 1 lit lshift            \ q head idx off
+	3 lit pick 204 lit + + 2 lit pick swap h!   \ ring[idx & 31] = head
+	fence_io                               \ the entry before the index
+	1 lit + rot 202 lit + h! drop
+;
+
+\ nused@ ( q -- idx )  the device's used index
+: nused@  1002 lit + h@ ;
+
+\ nkick ( qi -- )  QueueNotify
+: nkick  fence_io net @ @ 50 lit + ! ;
+
+\ ── receive ───────────────────────────────────────────────────────────────────
+
+: netrx ( -- buf len -1 | 0 )
+	net @ 4 lit + @                                    \ q
+	dup nused@ net @ 1C lit + @ FFFF lit and = if drop 0 lit else
+		fence_r
+		net @ 1C lit + @ dup 1 lit + net @ 1C lit + !  \ q done   (cursor++)
+		1F lit and 3 lit lshift + 1004 lit +           \ e = &used.ring[done & 31]
+		dup @ dup net @ 28 lit + !                     \ e head   (kept for netrel)
+		1 lit rshift B lit lshift net @ C lit + @ + 10 lit +   \ e buf
+		swap 4 lit + @ A lit -                         \ buf len   (minus the header)
+		-1 lit
+	then
+;
+
+: netrel ( -- )  net @ 4 lit + @ net @ 28 lit + @ navail+  0 lit nkick ;
+
+\ ── transmit ──────────────────────────────────────────────────────────────────
+
+: txb variable ;
+: nettx ( buf len -- ok )
+	net @ 20 lit + @ net @ 8 lit + @ nused@ - FFFF lit and 10 lit u< 0= if 2drop 0 lit else
+		net @ 20 lit + @ F lit and dup B lit lshift net @ 10 lit + @ + txb !   \ buf len slot
+		A lit 0 lit do 0 lit txb @ i + c! loop                                  \ header: no flags
+		over 0 lit do 2 lit pick i + c@ txb @ 10 lit + i + c! loop              \ the frame
+		net @ 8 lit + @                                                          \ buf len slot q
+		over 1 lit lshift 1 lit + 4 lit lshift over + 8 lit + 3 lit pick swap !  \ desc[2s+1].len = len
+		swap 1 lit lshift navail+                                                \ buf len
+		net @ 20 lit + dup @ 1 lit + swap !                                      \ submitted++
+		1 lit nkick 2drop -1 lit
+	then
+;
+
+\ ── setup ─────────────────────────────────────────────────────────────────────
+
+\ nqinit ( qi q -- )  tell the device where ring q of queue qi is
+: nqinit
+	net @ @                                \ qi q dev
+	rot over 30 lit + !                    \ QueueSel
+	20 lit over 38 lit + !                 \ QueueNum = 32
+	1000 lit over 3C lit + !               \ QueueAlign
+	swap C lit rshift swap 40 lit + !      \ QueuePFN
+;
+
+\ ntxinit ( -- )  the 16 transmit chains (lengths are set per frame)
+: ntxinit
+	10 lit 0 lit do
+		net @ 8 lit + @ i 1 lit lshift  net @ 10 lit + @ i B lit lshift +  A lit 1 lit 3 lit pick 1 lit + nfill
+		net @ 8 lit + @ i 1 lit lshift 1 lit +  net @ 10 lit + @ i B lit lshift + 10 lit +  0 lit 0 lit 0 lit nfill
+	loop
+;
+
+\ nrxpost ( -- )  the 16 receive chains, all offered to the device
+: nrxpost
+	10 lit 0 lit do
+		net @ 4 lit + @ i 1 lit lshift  net @ C lit + @ i B lit lshift +  A lit 3 lit 3 lit pick 1 lit + nfill
+		net @ 4 lit + @ i 1 lit lshift 1 lit +  net @ C lit + @ i B lit lshift + 10 lit +  7F0 lit 2 lit 0 lit nfill
+		net @ 4 lit + @ i 1 lit lshift navail+
+	loop
+	0 lit nkick
+;
+
+: netinit ( -- flag )
+	1 lit vfind ?dup if
+		30 lit alloc dup net ! !                           \ dev
+		5000 lit alloc FFF lit + FFFFF000 lit and
+		dup 1000 lit nzero                                 \ both rings zeroed
+		dup net @ 4 lit + !  2000 lit + net @ 8 lit + !    \ rxq, txq
+		8000 lit alloc net @ C lit + !  8000 lit alloc net @ 10 lit + !
+		0 lit net @ 1C lit + !  0 lit net @ 20 lit + !
+		net @ @
+		0 lit over 70 lit + !  1 lit over 70 lit + !  3 lit over 70 lit + !   \ reset, ACK, DRIVER
+		dup 10 lit + @ 20 lit and over 20 lit + !          \ DriverFeatures = MAC, if offered
+		B lit over 70 lit + !                              \ FEATURES_OK
+		1000 lit over 28 lit + !                           \ GuestPageSize
+		drop
+		0 lit net @ 4 lit + @ nqinit  1 lit net @ 8 lit + @ nqinit
+		ntxinit
+		F lit net @ @ 70 lit + !                           \ DRIVER_OK
+		nrxpost
+		-1 lit
+	else 0 lit then
+;
+
+: netmac ( -- addr )  net @ @ 100 lit + ;
+: nbit   ( -- mask )  net @ @ virqof 1 lit swap lshift ;
+: narm   ( -- )       net @ @ dup vack virqof irqon ;
+
+\ ──────────────────────────────────────────────────────────────────────────────
+\ Tests (./tools/fam --test src/fence.fam src/proc.fam src/net.fam [--net]).
+\ The first group drives the ring logic on fake memory with a scratch block as
+\ the device.  The ARP test needs --net (QEMU's user-mode network answers an ARP
+\ request for its gateway 10.0.2.2) and self-skips without it.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+Test {
+	\ nfill writes a legacy descriptor: addr, len, flags, next
+	desc {
+		200 lit alloc                                 \ q
+		dup 3 lit 40000000 lit 10 lit 3 lit 4 lit nfill
+		dup 30 lit + @ 40000000 lit asrt_eq
+		dup 34 lit + @ 0 lit asrt_eq
+		dup 38 lit + @ 10 lit asrt_eq
+		dup 3C lit + h@ 3 lit asrt_eq
+		3E lit + h@ 4 lit asrt_eq
+	}
+	\ navail+ appends heads and publishes the index, which wraps at 16 bits
+	avail {
+		3000 lit alloc FFF lit + FFFFF000 lit and dup 800 lit nzero   \ q
+		dup 6 lit navail+  dup 8 lit navail+
+		dup 204 lit + h@ 6 lit asrt_eq
+		dup 206 lit + h@ 8 lit asrt_eq
+		dup 202 lit + h@ 2 lit asrt_eq
+		FFFF lit over 202 lit + h!  dup 2 lit navail+          \ idx 65535: ring[31], then 0
+		dup 202 lit + h@ 0 lit asrt_eq
+		242 lit + h@ 2 lit asrt_eq
+	}
+	\ netrx / netrel on a fake device: the device used chain 4 (buffer 2) for a
+	\ 52-byte write, header included
+	fakerx {
+		30 lit alloc net !
+		100 lit alloc dup 40 lit nzero net @ !                \ dev scratch: QueueNotify lands at +50
+		3000 lit alloc FFF lit + FFFFF000 lit and dup 800 lit nzero net @ 4 lit + !
+		8000 lit alloc net @ C lit + !
+		0 lit net @ 1C lit + !
+		netrx 0 lit asrt_eq                                   \ nothing used yet
+		net @ 4 lit + @ dup 1004 lit + 4 lit swap !  dup 1008 lit + 34 lit swap !  1002 lit + 1 lit swap h!
+		netrx -1 lit asrt_eq
+		2A lit asrt_eq                                        \ 52 - 10
+		net @ C lit + @ 1010 lit + asrt_eq                    \ rxbufs + 2*0x800 + 0x10
+		netrx 0 lit asrt_eq
+		FF lit net @ @ 50 lit + !
+		netrel
+		net @ 4 lit + @ dup 204 lit + h@ 4 lit asrt_eq  202 lit + h@ 1 lit asrt_eq
+		net @ @ 50 lit + @ 0 lit asrt_eq                      \ RX queue kicked
+	}
+	\ nettx copies the frame behind a zeroed header, sets the length, publishes
+	\ and kicks; 16 slots, then refused until the device's used index moves
+	faketx {
+		3000 lit alloc FFF lit + FFFFF000 lit and dup 800 lit nzero net @ 8 lit + !
+		8000 lit alloc net @ 10 lit + !  0 lit net @ 20 lit + !
+		ntxinit
+		"hello" 5 lit nettx -1 lit asrt_eq
+		net @ 10 lit + @ 10 lit + c@ 'h' lit asrt_eq
+		net @ 10 lit + @ 14 lit + c@ 'o' lit asrt_eq
+		net @ 10 lit + @ @ 0 lit asrt_eq                      \ header zeroed
+		net @ 8 lit + @ 18 lit + @ 5 lit asrt_eq              \ desc[1].len
+		net @ 8 lit + @ 204 lit + h@ 0 lit asrt_eq            \ avail.ring[0] = head 0
+		net @ 8 lit + @ 202 lit + h@ 1 lit asrt_eq
+		net @ 20 lit + @ 1 lit asrt_eq
+		net @ @ 50 lit + @ 1 lit asrt_eq                      \ TX queue kicked
+		F lit 0 lit do "x" 1 lit nettx -1 lit asrt_eq loop
+		"x" 1 lit nettx 0 lit asrt_eq                         \ full
+		net @ 8 lit + @ 1002 lit + 3 lit swap h!              \ device consumed 3
+		"x" 1 lit nettx -1 lit asrt_eq
+		net @ 20 lit + @ 11 lit asrt_eq
+		net @ 8 lit + @ 18 lit + @ 1 lit asrt_eq              \ slot 0 reused: desc[1].len = 1
+	}
+	\ ── real device: ARP who-has 10.0.2.2, answered by slirp from 52:55:0a:00:02:02 ──
+	arp {
+		: b!   ( a x -- a+1 )  over c! 1 lit + ;
+		: bw!  ( a x -- a+2 )  dup 8 lit rshift rot swap b! swap FF lit and b! ;
+		: mac! ( a src -- a+6 )  6 lit 0 lit do 2dup swap i + swap i + c@ swap c! loop drop 6 lit + ;
+		: got variable ;
+		netinit if
+			narm
+			40 lit alloc dup                              \ f a
+			6 lit 0 lit do FF lit b! loop                 \ dst: broadcast
+			netmac mac!                                   \ src
+			806 lit bw!  1 lit bw!  800 lit bw!  6 lit b!  4 lit b!  1 lit bw!   \ ARP, Ethernet/IPv4, request
+			netmac mac!  A lit b! 0 lit b! 2 lit b! F lit b!                     \ sender 10.0.2.15
+			6 lit 0 lit do 0 lit b! loop  A lit b! 0 lit b! 2 lit b! 2 lit b!    \ target 10.0.2.2
+			drop
+			2A lit nettx -1 lit asrt_eq
+			0 lit got !
+			begin
+				nbit 989680 lit wait 0 lit <> assert      \ the doorbell within 1 s
+				narm
+				begin netrx while                         \ buf len
+					2A lit u< 0= if
+						dup C lit + c@ 8 lit = over D lit + c@ 6 lit = and over 15 lit + c@ 2 lit = and if
+							dup 16 lit + c@ 52 lit asrt_eq  dup 17 lit + c@ 55 lit asrt_eq
+							dup 18 lit + c@ A lit asrt_eq   dup 1B lit + c@ 2 lit asrt_eq
+							dup 1C lit + c@ A lit asrt_eq   dup 1F lit + c@ 2 lit asrt_eq
+							-1 lit got !
+						then
+					then
+					drop netrel
+				repeat
+				got @
+			until
+		then
+	}
+}

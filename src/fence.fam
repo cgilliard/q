@@ -1,13 +1,39 @@
 \ ──────────────────────────────────────────────────────────────────────────────
-\ src/fence.fam — shared RISC-V fence macros for the device modules.
+\ src/fence.fam — shared prelude for the device modules: fence macros and the
+\ virtio-mmio bus words (vfind / virqof / vack).
 \
-\ The node has no zicsr (no interrupts); every device is polled, and correctness
-\ depends on ordering MMIO writes before a QueueNotify and ordering used-ring/DMA
-\ reads after the device completes.  Both src/disk.fam and src/net.fam need these,
-\ and `:M` redefinition is rejected by the compiler, so they live here once and are
-\ compiled FIRST.  Each module is then independently testable by prepending this
-\ file, e.g.  ./tools/fam --test src/fence.fam src/net.fam
+\ Devices are driven by polling, with interrupts only as a doorbell for the idle
+\ case (src/proc.fam `wait`); correctness depends on ordering MMIO writes before
+\ a QueueNotify and ordering used-ring/DMA reads after the device completes.
+\ Both src/disk.fam and src/net.fam need these, and `:M` redefinition is rejected
+\ by the compiler, so they live here once and are compiled FIRST, e.g.
+\   ./tools/fam --test src/fence.fam src/proc.fam src/disk.fam
 \ ──────────────────────────────────────────────────────────────────────────────
 
 :M fence_io 0F00500F , ;           \ fence iorw,ow   (order MMIO writes before QueueNotify)
 :M fence_r  0F002002 , ;           \ fence r,r       (order reads after device DMA)
+
+\ ── virtio-mmio bus ───────────────────────────────────────────────────────────
+\ QEMU virt: 8 slots at 0x10001000 + 0x1000*(n-1), slot n = PLIC source n.  The
+\ first device on the command line gets the HIGHEST slot, so scan downward.
+
+\ vfind ( id -- dev|0 )  the first device with DeviceID id, or 0
+: vfind
+	10009000 lit                 \ one slot above the top; decrement first
+	begin
+		1000 lit -
+		dup 10001000 lit u< if
+			2drop 0 lit 1 lit     \ exhausted: leave 0, stop
+		else 2dup 8 lit + @ = if
+			nip 1 lit            \ found: leave dev, stop
+		else
+			0 lit                \ keep scanning
+		then then
+	until
+;
+
+\ virqof ( dev -- irq )  the PLIC source of a virtio-mmio slot
+: virqof  10000000 lit - C lit rshift ;
+
+\ vack ( dev -- )  acknowledge whatever the device is asserting (drops its line)
+: vack  dup 60 lit + @ swap 64 lit + ! ;
