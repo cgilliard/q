@@ -65,16 +65,14 @@
 
 \ ── compile-time helpers ──────────────────────────────────────────────────────
 
-\ ,addr  ( C: cursor -- )  emit a runtime push of the FINAL address of an output
-\ cursor taken with `here`.  The compiler assembles in its own heap (s0 = output
-\ start) and the image loads at 0x80000000, so this pushes 0x80000000 + (cursor -
-\ s0).  (`lit` would push the raw cursor.)
+\ ,addr  ( C: cursor -- )  emit a runtime push of the address of an output cursor
+\ taken with `here`, as auipc + addi from where it is emitted: position
+\ independent, since the image is not always loaded at 0x80000000 (tabernacle
+\ puts the node after itself).  (`lit` would push the raw compiler-heap cursor.)
 :M ,addr
 83220200 ,   \ lw t0,0(tp) # 0 <.text>
 13024200 ,   \ addi tp,tp,4 # 4 <.text+0x4>
-B3828240 ,   \ sub t0,t0,s0
-37030080 ,   \ lui t1,0x80000
-B3826200 ,   \ add t0,t0,t1
+B3823240 ,   \ sub t0,t0,gp
 B71F0000 ,   \ lui t6,0x1
 938F0F80 ,   \ addi t6,t6,-2048 # 800 <.text+0x800>
 3383F201 ,   \ add t1,t0,t6
@@ -85,7 +83,7 @@ B3837240 ,   \ sub t2,t0,t2
 130EFEFF ,   \ addi t3,t3,-1 # fff <.text+0xfff>
 B3F3C301 ,   \ and t2,t2,t3
 931EC300 ,   \ slli t4,t1,0xc
-93EE7E33 ,   \ ori t4,t4,823
+93EE7E31 ,   \ ori t4,t4,791
 23A0D101 ,   \ sw t4,0(gp)
 93814100 ,   \ addi gp,gp,4
 939E4301 ,   \ slli t4,t2,0x14

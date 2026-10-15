@@ -1,0 +1,645 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/tcp.fam — TCP over src/ip.fam: a pool of connections, each with a 4 KiB
+\ send ring and a 4 KiB receive ring, driven by the event loop's turns.
+\
+\   tcpinit  ( n -- )                     once: a pool of n connections
+\   tcplsn   ( port -- lsn|0 )            listen on port
+\   tcpacc   ( lsn -- conn|0 )            a connection that arrived on lsn and
+\                                         has not been handed out yet
+\   tcpconn  ( ip port -- conn|0 )        open a connection (the SYN is sent;
+\                                         see tcpst for when it is up)
+\   tcpsend  ( conn data len -- n )       queue up to len bytes; n is how many
+\                                         fit (0 when the ring is full or the
+\                                         connection cannot send)
+\   tcproom  ( conn -- n )                how many bytes tcpsend would take now
+\   tcprecv  ( conn buf cap -- n | -1 )   received bytes (0 when none yet);
+\                                         -1 once the peer has closed or the
+\                                         connection was reset, with nothing
+\                                         left to read
+\   tcpclose ( conn -- )                  done with it: the FIN handshake runs
+\                                         by itself; the record is reused later
+\   tcpst    ( conn -- state )            1 LISTEN 2 SYN_SENT 3 SYN_RCVD
+\                                         4 ESTABLISHED 5 FIN_WAIT_1 6 FIN_WAIT_2
+\                                         7 CLOSE_WAIT 8 LAST_ACK 9 CLOSING
+\                                         A TIME_WAIT B closed (reset, failed)
+\   tcpin    ( buf len -- )               a received packet (from ipin)
+\   tcptick  ( -- )                       once per loop turn, after the
+\                                         application ran: pending ACKs go out
+\                                         (unless data carried them meanwhile),
+\                                         lost segments are resent, timers run
+\   tlog     variable                     nonzero: a line on the UART, stamped
+\                                         with the uptime in ms, for every SYN,
+\                                         RST, FIN, retransmit and dropped
+\                                         segment (tms gives the stamp)
+\
+\ Record (0x50 bytes):  +00 state  +04 local port  +08 remote ip  +0C remote
+\ port  +10 snd.una  +14 snd.nxt  +18 peer window  +1C rcv.nxt  +20 send ring
+\ +24 end of queued data (seq; the SYN is at una, data starts after it)  +28 receive ring  +2C oldest unread (seq)
+\ +30 time of the last transmission  +34 retries  +38 flags (1 ACK pending,
+\ 2 our FIN queued, 4 their FIN seen, 8 handed to the application, 10 the
+\ application closed it)  +3C listener it came from  +40 MSS.
+\ The rings hold [snd.una, end) and [unread, rcv.nxt); a byte lives at
+\ seq & FFF.  Out-of-order segments are dropped (the ACK asks again), the
+\ retransmit timeout starts at 200 ms and doubles up to 3.2 s, nine misses end
+\ the connection, TIME_WAIT lasts 1 s.  No window scaling, no SACK, no zero
+\ window probes.  Needs src/udp.fam (umn) and what it needs.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: tcpl variable ;  : tcn variable ;  : tps variable ;  : tport variable ;
+: tcrst variable ;                 \ a scratch record for RSTs to nobody
+\ the segment being received
+: tpb variable ;  : tph variable ;  : tpl variable ;
+: tpsq variable ;  : tpak variable ;  : tpfl variable ;  : tpwn variable ;
+: tpdt variable ;  : tpdl variable ;  : tpdn variable ;
+: tpsip variable ;  : tpsp variable ;  : tpdp variable ;
+: tpc variable ;                   \ its connection
+
+: tnow ( -- t )  mtime@ drop ;
+: tms ( -- ms )  mtime@ 68DB9 lit * swap 2710 lit / + ;       \ uptime in ms (2^32 ticks = 429497 ms)
+: tlog variable ;
+: tlp ( -- )  '[' lit putc tms u. " ms] " puts ;
+: tln ( -- )  '\n' lit putc ;
+: tcrec ( i -- c )  dup 4 lit lshift swap 6 lit lshift + tcpl @ + ;
+: tcidx ( c -- i )  tcpl @ - 50 lit / ;
+: tlc ( c -- )  tlp "tcp c" puts tcidx u. ": " puts ;
+: tcpst ( c -- state )  @ ;
+: trfree ( c -- window )  dup 1C lit + @ swap 2C lit + @ - 1000 lit swap - ;
+: tackp ( c -- )  38 lit + dup @ 1 lit or swap ! ;
+: tcfree ( c -- )  0 lit over !  0 lit over 38 lit + !  0 lit swap 3C lit + ! ;
+
+\ ── rings ─────────────────────────────────────────────────────────────────────
+: rsrc variable ;  : rrng variable ;  : roff variable ;  : rn variable ;  : rf variable ;
+
+\ rput ( src ring seq n -- )  n bytes into the ring at seq
+: rput
+	rn ! FFF lit and roff ! rrng ! rsrc !
+	1000 lit roff @ - rn @ umn rf !
+	rsrc @ rrng @ roff @ + rf @ mcopy
+	rn @ rf @ - ?dup if rsrc @ rf @ + rrng @ rot mcopy then ;
+
+\ rget ( ring seq dst n -- )  n bytes out of the ring from seq
+: rget
+	rn ! rsrc ! FFF lit and roff ! rrng !
+	1000 lit roff @ - rn @ umn rf !
+	rrng @ roff @ + rsrc @ rf @ mcopy
+	rn @ rf @ - ?dup if rrng @ rsrc @ rf @ + rot mcopy then ;
+
+\ ── the pool ──────────────────────────────────────────────────────────────────
+: tcpinit ( n -- )
+	dup tcn !  dup 14 lit * dup alloc dup tcpl ! swap nzero
+	0 lit do 1000 lit alloc i tcrec 20 lit + !  1000 lit alloc i tcrec 28 lit + ! loop
+	10 lit alloc tps !  50 lit alloc dup tcrst ! 14 lit nzero
+	tnow 3FFF lit and C000 lit + tport ! ;                     \ ephemeral ports: start somewhere in C000..FFFF
+
+: tcalloc ( -- c|0 )
+	0 lit tcn @ 0 lit do dup 0= if drop i tcrec dup @ if drop 0 lit then then loop ;
+
+\ tcpfind ( lport rip rport -- c|0 )  the connection of a segment
+: tcpfind
+	0 lit tcn @ 0 lit do
+		dup 0= if drop i tcrec
+			dup @ 2 lit u< 0= if
+				dup 4 lit + @ 4 lit pick =  over 8 lit + @ 4 lit pick = and  over C lit + @ 3 lit pick = and
+				0= if drop 0 lit then
+			else drop 0 lit then
+		then
+	loop nip nip nip ;
+
+\ tclfind ( port -- lsn|0 )
+: tclfind
+	0 lit tcn @ 0 lit do
+		dup 0= if drop i tcrec dup @ 1 lit = over 4 lit + @ 3 lit pick = and 0= if drop 0 lit then then
+	loop nip ;
+
+\ ── segments out ──────────────────────────────────────────────────────────────
+: tgc variable ;  : tgs variable ;  : tgf variable ;  : tgl variable ;  : tgh variable ;
+
+\ tseg ( c seq flags dlen -- ok )  a segment whose data is already at ipbuf+14
+: tseg
+	tgl ! tgf ! tgs ! tgc !
+	tgf @ 2 lit and if 18 lit else 14 lit then tgh !            \ a SYN carries the MSS option
+	tgc @ 4 lit + @ ipbuf be16!  tgc @ C lit + @ ipbuf 2 lit + be16!
+	tgs @ ipbuf 4 lit + be32!  tgc @ 1C lit + @ ipbuf 8 lit + be32!
+	tgh @ 2 lit lshift ipbuf C lit + c!  tgf @ ipbuf D lit + c!
+	tgc @ trfree ipbuf E lit + be16!
+	0 lit ipbuf 10 lit + be16!  0 lit ipbuf 12 lit + be16!
+	tgf @ 2 lit and if 020405B4 lit ipbuf 14 lit + be32! then
+	ipaddr @ tps @ be32!  tgc @ 8 lit + @ tps @ 4 lit + be32!  6 lit tps @ 8 lit + be16!  tgh @ tgl @ + tps @ A lit + be16!
+	tps @ C lit 0 lit cksum ipbuf tgh @ tgl @ + rot cksum ckfin ipbuf 10 lit + be16!
+	tgc @ 8 lit + @ 6 lit tgh @ tgl @ + ipsend
+	dup if tgc @ 38 lit + dup @ 1 lit invert and swap ! then ;     \ it carried the ACK
+
+: toc variable ;  : ton variable ;  : toi variable ;
+
+\ tcpout ( c -- )  send what the state and the peer's window allow
+: tcpout
+	toc !  toc @ 14 lit + @ toc @ 10 lit + @ = toi !             \ nothing was outstanding
+	toc @ @ 2 lit = if toc @ toc @ 10 lit + @ 2 lit 0 lit tseg if toc @ 10 lit + @ 1 lit + toc @ 14 lit + ! then else
+	toc @ @ 3 lit = if toc @ toc @ 10 lit + @ 12 lit 0 lit tseg if toc @ 10 lit + @ 1 lit + toc @ 14 lit + ! then else
+	toc @ @ 4 lit - 6 lit u< if
+		begin
+			toc @ 24 lit + @ toc @ 14 lit + @ - dup 0< if drop 0 lit then                      \ unsent
+			toc @ 10 lit + @ toc @ 18 lit + @ + toc @ 14 lit + @ - dup 0< if drop 0 lit then   \ room in their window
+			umn toc @ 40 lit + @ umn ton !
+			ton @ if
+				toc @ 20 lit + @ toc @ 14 lit + @ ipbuf 14 lit + ton @ rget
+				toc @ toc @ 14 lit + @
+				toc @ 24 lit + @ toc @ 14 lit + @ - ton @ = if 18 lit else 10 lit then      \ PSH on the last piece
+				ton @ tseg if toc @ 14 lit + @ ton @ + toc @ 14 lit + !  0 lit else -1 lit then
+			else -1 lit then
+		until
+		toc @ 38 lit + @ 2 lit and  toc @ 14 lit + @ toc @ 24 lit + @ = and if                  \ our FIN, after the data
+			toc @ toc @ 14 lit + @ 11 lit 0 lit tseg if toc @ 14 lit + @ 1 lit + toc @ 14 lit + ! then
+		then
+	then then then
+	toi @ if toc @ 14 lit + @ toc @ 10 lit + @ <> if tnow toc @ 30 lit + ! then then ;      \ the timer starts
+
+\ ── segments in ───────────────────────────────────────────────────────────────
+: tmo variable ;
+
+\ tmssopt ( -- mss )  the MSS option of the segment being received, capped at ours
+: tmssopt
+	5B4 lit  tph @ 14 lit + tmo !
+	begin tmo @ tpdt @ u< while
+		tmo @ c@ dup 1 lit = if drop tmo @ 1 lit + tmo ! else
+			dup 0= if drop tpdt @ tmo ! else
+				2 lit = if tmo @ 2 lit + be16@ umn then
+				tmo @ 1 lit + c@ dup 2 lit u< if drop 2 lit then tmo @ + tmo !
+			then
+		then
+	repeat ;
+
+\ trst ( -- )  a RST to whoever sent the segment (no connection of ours)
+: trst
+	tlog @ if tlp "tcp: RST to port " puts tpsp @ u. " (no such connection; flags " puts tpfl @ u.x ")" puts tln then
+	tpdp @ tcrst @ 4 lit + !  tpsip @ tcrst @ 8 lit + !  tpsp @ tcrst @ C lit + !
+	tpfl @ 10 lit and if
+		tcrst @ tpak @ 4 lit 0 lit tseg drop
+	else
+		tpsq @ tpdl @ +  tpfl @ 2 lit and if 1 lit + then  tpfl @ 1 lit and if 1 lit + then
+		dup tcrst @ 1C lit + !  tcrst @ 2C lit + !
+		tcrst @ 0 lit 14 lit 0 lit tseg drop
+	then ;
+
+\ tlisten ( lsn -- )  a SYN for a listener: a new connection, SYN|ACK
+: tlisten
+	tcalloc ?dup if
+		tuck 3C lit + !
+		3 lit over !  tpdp @ over 4 lit + !  tpsip @ over 8 lit + !  tpsp @ over C lit + !
+		tpsq @ 1 lit + over 1C lit + !  tpsq @ 1 lit + over 2C lit + !
+		tnow over 10 lit + !  dup 10 lit + @ over 14 lit + !  dup 10 lit + @ 1 lit + over 24 lit + !
+		tpwn @ over 18 lit + !  0 lit over 34 lit + !  0 lit over 38 lit + !
+		tmssopt over 40 lit + !
+		tlog @ if dup tlc "SYN from port " puts tpsp @ u. " -> SYN|ACK" puts tln then
+		tcpout
+	else drop tlog @ if tlp "tcp: SYN from port " puts tpsp @ u. " but the pool is full: dropped" puts tln then then ;
+
+: tabort ( -- )  tpc @ 38 lit + @ 10 lit and if tpc @ tcfree else B lit tpc @ ! then ;
+
+\ tack ( -- alive )  the ACK field: advance snd.una, note an acked FIN
+: tack
+	-1 lit
+	tpfl @ 10 lit and if
+		tpak @ tpc @ 10 lit + @ - 0< 0=  tpc @ 14 lit + @ tpak @ - 0< 0= and if      \ una <= ack <= nxt
+			tpak @ tpc @ 10 lit + @ <> if
+				tpak @ tpc @ 10 lit + !  tnow tpc @ 30 lit + !  0 lit tpc @ 34 lit + !
+			then
+			tpwn @ tpc @ 18 lit + !
+			tpc @ 38 lit + @ 2 lit and  tpc @ 10 lit + @ tpc @ 24 lit + @ 1 lit + = and if      \ our FIN is acked
+				tpc @ @ dup 5 lit = if drop 6 lit tpc @ ! else
+				dup 9 lit = if drop A lit tpc @ !  tnow tpc @ 30 lit + ! else
+				8 lit = if tpc @ tcfree drop 0 lit then then then
+			then
+		else tpc @ 14 lit + @ tpak @ - 0< if tpc @ tackp then then                   \ beyond what we sent
+	then ;
+
+\ tdata ( -- )  the data: what fits in the receive ring
+: tdata
+	tpdl @ tpdn !
+	tpdl @ if
+		tpc @ trfree tpdl @ umn tpdn !
+		tpdn @ if
+			tpdt @ tpc @ 28 lit + @ tpc @ 1C lit + @ tpdn @ rput
+			tpc @ 1C lit + @ tpdn @ + tpc @ 1C lit + !
+			tpc @ 38 lit + @ 10 lit and if tpc @ 1C lit + @ tpc @ 2C lit + ! then     \ nobody will read it
+		then
+		tpc @ tackp
+	then ;
+
+\ tfin ( -- )  their FIN, once all the data before it is in
+: tfin
+	tpfl @ 1 lit and  tpdn @ tpdl @ = and if
+		tpc @ 1C lit + dup @ 1 lit + swap !
+		tpc @ 38 lit + dup @ 5 lit or swap !
+		tpc @ @ dup 4 lit = if drop 7 lit tpc @ ! else
+		dup 5 lit = if drop 9 lit tpc @ ! else
+		6 lit = if A lit tpc @ !  tnow tpc @ 30 lit + ! then then then
+		tlog @ if tpc @ tlc "FIN from the peer, state now " puts tpc @ @ u. tln then
+	then ;
+
+\ tmain ( -- )  ESTABLISHED and the closing states
+: tmain
+	tpfl @ 4 lit and if
+		tlog @ if tpc @ tlc "RST from the peer in state " puts tpc @ @ u. tln then
+		tabort
+	else
+		tpc @ 1C lit + @ tpsq @ - dup 0< if drop 0 lit then                 \ already seen
+		dup tpdl @ u> if
+			drop 0 lit tpdl !  tpc @ 1C lit + @ tpsq !  tpfl @ 1 lit invert and tpfl !  tpc @ tackp
+		else dup tpdt @ + tpdt !  tpdl @ over - tpdl !  tpsq @ + tpsq ! then
+		tack if
+			tpsq @ tpc @ 1C lit + @ = if tdata tfin else                        \ a gap: ask again
+				tlog @ if tpc @ tlc "out of order: seq " puts tpsq @ u. ", expected " puts tpc @ 1C lit + @ u. ", dropped" puts tln then
+				tpc @ tackp
+			then
+			tpc @ tcpout
+		then
+	then ;
+
+: tsynsent
+	tpfl @ 4 lit and if B lit tpc @ ! else
+		tpfl @ 2 lit and if
+			tpfl @ 10 lit and 0=  tpak @ tpc @ 14 lit + @ = or if
+				tpsq @ 1 lit + dup tpc @ 1C lit + ! tpc @ 2C lit + !
+				tpwn @ tpc @ 18 lit + !  tmssopt tpc @ 40 lit + !
+				tpfl @ 10 lit and if tpak @ tpc @ 10 lit + !  4 lit else 3 lit then tpc @ !
+				tpc @ tackp  tpc @ tcpout
+			then
+		then
+	then ;
+
+: tsynrcvd
+	tpfl @ 4 lit and if tpc @ tcfree else
+		tpfl @ 2 lit and if tpc @ 10 lit + @ tpc @ 14 lit + !  tpc @ tcpout else      \ their SYN again: ours again
+			tpfl @ 10 lit and if
+				tpak @ tpc @ 14 lit + @ = if
+					tpak @ tpc @ 10 lit + !  tpwn @ tpc @ 18 lit + !  4 lit tpc @ !  0 lit tpc @ 34 lit + !  tmain
+				else trst then
+			then
+		then
+	then ;
+
+: tdisp ( -- )
+	tpdp @ tpsip @ tpsp @ tcpfind ?dup if
+		tpc !
+		tpc @ @ dup 2 lit = if drop tsynsent else
+		dup 3 lit = if drop tsynrcvd else
+		B lit = if trst else tmain then then then
+	else
+		tpfl @ 4 lit and 0= if
+			tpdp @ tclfind dup if tpfl @ 12 lit and 2 lit = 0= if drop 0 lit then then
+			?dup if tlisten else trst then
+		then
+	then ;
+
+: tcpin ( buf len -- )
+	tcn @ 0= if 2drop else
+		over tpb !  over c@ F lit and 2 lit lshift dup tpb @ + tph !  - tpl !  drop
+		tpl @ 14 lit u< 0= if
+			tpb @ C lit + be32@ tps @ be32!  ipaddr @ tps @ 4 lit + be32!  6 lit tps @ 8 lit + be16!  tpl @ tps @ A lit + be16!
+			tps @ C lit 0 lit cksum tph @ tpl @ rot cksum ckfin 0= if
+				tph @ C lit + c@ 4 lit rshift 2 lit lshift
+				dup tpl @ u> 0= over 14 lit u< 0= and if
+					dup tph @ + tpdt !  tpl @ swap - tpdl !
+					tph @ be16@ tpsp !  tph @ 2 lit + be16@ tpdp !  tpb @ C lit + be32@ tpsip !
+					tph @ 4 lit + be32@ tpsq !  tph @ 8 lit + be32@ tpak !  tph @ D lit + c@ 3F lit and tpfl !  tph @ E lit + be16@ tpwn !
+					tdisp
+				else drop then
+			then
+		then
+	then ;
+
+\ ── the tick ──────────────────────────────────────────────────────────────────
+: trto ( retries -- ticks )  4 lit umn 1E8480 lit swap lshift ;
+
+: tcptick ( -- )
+	tcn @ ?dup if 0 lit do
+		i tcrec tpc !
+		tpc @ @ A lit = if
+			tnow tpc @ 30 lit + @ - 989680 lit u> if tpc @ tcfree then
+		else tpc @ @ 2 lit - 9 lit u< if                                      \ SYN_SENT .. CLOSING
+			tpc @ 10 lit + @ tpc @ 14 lit + @ <> if                            \ something is outstanding
+				tnow tpc @ 30 lit + @ - tpc @ 34 lit + @ trto u> if
+					tpc @ 34 lit + @ 8 lit u> 0= if
+						tpc @ 34 lit + dup @ 1 lit + swap !  tnow tpc @ 30 lit + !
+						tlog @ if tpc @ tlc "no ACK: retransmit " puts tpc @ 34 lit + @ u. tln then
+						tpc @ 10 lit + @ tpc @ 14 lit + !  tpc @ tcpout
+					else tlog @ if tpc @ tlc "no ACK after 9 retries: dead" puts tln then tabort then
+				then
+			then
+		then then
+		tpc @ @ 2 lit - 9 lit u< if                                            \ still live: a pending ACK goes out
+			tpc @ 38 lit + @ 1 lit and if tpc @ tpc @ 14 lit + @ 10 lit 0 lit tseg drop then
+		then
+	loop then ;
+
+\ ── the application's side ────────────────────────────────────────────────────
+: tcplsn ( port -- lsn|0 )  tcalloc ?dup if 1 lit over !  tuck 4 lit + ! else drop 0 lit then ;
+
+: tcpacc ( lsn -- c|0 )
+	0 lit tcn @ 0 lit do
+		dup 0= if drop i tcrec
+			dup 3C lit + @ 2 lit pick =  over @ 4 lit u< 0= and  over 38 lit + @ 8 lit and 0= and
+			0= if drop 0 lit then
+		then
+	loop nip
+	?dup if dup 38 lit + dup @ 8 lit or swap ! else 0 lit then ;
+
+: tcpconn ( ip port -- c|0 )
+	tcalloc ?dup if
+		tuck C lit + !  tuck 8 lit + !
+		tport @ dup 1 lit + FFFF lit and dup C000 lit u< if drop C000 lit then tport !  over 4 lit + !
+		tnow over 10 lit + !  dup 10 lit + @ over 14 lit + !  dup 10 lit + @ 1 lit + over 24 lit + !
+		0 lit over 1C lit + !  0 lit over 2C lit + !  0 lit over 18 lit + !
+		0 lit over 34 lit + !  0 lit over 38 lit + !  0 lit over 3C lit + !  5B4 lit over 40 lit + !
+		2 lit over !
+		dup tcpout
+	else 2drop 0 lit then ;
+
+: tsc variable ;  : tsn variable ;
+: tcpsend ( c data len -- n )
+	rot tsc !
+	tsc @ @ dup 4 lit = swap 7 lit = or 0= if 2drop 0 lit else
+		1000 lit tsc @ 24 lit + @ tsc @ 10 lit + @ - - umn tsn !
+		tsn @ if
+			tsc @ 20 lit + @ tsc @ 24 lit + @ tsn @ rput
+			tsc @ 24 lit + dup @ tsn @ + swap !
+			tsc @ tcpout
+		else drop then
+		tsn @
+	then ;
+
+: tcproom ( c -- n )  1000 lit over 24 lit + @ rot 10 lit + @ - - ;
+
+: trc variable ;  : trn variable ;
+: tcprecv ( c buf cap -- n | -1 )
+	rot trc !
+	trc @ 1C lit + @ trc @ 2C lit + @ -  trc @ 38 lit + @ 4 lit and if 1 lit - then  umn trn !      \ their FIN took a number, not a byte
+	trn @ if
+		trc @ 28 lit + @ trc @ 2C lit + @ rot trn @ rget
+		trc @ 2C lit + dup @ trn @ + swap !
+		trc @ trfree dup trn @ - 800 lit u< swap 800 lit u< 0= and if trc @ tackp then     \ the window grew past half: say so
+		trn @
+	else drop
+		trc @ @ B lit =  trc @ 38 lit + @ 4 lit and or  trc @ @ 0= or if -1 lit else 0 lit then
+	then ;
+
+: tcpclose ( c -- )
+	dup @ dup 1 lit = if drop tcfree else
+	dup 4 lit = if drop 5 lit over !  dup 38 lit + dup @ 12 lit or swap !  tcpout else
+	dup 7 lit = if drop 8 lit over !  dup 38 lit + dup @ 12 lit or swap !  tcpout else
+	dup 2 lit = over 3 lit = or over B lit = or if drop tcfree else
+	drop dup 38 lit + dup @ 10 lit or swap ! drop then then then then ;
+
+\ ──────────────────────────────────────────────────────────────────────────────
+\ Tests on the scratch NIC (efake, src/eth.fam).  The peer is 10.0.2.9:5555;
+\ tin builds a segment from it to our port 8080 (data byte i = 'a' + i) and
+\ feeds it to tcpin; tfr gives the TCP header of the i-th frame we sent.
+\ The live tests and benches against the host are in src/netin.fam.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+Test {
+	pool {
+		: tpk variable ;  800 lit alloc tpk !
+		: tbf variable ;  2000 lit alloc tbf !
+		: tdport variable ;  : tsrcip variable ;  : tsrcpt variable ;  : twin variable ;
+		: tcc variable ;  : tcl variable ;  : tiss variable ;
+		\ tbuild ( flags seq ack dlen -- len )  a segment from the peer into tpk
+		: tbuild
+			tpk @ 40 lit nzero
+			dup ?dup if 0 lit do i 1A lit % 'a' lit + tpk @ 28 lit + i + c! loop then
+			45 lit tpk @ c!  dup 28 lit + tpk @ 2 lit + be16!  40 lit tpk @ 8 lit + c!  6 lit tpk @ 9 lit + c!
+			tsrcip @ tpk @ C lit + be32!  0A00020F lit tpk @ 10 lit + be32!
+			tpk @ 14 lit 0 lit cksum ckfin tpk @ A lit + be16!
+			tsrcpt @ tpk @ 14 lit + be16!  tdport @ tpk @ 16 lit + be16!
+			2 lit pick tpk @ 18 lit + be32!  over tpk @ 1C lit + be32!
+			50 lit tpk @ 20 lit + c!  3 lit pick tpk @ 21 lit + c!  twin @ tpk @ 22 lit + be16!
+			tsrcip @ tps @ be32!  0A00020F lit tps @ 4 lit + be32!  6 lit tps @ 8 lit + be16!  dup 14 lit + tps @ A lit + be16!
+			tps @ C lit 0 lit cksum tpk @ 14 lit + 2 lit pick 14 lit + rot cksum ckfin tpk @ 24 lit + be16!
+			28 lit + nip nip nip ;
+		: tin ( flags seq ack dlen -- )  tbuild tpk @ swap tcpin ;
+		: tntx ( -- n )  net @ 20 lit + @ ;
+		: tfr ( i -- th )  F lit and etx 22 lit + ;
+		: tlast ( -- th )  tntx 1 lit - tfr ;
+		: tdone ( -- )  tntx net @ 8 lit + @ 1002 lit + h! ;             \ the fake NIC completes everything
+		: tsetup ( -- )
+			efake
+			0A00020F lit FFFFFF00 lit 0A000202 lit ipgw ! ipmask ! ipaddr !
+			800 lit alloc txf !  80 lit alloc dup arpt ! 20 lit 0 lit do 0 lit over i 2 lit lshift + ! loop drop  0 lit arpn !
+			8 lit alloc dup bcast ! 6 lit 0 lit do FF lit over i + c! loop drop
+			0A000209 lit "QRSTUV" arpadd  0A000202 lit "GWGWGW" arpadd
+			1F90 lit tdport !  0A000209 lit tsrcip !  15B3 lit tsrcpt !  2000 lit twin !
+			4 lit tcpinit ;
+		\ tgo ( -- c )  a connection from the peer: SYN, ACK of our SYN|ACK, accepted
+		: tgo
+			2 lit 3E8 lit 0 lit 0 lit tin
+			tlast 4 lit + be32@ tiss !
+			10 lit 3E9 lit tiss @ 1 lit + 0 lit tin
+			tcl @ tcpacc ;
+		tsetup
+		1F90 lit tcplsn dup tcl ! 0 lit <> assert  tcl @ @ 1 lit asrt_eq
+		1F90 lit tclfind tcl @ asrt_eq  1F91 lit tclfind 0 lit asrt_eq
+		3 lit 0 lit do 1 lit tcplsn 0 lit <> assert loop
+		1 lit tcplsn 0 lit asrt_eq                                  \ the pool is 4
+		tcl @ tcpclose  tcl @ @ 0 lit asrt_eq  1F90 lit tclfind 0 lit asrt_eq
+		3 lit 0 lit do 1 lit tclfind tcpclose loop  1 lit tclfind 0 lit asrt_eq
+	}
+	\ an active open: the SYN, with the MSS option, from an ephemeral port
+	connect {
+		tsetup  0 lit ipid !
+		0A000202 lit 50 lit tcpconn dup tcc ! 0 lit <> assert
+		tcc @ @ 2 lit asrt_eq  tcc @ 4 lit + @ C000 lit u< 0= assert  tcc @ C lit + @ 50 lit asrt_eq
+		tntx 1 lit asrt_eq
+		0 lit etx dup "GWGWGW" emac assert  17 lit + c@ 6 lit asrt_eq
+		tlast dup be16@ tcc @ 4 lit + @ asrt_eq  dup 2 lit + be16@ 50 lit asrt_eq
+		dup C lit + c@ 60 lit asrt_eq  dup D lit + c@ 2 lit asrt_eq  dup E lit + be16@ 1000 lit asrt_eq
+		dup 14 lit + be32@ 020405B4 lit asrt_eq
+		dup 4 lit + be32@ tcc @ 10 lit + @ asrt_eq  tcc @ 14 lit + @ tcc @ 10 lit + @ 1 lit + asrt_eq
+		drop
+		\ the checksum verifies (pseudo header + segment)
+		ipaddr @ tps @ be32!  0A000202 lit tps @ 4 lit + be32!  6 lit tps @ 8 lit + be16!  18 lit tps @ A lit + be16!
+		tps @ C lit 0 lit cksum tlast 18 lit rot cksum ckfin 0 lit asrt_eq
+		\ their SYN|ACK: established, our ACK pending, sent by the tick
+		tcc @ 4 lit + @ tdport !  0A000202 lit tsrcip !  50 lit tsrcpt !
+		12 lit 7D0 lit tcc @ 14 lit + @ 0 lit tin
+		tcc @ @ 4 lit asrt_eq  tcc @ 1C lit + @ 7D1 lit asrt_eq  tcc @ 10 lit + @ tcc @ 14 lit + @ asrt_eq  tcc @ 18 lit + @ 2000 lit asrt_eq
+		tntx 1 lit asrt_eq
+		tcptick  tntx 2 lit asrt_eq  tlast D lit + c@ 10 lit asrt_eq  tlast 8 lit + be32@ 7D1 lit asrt_eq
+		tcptick  tntx 2 lit asrt_eq                                  \ once
+		tcc @ tcpclose  tcc @ @ 5 lit asrt_eq
+		0A000202 lit 50 lit tcpconn dup tcpclose @ 0 lit asrt_eq    \ closed in SYN_SENT: freed
+	}
+	\ a passive open: SYN in, SYN|ACK out, ACK in; tcpacc hands it over once
+	accept {
+		tsetup  1F90 lit tcplsn tcl !
+		2 lit 3E8 lit 0 lit 0 lit tin
+		tcl @ tcpacc 0 lit asrt_eq                                   \ not yet
+		tntx 1 lit asrt_eq
+		tlast dup D lit + c@ 12 lit asrt_eq  dup 8 lit + be32@ 3E9 lit asrt_eq  dup C lit + c@ 60 lit asrt_eq
+		dup be16@ 1F90 lit asrt_eq  dup 2 lit + be16@ 15B3 lit asrt_eq
+		4 lit + be32@ tiss !
+		1F90 lit 0A000209 lit 15B3 lit tcpfind dup tcc ! 0 lit <> assert  tcc @ @ 3 lit asrt_eq
+		2 lit 3E8 lit 0 lit 0 lit tin                                \ their SYN again: ours again
+		tntx 2 lit asrt_eq  tlast D lit + c@ 12 lit asrt_eq  tlast 4 lit + be32@ tiss @ asrt_eq
+		10 lit 3E9 lit tiss @ 1 lit + 0 lit tin
+		tcc @ @ 4 lit asrt_eq  tcc @ 10 lit + @ tiss @ 1 lit + asrt_eq
+		tcl @ tcpacc tcc @ asrt_eq  tcl @ tcpacc 0 lit asrt_eq
+		tcc @ tbf @ 100 lit tcprecv 0 lit asrt_eq                   \ nothing yet, still open
+		tntx 2 lit asrt_eq                                           \ a bare ACK needs no answer
+		\ a SYN with nobody listening: RST|ACK
+		1F91 lit tdport !  2 lit 3E8 lit 0 lit 0 lit tin  1F90 lit tdport !
+		tlast dup D lit + c@ 14 lit asrt_eq  dup 4 lit + be32@ 0 lit asrt_eq  8 lit + be32@ 3E9 lit asrt_eq
+		\ data to nobody: RST at their ack
+		1F91 lit tdport !  10 lit 3E8 lit 777 lit 5 lit tin  1F90 lit tdport !
+		tlast dup D lit + c@ 4 lit asrt_eq  4 lit + be32@ 777 lit asrt_eq
+	}
+	\ data both ways: in-order data read out, the ACK sent by the tick or carried by our data
+	data {
+		tsetup  1F90 lit tcplsn tcl !  tgo tcc !
+		18 lit 3E9 lit tiss @ 1 lit + A lit tin
+		tcc @ 1C lit + @ 3F3 lit asrt_eq
+		tcc @ tbf @ 4 lit tcprecv 4 lit asrt_eq  tbf @ c@ 'a' lit asrt_eq  tbf @ 3 lit + c@ 'd' lit asrt_eq
+		tcc @ tbf @ 100 lit tcprecv 6 lit asrt_eq  tbf @ c@ 'e' lit asrt_eq  tbf @ 5 lit + c@ 'j' lit asrt_eq
+		tcc @ tbf @ 100 lit tcprecv 0 lit asrt_eq
+		tntx tcptick tntx swap - 1 lit asrt_eq
+		tlast dup D lit + c@ 10 lit asrt_eq  dup 8 lit + be32@ 3F3 lit asrt_eq  E lit + be16@ 1000 lit asrt_eq
+		\ ours: PSH|ACK, the right sequence, carrying the pending ACK
+		18 lit 3F3 lit tiss @ 1 lit + 3 lit tin
+		tcc @ "hello" 5 lit tcpsend 5 lit asrt_eq
+		tlast dup D lit + c@ 18 lit asrt_eq  dup 4 lit + be32@ tiss @ 1 lit + asrt_eq  dup 8 lit + be32@ 3F6 lit asrt_eq
+		dup 14 lit + c@ 'h' lit asrt_eq  18 lit + c@ 'o' lit asrt_eq
+		tcc @ 14 lit + @ tiss @ 6 lit + asrt_eq  tcc @ 10 lit + @ tiss @ 1 lit + asrt_eq
+		tntx tcptick tntx asrt_eq                                    \ nothing pending
+		10 lit 3F6 lit tiss @ 6 lit + 0 lit tin                      \ acked
+		tcc @ 10 lit + @ tiss @ 6 lit + asrt_eq  tcc @ 34 lit + @ 0 lit asrt_eq
+		tntx tcptick tntx asrt_eq
+		\ a gap: dropped, asked again; an overlap: the new part taken
+		18 lit 400 lit tiss @ 6 lit + A lit tin
+		tcc @ 1C lit + @ 3F6 lit asrt_eq  tntx tcptick tntx swap - 1 lit asrt_eq  tlast 8 lit + be32@ 3F6 lit asrt_eq
+		18 lit 3F0 lit tiss @ 6 lit + A lit tin
+		tcc @ 1C lit + @ 3FA lit asrt_eq
+		tcc @ tbf @ 100 lit tcprecv 7 lit asrt_eq                   \ the 3 unread, then the 4 new
+		tbf @ c@ 'a' lit asrt_eq  tbf @ 3 lit + c@ 'g' lit asrt_eq  tbf @ 6 lit + c@ 'j' lit asrt_eq
+		10 lit 3E0 lit tiss @ 6 lit + 0 lit tin                      \ an old bare ACK: nothing changes
+		tcc @ 1C lit + @ 3FA lit asrt_eq  tcc @ 10 lit + @ tiss @ 6 lit + asrt_eq
+		\ a bad checksum is dropped
+		18 lit 3FA lit tiss @ 6 lit + 5 lit tbuild  tpk @ 24 lit + dup be16@ 1 lit + swap be16!  tpk @ swap tcpin
+		tcc @ 1C lit + @ 3FA lit asrt_eq
+	}
+	\ the send side: segments of MSS, PSH on the last, the peer's window and the ring as limits
+	window {
+		tsetup  1F90 lit tcplsn tcl !  tgo tcc !
+		tbf @ 1000 lit 0 lit do i FF lit and over i + c! loop drop
+		tcc @ tbf @ BB8 lit tcpsend BB8 lit asrt_eq                  \ 3000: 1460 + 1460 + 80
+		tntx 4 lit asrt_eq
+		1 lit tfr dup D lit + c@ 10 lit asrt_eq  dup 4 lit + be32@ tiss @ 1 lit + asrt_eq  12 lit - be16@ 5DC lit asrt_eq
+		2 lit tfr dup D lit + c@ 10 lit asrt_eq  dup 4 lit + be32@ tiss @ 5B5 lit + asrt_eq  14 lit + c@ B4 lit asrt_eq
+		3 lit tfr dup D lit + c@ 18 lit asrt_eq  dup 4 lit + be32@ tiss @ B69 lit + asrt_eq  12 lit - be16@ 50 lit 28 lit + asrt_eq
+		tcc @ 14 lit + @ tiss @ BB9 lit + asrt_eq
+		tcc @ tbf @ 1000 lit tcpsend 448 lit asrt_eq                 \ the ring: 4096 - 3000
+		tcc @ tbf @ 10 lit tcpsend 0 lit asrt_eq
+		tntx 5 lit asrt_eq
+		10 lit 3E9 lit tiss @ 1001 lit + 0 lit tin                   \ all acked
+		tcc @ 10 lit + @ tiss @ 1001 lit + asrt_eq
+		tdone
+		\ a window of 100: one segment of 100, the next on the ACK, the rest when it opens
+		64 lit twin !  10 lit 3E9 lit tiss @ 1001 lit + 0 lit tin
+		tcc @ 18 lit + @ 64 lit asrt_eq
+		tcc @ tbf @ 200 lit tcpsend 200 lit asrt_eq
+		tntx 6 lit asrt_eq  tlast 12 lit - be16@ 64 lit 28 lit + asrt_eq
+		10 lit 3E9 lit tiss @ 1065 lit + 0 lit tin
+		tntx 7 lit asrt_eq  tlast 4 lit + be32@ tiss @ 1065 lit + asrt_eq  tlast 12 lit - be16@ 64 lit 28 lit + asrt_eq
+		2000 lit twin !  10 lit 3E9 lit tiss @ 1065 lit + 0 lit tin
+		tntx 8 lit asrt_eq  tlast 4 lit + be32@ tiss @ 10C9 lit + asrt_eq  tlast 12 lit - be16@ 138 lit 28 lit + asrt_eq
+		tlast D lit + c@ 18 lit asrt_eq
+	}
+	\ retransmission: the timer, the backoff, a dead connection after nine misses
+	retrans {
+		tsetup  1F90 lit tcplsn tcl !  tgo tcc !
+		tcc @ "data" 4 lit tcpsend drop
+		tntx 2 lit asrt_eq
+		tcptick  tntx 2 lit asrt_eq                                   \ not due
+		tcc @ 30 lit + dup @ 1F0000 lit - swap !                       \ 203 ms ago
+		tcptick  tntx 3 lit asrt_eq  tlast 4 lit + be32@ tiss @ 1 lit + asrt_eq  tlast D lit + c@ 18 lit asrt_eq
+		tcc @ 34 lit + @ 1 lit asrt_eq
+		tcc @ 30 lit + dup @ 1F0000 lit - swap !
+		tcptick  tntx 3 lit asrt_eq                                   \ 400 ms now
+		tcc @ 30 lit + dup @ 1F0000 lit - swap !
+		tcptick  tntx 4 lit asrt_eq  tcc @ 34 lit + @ 2 lit asrt_eq
+		10 lit 3E9 lit tiss @ 5 lit + 0 lit tin                       \ acked: the timer stops
+		tcc @ 34 lit + @ 0 lit asrt_eq
+		tcc @ 30 lit + dup @ 1000000 lit - swap !  tcptick  tntx 4 lit asrt_eq
+		tcc @ "more" 4 lit tcpsend drop
+		tdone
+		A lit 0 lit do tcc @ 30 lit + dup @ 4000000 lit - swap ! tcptick loop
+		tcc @ @ B lit asrt_eq
+		tcc @ tbf @ 10 lit tcprecv -1 lit asrt_eq
+		tcc @ tcpclose  tcc @ @ 0 lit asrt_eq
+	}
+	\ their FIN first: CLOSE_WAIT, we may still send, then LAST_ACK and gone
+	closewait {
+		tsetup  1F90 lit tcplsn tcl !  tgo tcc !
+		19 lit 3E9 lit tiss @ 1 lit + 3 lit tin                        \ FIN with 3 bytes
+		tcc @ @ 7 lit asrt_eq  tcc @ 1C lit + @ 3ED lit asrt_eq
+		tcc @ tbf @ 10 lit tcprecv 3 lit asrt_eq  tcc @ tbf @ 10 lit tcprecv -1 lit asrt_eq
+		tcptick  tlast 8 lit + be32@ 3ED lit asrt_eq
+		tcc @ "bye" 3 lit tcpsend 3 lit asrt_eq
+		tcc @ tcpclose  tcc @ @ 8 lit asrt_eq
+		tlast dup D lit + c@ 11 lit asrt_eq  4 lit + be32@ tiss @ 4 lit + asrt_eq
+		19 lit 3E9 lit tiss @ 1 lit + 3 lit tin                        \ their FIN again: nothing new
+		tcc @ @ 8 lit asrt_eq  tcc @ 1C lit + @ 3ED lit asrt_eq
+		10 lit 3ED lit tiss @ 5 lit + 0 lit tin                        \ our FIN acked: gone
+		tcc @ @ 0 lit asrt_eq
+	}
+	\ our FIN first: FIN_WAIT_1, _2, their FIN, TIME_WAIT, freed by the tick after 1 s
+	finwait {
+		tsetup  1F90 lit tcplsn tcl !  tgo tcc !
+		tcc @ tcpclose  tcc @ @ 5 lit asrt_eq
+		tlast dup D lit + c@ 11 lit asrt_eq  4 lit + be32@ tiss @ 1 lit + asrt_eq
+		tcc @ "x" 1 lit tcpsend 0 lit asrt_eq
+		18 lit 3E9 lit tiss @ 1 lit + 2 lit tin                        \ data still arrives, discarded
+		tcc @ 1C lit + @ 3EB lit asrt_eq  tcc @ 2C lit + @ 3EB lit asrt_eq
+		10 lit 3EB lit tiss @ 2 lit + 0 lit tin                        \ our FIN acked
+		tcc @ @ 6 lit asrt_eq
+		11 lit 3EB lit tiss @ 2 lit + 0 lit tin
+		tcc @ @ A lit asrt_eq
+		tntx tcptick tntx swap - 1 lit asrt_eq  tlast 8 lit + be32@ 3EC lit asrt_eq
+		tcptick  tcc @ @ A lit asrt_eq
+		tcc @ 30 lit + dup @ A00000 lit - swap !  tcptick  tcc @ @ 0 lit asrt_eq
+		\ both at once: CLOSING, then TIME_WAIT
+		tgo tcc !  tcc @ tcpclose
+		11 lit 3E9 lit tiss @ 1 lit + 0 lit tin  tcc @ @ 9 lit asrt_eq
+		10 lit 3EA lit tiss @ 2 lit + 0 lit tin  tcc @ @ A lit asrt_eq
+	}
+	\ a RST: dead until the application closes it; a dead one answers with RST
+	reset {
+		tsetup  1F90 lit tcplsn tcl !  tgo tcc !
+		14 lit 3E9 lit tiss @ 1 lit + 0 lit tin
+		tcc @ @ B lit asrt_eq
+		tcc @ tbf @ 10 lit tcprecv -1 lit asrt_eq  tcc @ "x" 1 lit tcpsend 0 lit asrt_eq
+		tntx 18 lit 3E9 lit tiss @ 1 lit + 2 lit tin tntx swap - 1 lit asrt_eq  tlast D lit + c@ 4 lit asrt_eq
+		tcc @ tcpclose  tcc @ @ 0 lit asrt_eq
+		\ a reset in SYN_RCVD frees quietly; one after our close frees too
+		2 lit 3E8 lit 0 lit 0 lit tin  1F90 lit 0A000209 lit 15B3 lit tcpfind dup tcc ! 0 lit <> assert
+		14 lit 3E9 lit 0 lit 0 lit tin  tcc @ @ 0 lit asrt_eq
+		tgo tcc !  tcc @ tcpclose  14 lit 3E9 lit tiss @ 1 lit + 0 lit tin  tcc @ @ 0 lit asrt_eq
+	}
+	\ the receive ring: what does not fit waits for the peer to send it again;
+	\ the window closes, and reopens with an update once half is free
+	rcvwin {
+		tsetup  1F90 lit tcplsn tcl !  tgo tcc !
+		18 lit 3E9 lit tiss @ 1 lit + 5B4 lit tin
+		18 lit 99D lit tiss @ 1 lit + 5B4 lit tin
+		18 lit F51 lit tiss @ 1 lit + 5B4 lit tin                      \ only 1176 of it fits
+		tcc @ 1C lit + @ 13E9 lit asrt_eq  tcc @ trfree 0 lit asrt_eq
+		tcptick  tlast E lit + be16@ 0 lit asrt_eq  tlast 8 lit + be32@ 13E9 lit asrt_eq
+		tcc @ tbf @ 400 lit tcprecv 400 lit asrt_eq
+		tntx tcptick tntx asrt_eq                                      \ under half: no update
+		tcc @ tbf @ 800 lit tcprecv 800 lit asrt_eq  tbf @ c@ 'k' lit asrt_eq
+		tntx tcptick tntx swap - 1 lit asrt_eq  tlast E lit + be16@ C00 lit asrt_eq
+		tcc @ tbf @ 1000 lit tcprecv 400 lit asrt_eq  tbf @ c@ 'w' lit asrt_eq  tbf @ 3FF lit + c@ 'f' lit asrt_eq
+		18 lit F51 lit tiss @ 1 lit + 5B4 lit tin                      \ the third again: the rest of it
+		tcc @ 1C lit + @ 1505 lit asrt_eq
+		tcc @ tbf @ 1000 lit tcprecv 11C lit asrt_eq  tbf @ c@ 'g' lit asrt_eq
+	}
+}

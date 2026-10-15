@@ -1,0 +1,510 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/http.fam — an HTTP/1.1 server with WebSocket upgrades over src/tcp.fam,
+\ driven by the event loop's turns.
+\
+\   httpinit ( port n -- )     once, after tcpinit: listen on port, serve at
+\                              most n connections at a time
+\   httpturn ( -- )            once per loop turn, after netpoll and before
+\                              tcptick: accept, read, answer, send what is due
+\   hlog     variable          nonzero: a line on the UART, stamped with the
+\                              uptime in ms, for every connection, request,
+\                              answer, frame, close and tick (src/tcp.fam's
+\                              tlog does the same one layer down)
+\
+\ What it serves, for now: GET / is the page (built at init from the pieces in
+\ hpage: a hello and a WebSocket log, closed cleanly on
+\ unload so Firefox does not count a reload as a failed socket), a GET carrying a Sec-WebSocket-Key is
+\ upgraded, anything else is a 404.  On a socket a text or binary message is
+\ answered with "you said: " and the message, a ping with a pong, a close with
+\ a close; every second every socket gets a tick with the uptime.  Connections
+\ are kept alive; a request over 2 KiB without its end, or a frame over 2 KiB,
+\ closes the connection.
+\
+\ A slot (0x20 bytes): +00 connection (0 free)  +04 mode (0 HTTP, 1 socket)
+\ +08 bytes in the request buffer  +0C/+10 what is still to be sent (pointer,
+\ bytes: a response goes out across turns when the send ring is full)
+\ +14 request buffer (0x800)  +18 scratch for the 101 (0x100).
+\ SHA-1 and base64 (the upgrade's accept key) are here too.  Needs src/tcp.fam
+\ (and what it needs); the live test needs src/netin.fam.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: hsl variable ;  : hsn variable ;  : hlsn variable ;
+: hbody variable ;  : hbn variable ;  : hresp variable ;  : hrlen variable ;  : h404 variable ;  : h4len variable ;
+: hnreq variable ;  : hnws variable ;  : hnmsg variable ;  : hncls variable ;     \ counters: requests, upgrades, messages, closes
+: htick variable ;  : hsec variable ;  : htb variable ;
+: hp variable ;  : hdt variable ;  : hdn variable ;  : hkb variable ;  : hdg variable ;
+\ the slot being served
+: hs variable ;  : hc variable ;  : hrb variable ;  : hf variable ;  : hob variable ;  : hreq variable ;
+
+: hslot ( i -- s )  5 lit lshift hsl @ + ;
+: hlog variable ;
+: hls ( -- )  tlp "http s" puts hs @ hsl @ - 5 lit rshift u. ": " puts ;
+
+\ ── SHA-1 ─────────────────────────────────────────────────────────────────────
+: shh variable ;  : shw variable ;  : shm variable ;  : shl variable ;  : sho variable ;
+: sha variable ;  : shb variable ;  : shc variable ;  : shd variable ;  : she variable ;
+
+: rol ( x n -- x' )  2dup lshift -rot 20 lit swap - rshift or ;
+
+\ shblk ( p -- )  one 64-byte block into the state
+: shblk
+	10 lit 0 lit do dup i 2 lit lshift + be32@ shw @ i 2 lit lshift + ! loop drop
+	50 lit 10 lit do
+		shw @ i 3 lit - 2 lit lshift + @  shw @ i 8 lit - 2 lit lshift + @ xor
+		shw @ i E lit - 2 lit lshift + @ xor  shw @ i 10 lit - 2 lit lshift + @ xor
+		1 lit rol shw @ i 2 lit lshift + !
+	loop
+	shh @ @ sha !  shh @ 4 lit + @ shb !  shh @ 8 lit + @ shc !  shh @ C lit + @ shd !  shh @ 10 lit + @ she !
+	50 lit 0 lit do
+		i 14 lit u< if shb @ shc @ and shb @ invert shd @ and or 5A827999 lit else
+		i 28 lit u< if shb @ shc @ xor shd @ xor 6ED9EBA1 lit else
+		i 3C lit u< if shb @ shc @ and shb @ shd @ and or shc @ shd @ and or 8F1BBCDC lit else
+		shb @ shc @ xor shd @ xor CA62C1D6 lit then then then
+		+ sha @ 5 lit rol + she @ + shw @ i 2 lit lshift + @ +
+		shd @ she !  shc @ shd !  shb @ 1E lit rol shc !  sha @ shb !  sha !
+	loop
+	shh @ dup @ sha @ + swap !  shh @ 4 lit + dup @ shb @ + swap !  shh @ 8 lit + dup @ shc @ + swap !
+	shh @ C lit + dup @ shd @ + swap !  shh @ 10 lit + dup @ she @ + swap ! ;
+
+\ sha1 ( msg len out -- )  the 20-byte digest of up to 0x1F7 bytes
+: sha1
+	sho ! shl !
+	shm @ 80 lit nzero
+	shm @ shl @ mcopy
+	80 lit shm @ shl @ + c!
+	shl @ 3 lit lshift shm @ shl @ 48 lit + 3F lit invert and + 4 lit - be32!
+	67452301 lit shh @ !  EFCDAB89 lit shh @ 4 lit + !  98BADCFE lit shh @ 8 lit + !
+	10325476 lit shh @ C lit + !  C3D2E1F0 lit shh @ 10 lit + !
+	shl @ 48 lit + 6 lit rshift 0 lit do shm @ i 6 lit lshift + shblk loop
+	5 lit 0 lit do shh @ i 2 lit lshift + @ sho @ i 2 lit lshift + be32! loop ;
+
+\ ── base64 ────────────────────────────────────────────────────────────────────
+: bs variable ;  : bn variable ;  : bd variable ;
+: b64t ( -- s )  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/" ;
+: b64c ( v -- ch )  3F lit and b64t + c@ ;
+
+\ b64 ( src n dst -- )  n bytes as 4*ceil(n/3) characters, no terminator
+: b64
+	bd ! bn ! bs !
+	begin bn @ while
+		bs @ c@ 10 lit lshift
+		bn @ 1 lit u> if bs @ 1 lit + c@ 8 lit lshift or then
+		bn @ 2 lit u> if bs @ 2 lit + c@ or then
+		dup 12 lit rshift b64c bd @ c!
+		dup C lit rshift b64c bd @ 1 lit + c!
+		bn @ 1 lit u> if dup 6 lit rshift b64c else 3D lit then bd @ 2 lit + c!
+		bn @ 2 lit u> if b64c else drop 3D lit then bd @ 3 lit + c!
+		bs @ 3 lit + bs !  bd @ 4 lit + bd !  bn @ dup 3 lit umn - bn !
+	repeat ;
+
+\ ── text ──────────────────────────────────────────────────────────────────────
+\ hdec ( n a -- a' )  n in decimal at a; a' is past the digits
+: hdec
+	hdt @ A lit + rot
+	begin swap 1 lit - swap  dup A lit % '0' lit + 2 lit pick c!  A lit / dup 0= until drop
+	hdt @ A lit + over - hdn !  over hdn @ mcopy  hdn @ + ;
+
+\ hcat ( s dst -- dst' )  a NUL-terminated string at dst; dst' is past it
+: hcat  begin over c@ ?dup while over c! 1 lit + swap 1 lit + swap repeat nip ;
+: h+ ( s -- )  hp @ hcat hp ! ;
+
+\ hpage ( -- )  the page, into hbody
+: hpage
+	hbody @ hp !
+	"<!doctype html><html><head><meta charset='utf-8'><title>q</title>" h+
+	"<style>body{font-family:monospace;margin:2em;max-width:60em}#log{white-space:pre-wrap;border:1px solid #888;padding:1em;height:20em;overflow:auto}</style></head><body>" h+
+	"<h1>hello from q</h1><p>Served by the fam node on QEMU riscv32 over its own TCP. The box is a WebSocket: the node sends a tick every second and echoes what you send.</p>" h+
+	"<p><input id='in' size='40' placeholder='type and press enter'> <button id='go'>send</button> <span id='st'>connecting...</span></p><div id='log'></div>" h+
+	"<script>var log=document.getElementById('log'),st=document.getElementById('st'),inp=document.getElementById('in');" h+
+	"function add(s){log.textContent+=s+'\\n';log.scrollTop=log.scrollHeight}" h+
+	"var ws=new WebSocket('ws://'+location.host+'/ws');ws.onopen=function(){st.textContent='connected'};ws.onclose=function(){st.textContent='closed'};" h+
+	"ws.onmessage=function(e){add(e.data)};function send(){if(inp.value){ws.send(inp.value);inp.value=''}}" h+
+	"document.getElementById('go').onclick=send;inp.onkeydown=function(e){if(e.key==='Enter')send()};" h+
+	"window.addEventListener('pagehide',function(){ws.close()});window.addEventListener('beforeunload',function(){ws.close()});</script></body></html>\n" h+
+	hp @ hbody @ - hbn ! ;
+
+\ hbuild ( -- )  the 200 (with the page) and the 404, ready to send
+: hbuild
+	hresp @ hp !
+	"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: keep-alive\r\nContent-Length: " h+
+	hbn @ hp @ hdec hp !  "\r\n\r\n" h+
+	hbody @ hp @ hbn @ mcopy  hp @ hbn @ + hresp @ - hrlen !
+	h404 @ hp !
+	"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nConnection: keep-alive\r\nContent-Length: 10\r\n\r\nnot found\n" h+
+	hp @ h404 @ - h4len ! ;
+
+: httpinit ( port n -- )
+	dup hsn !  5 lit lshift dup alloc dup hsl ! swap 2 lit rshift nzero
+	hsn @ 0 lit do 800 lit alloc i hslot 14 lit + !  100 lit alloc i hslot 18 lit + ! loop
+	1000 lit alloc hbody !  1200 lit alloc hresp !  100 lit alloc h404 !  800 lit alloc htb !
+	10 lit alloc hdt !  80 lit alloc hkb !  14 lit alloc hdg !
+	14 lit alloc shh !  140 lit alloc shw !  200 lit alloc shm !
+	hpage hbuild
+	tcplsn hlsn !
+	0 lit hnreq !  0 lit hnws !  0 lit hnmsg !  0 lit hncls !  tnow htick !  0 lit hsec ! ;
+
+\ ── the slot being served ─────────────────────────────────────────────────────
+: hsel ( s -- )  dup hs !  dup @ hc !  dup 14 lit + @ hrb !  dup 18 lit + @ hob !  8 lit + @ hf ! ;
+
+\ hout ( ptr len -- )  to the slot's connection; what does not fit now goes in later turns
+: hout  2dup hc @ -rot tcpsend  tuck - hs @ 10 lit + !  + hs @ C lit + ! ;
+: hflush ( -- )  hs @ 10 lit + @ ?dup if hs @ C lit + @ swap hout then ;
+
+: hclose ( -- )  hc @ tcpclose  0 lit hs @ !  0 lit hs @ 4 lit + !  0 lit hs @ 10 lit + !  0 lit hf ! ;
+
+\ hshift ( n -- )  drop the first n bytes of the request buffer
+: hshift
+	hf @ over u< if drop 0 lit hf ! else
+		hf @ over - dup hf ! ?dup if 0 lit do hrb @ over + i + c@ hrb @ i + c! loop then drop
+	then ;
+
+\ hcrlf ( -- i|-1 )  where the blank line that ends a request starts
+: hcrlf
+	-1 lit hf @ 3 lit u> if hf @ 3 lit - 0 lit do
+		dup 0< if hrb @ i + dup be16@ 0D0A lit = swap 2 lit + be16@ 0D0A lit = and if drop i then then
+	loop then ;
+
+: hlc ( ch -- ch )  dup 'A' lit - 1A lit u< if 20 lit or then ;
+: hfn variable ;  : hfl variable ;
+\ hfind ( needle n -- i|-1 )  the needle (in lowercase) in the request, ignoring case
+: hfind
+	hfl ! hfn !  -1 lit
+	hreq @ hfl @ u< 0= if hreq @ hfl @ - 1 lit + 0 lit do
+		dup 0< if
+			-1 lit hfl @ 0 lit do hrb @ j + i + c@ hlc hfn @ i + c@ <> if drop 0 lit then loop
+			if drop i then
+		then
+	loop then ;
+
+\ hupgr ( i -- )  the upgrade; i is where "sec-websocket-key:" is
+: hupgr
+	hrb @ + 12 lit +
+	begin dup c@ 20 lit = while 1 lit + repeat
+	hkb @ hp !
+	begin dup c@ dup 0D lit <> swap 20 lit <> and hp @ hkb @ 20 lit + u< and while
+		dup c@ hp @ c!  1 lit +  hp @ 1 lit + hp !
+	repeat drop
+	"258EAFA5-E914-47DA-95CA-C5AB0DC85B11" h+
+	hkb @ hp @ hkb @ - hdg @ sha1
+	hob @ hp !
+	"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " h+
+	hdg @ 14 lit hp @ b64  hp @ 1C lit + hp !  "\r\n\r\n" h+
+	hob @ hp @ hob @ - hout
+	1 lit hs @ 4 lit + !  hnws @ 1 lit + hnws ! ;
+
+\ hget ( -- )  answer the request of hreq bytes at the front of the buffer
+: hget
+	hnreq @ 1 lit + hnreq !
+	hlog @ if
+		hls "request " puts hrb @ begin dup c@ dup 0D lit <> swap 0= 0= and over hrb @ - 40 lit u< and while dup c@ putc 1 lit + repeat drop
+		" (" puts hreq @ u. " bytes)" puts
+	then
+	hrb @ be32@ 47455420 lit = if
+		"sec-websocket-key:" 12 lit hfind dup 0< if drop
+			hrb @ 4 lit + be16@ 2F20 lit = if hresp @ hrlen @ hout  hlog @ if " -> 200, " puts hrlen @ u. " bytes" puts tln then
+			else h404 @ h4len @ hout  hlog @ if " -> 404" puts tln then then
+		else hupgr  hlog @ if " -> 101, socket" puts tln then then
+	else h404 @ h4len @ hout  hlog @ if " -> 404" puts tln then then ;
+
+\ hreqin ( -- )  every complete request in the buffer, while the previous answer is out
+: hreqin
+	begin
+		hcrlf dup 0< if drop -1 lit else
+			4 lit + hreq !
+			hs @ 10 lit + @ if -1 lit else
+				hget  hreq @ hshift
+				hs @ 4 lit + @                                                 \ upgraded: the rest are frames
+			then
+		then
+	until ;
+
+\ ── WebSocket ─────────────────────────────────────────────────────────────────
+: hwl variable ;  : hwh variable ;
+
+\ wsend ( data len op -- )  a frame to the slot's socket, built in htb (the payload
+\ at htb+4 unless it is there already); dropped when it would not fit now
+: wsd variable ;  : wsn variable ;
+: wsend
+	-rot wsn ! wsd !
+	hs @ 10 lit + @ 0=  hc @ tcproom wsn @ 4 lit + u< 0= and if
+		wsd @ htb @ 4 lit + <> if wsd @ htb @ 4 lit + wsn @ mcopy then
+		80 lit or
+		wsn @ 7E lit u< if htb @ 2 lit + c!  wsn @ htb @ 3 lit + c!  hc @ htb @ 2 lit + wsn @ 2 lit + tcpsend drop
+		else htb @ c!  7E lit htb @ 1 lit + c!  wsn @ htb @ 2 lit + be16!  hc @ htb @ wsn @ 4 lit + tcpsend drop then
+	else drop then ;
+
+\ hframe ( -- )  the complete frame at the front of the buffer: hwh header bytes, hwl of payload
+: hframe
+	hrb @ 1 lit + c@ 80 lit and if
+		hwl @ ?dup if 0 lit do hrb @ hwh @ + i + dup c@ hrb @ hwh @ 4 lit - + i 3 lit and + c@ xor swap c! loop then
+	then
+	hrb @ c@ F lit and
+	hlog @ if hls "frame op " puts dup u. ", " puts hwl @ u. " bytes" puts dup 8 lit = if " -> close back, closed" puts else dup 9 lit = if " -> pong" puts else " -> echoed" puts then then tln then
+	dup 1 lit = over 2 lit = or if
+		hnmsg @ 1 lit + hnmsg !
+		htb @ 4 lit + hp !  "you said: " h+  hrb @ hwh @ + hp @ hwl @ mcopy
+		htb @ 4 lit + hwl @ A lit + rot wsend
+	else dup 8 lit = if
+		hncls @ 1 lit + hncls !  htb @ 0 lit 8 lit wsend  hclose  drop
+	else dup 9 lit = if hrb @ hwh @ + hwl @ A lit wsend drop
+	else drop then then then
+	hwh @ hwl @ + hshift ;
+
+\ hwsin ( -- )  every complete frame in the buffer
+: hwsin
+	begin
+		hf @ 2 lit u< if -1 lit else
+			hrb @ 1 lit + c@ 7F lit and hwl !  2 lit hwh !
+			hwl @ 7E lit = if hrb @ 2 lit + be16@ hwl !  4 lit hwh ! then
+			hrb @ 1 lit + c@ 80 lit and if hwh @ 4 lit + hwh ! then
+			hrb @ 1 lit + c@ 7F lit and 7F lit =  hwl @ 7F0 lit u> or if
+				hlog @ if hls "frame too long (" puts hwl @ u. "): closed" puts tln then hclose -1 lit else
+			hwh @ hwl @ + hf @ u> if -1 lit else hframe 0 lit then then
+		then
+	until ;
+
+\ ── the turn ──────────────────────────────────────────────────────────────────
+\ hserve ( s -- )  one slot's turn
+: hserve
+	hsel
+	hflush
+	hc @ hrb @ hf @ + 800 lit hf @ - tcprecv
+	dup 0< if drop hs @ 10 lit + @ 0= if
+			hlog @ if hls "peer gone (tcp state " puts hc @ @ u. "): closed" puts tln then hclose then
+		else                                                            \ gone: close once the answer is out
+		hf @ + hf !
+		hs @ 4 lit + @ 0= if hreqin then
+		hs @ 4 lit + @ 1 lit = if hwsin then
+		hs @ @ if hf @ 800 lit = hs @ 4 lit + @ 0= and if
+			hlog @ if hls "request over 2 KiB without its end: closed" puts tln then hclose then then
+	then
+	hf @ hs @ 8 lit + ! ;
+
+\ hbcast ( -- )  the tick to every socket
+: hbcast
+	htb @ 4 lit + hp !  "tick " h+  hsec @ hp @ hdec hp !  " s up, " h+
+	0 lit hsn @ 0 lit do i hslot 4 lit + @ 1 lit = if 1 lit + then loop
+	hlog @ if tlp "http: tick " puts hsec @ u. ", " puts dup u. " socket(s)" puts tln then
+	hp @ hdec hp !  " socket(s)" h+
+	hsn @ 0 lit do i hslot 4 lit + @ 1 lit = if i hslot hsel htb @ 4 lit + hp @ htb @ - 4 lit - 1 lit wsend then loop ;
+
+: httpturn ( -- )
+	begin hlsn @ tcpacc ?dup while
+		0 lit hsn @ 0 lit do dup 0= if drop i hslot dup @ if drop 0 lit then then loop
+		?dup if tuck !  0 lit over 4 lit + !  0 lit over 8 lit + !  0 lit over 10 lit + !
+			hlog @ if hs ! hls "connection from port " puts hs @ @ C lit + @ u. " (tcp c" puts hs @ @ tcidx u. ")" puts tln else drop then
+		else hlog @ if tlp "http: connection from port " puts dup C lit + @ u. " but no free slot: closed" puts tln then tcpclose then
+	repeat
+	hsn @ 0 lit do i hslot @ if i hslot hserve then loop
+	tnow htick @ - 989680 lit u< 0= if htick @ 989680 lit + htick !  hsec @ 1 lit + hsec !  hbcast then ;
+
+\ ──────────────────────────────────────────────────────────────────────────────
+\ Tests: the hashes against their standard vectors, then a client on the
+\ scratch NIC (src/tcp.fam's test words: tsetup, tin, tlast ...), then the
+\ host's prober (scripts/net_host.py) through the forwarded port 47656.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+Test {
+	\ SHA-1 of "abc", RFC 6455's example key, base64 padding, decimals
+	sha1 {
+		: hts variable ;  : htl variable ;
+		\ hin ( flags seq ack str len -- )  a segment from the peer carrying str
+		: hin
+			htl ! hts !  htl @ tbuild
+			hts @ tpk @ 28 lit + htl @ mcopy
+			0 lit tpk @ 24 lit + be16!
+			tps @ C lit 0 lit cksum tpk @ 14 lit + htl @ 14 lit + rot cksum ckfin tpk @ 24 lit + be16!
+			tpk @ swap tcpin ;
+		: hcmp ( a s n -- flag )  -1 lit swap 0 lit do 2 lit pick i + c@ 2 lit pick i + c@ <> if drop 0 lit then loop nip nip ;
+		tsetup  1F90 lit 4 lit httpinit
+		"abc" 3 lit hdg @ sha1
+		hdg @ be32@ A9993E36 lit asrt_eq  hdg @ 10 lit + be32@ 9CD0D89D lit asrt_eq
+		"dGhlIHNhbXBsZSBub25jZQ==258EAFA5-E914-47DA-95CA-C5AB0DC85B11" 3C lit hdg @ sha1
+		hdg @ 14 lit htb @ b64  htb @ "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=" 1C lit hcmp assert
+		"Man" 3 lit htb @ b64  htb @ "TWFu" 4 lit hcmp assert
+		"M" 1 lit htb @ b64  htb @ "TQ==" 4 lit hcmp assert
+		0 lit htb @ hdec htb @ - 1 lit asrt_eq  htb @ c@ '0' lit asrt_eq
+		4D2 lit htb @ hdec htb @ - 4 lit asrt_eq  htb @ "1234" 4 lit hcmp assert
+	}
+	\ a client on the scratch NIC: the page, a 404, the upgrade, a message, a ping, a close;
+	\ then one that never finishes its request
+	httpserve {
+		tsetup  1F90 lit 4 lit httpinit
+		2 lit 3E8 lit 0 lit 0 lit tin  tlast 4 lit + be32@ tiss !  10 lit 3E9 lit tiss @ 1 lit + 0 lit tin
+		httpturn  0 lit hslot @ dup tcc ! 0 lit <> assert  tcc @ @ 4 lit asrt_eq
+		18 lit 3E9 lit tcc @ 14 lit + @ "GET / HTTP/1.1\r\nHost: q\r\n\r\n" 1B lit hin
+		tntx 1 lit asrt_eq
+		httpturn
+		hnreq @ 1 lit asrt_eq  tntx 2 lit asrt_eq  hrlen @ 5B4 lit u< assert                \ one segment
+		tlast dup D lit + c@ 18 lit asrt_eq  dup 14 lit + "HTTP/1.1 200 OK\r\n" 11 lit hcmp assert
+		14 lit + hrlen @ + 8 lit - "</html>\n" 8 lit hcmp assert
+		0 lit hslot 8 lit + @ 0 lit asrt_eq                                             \ consumed
+		10 lit 404 lit tcc @ 14 lit + @ 0 lit tin                                      \ all acked
+		\ four requests in one segment: three answers fit the ring, the fourth waits for the ACK
+		4 lit 0 lit do "GET / HTTP/1.1\r\nHost: q\r\n\r\n" tbf @ i 1B lit * + 1B lit mcopy loop
+		18 lit 404 lit tcc @ 14 lit + @ tbf @ 6C lit hin
+		httpturn  hnreq @ 5 lit asrt_eq  tntx 6 lit asrt_eq
+		0 lit hslot 10 lit + @ hrlen @ 4 lit * 1000 lit - asrt_eq
+		10 lit 470 lit tcc @ 14 lit + @ 0 lit tin
+		httpturn  tntx 7 lit asrt_eq  0 lit hslot 10 lit + @ 0 lit asrt_eq
+		tlast 14 lit + hrlen @ 4 lit * 1000 lit - + 8 lit - "</html>\n" 8 lit hcmp assert
+		10 lit 470 lit tcc @ 14 lit + @ 0 lit tin
+		18 lit 470 lit tcc @ 14 lit + @ "GET /nope HTTP/1.1\r\n\r\n" 16 lit hin
+		httpturn  tntx 8 lit asrt_eq  tlast 14 lit + "HTTP/1.1 404" C lit hcmp assert
+		10 lit 486 lit tcc @ 14 lit + @ 0 lit tin
+		18 lit 486 lit tcc @ 14 lit + @ "GET /ws HTTP/1.1\r\nHost: q\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n" 8E lit hin
+		httpturn  tntx 9 lit asrt_eq
+		tlast 14 lit + dup "HTTP/1.1 101 Switching Protocols\r\n" 22 lit hcmp assert
+		61 lit + "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n" 20 lit hcmp assert
+		0 lit hslot 4 lit + @ 1 lit asrt_eq  hnws @ 1 lit asrt_eq
+		10 lit 514 lit tcc @ 14 lit + @ 0 lit tin
+		\ a masked "Hello" (RFC 6455's example): answered in a text frame
+		81 lit tbf @ c!  85 lit tbf @ 1 lit + c!  37 lit tbf @ 2 lit + c!  FA lit tbf @ 3 lit + c!  21 lit tbf @ 4 lit + c!  3D lit tbf @ 5 lit + c!
+		7F lit tbf @ 6 lit + c!  9F lit tbf @ 7 lit + c!  4D lit tbf @ 8 lit + c!  51 lit tbf @ 9 lit + c!  58 lit tbf @ A lit + c!
+		18 lit 514 lit tcc @ 14 lit + @ tbf @ B lit hin
+		httpturn  tntx A lit asrt_eq  hnmsg @ 1 lit asrt_eq
+		tlast 14 lit + dup c@ 81 lit asrt_eq  dup 1 lit + c@ F lit asrt_eq  2 lit + "you said: Hello" F lit hcmp assert
+		10 lit 51F lit tcc @ 14 lit + @ 0 lit tin
+		\ a ping: a pong
+		89 lit tbf @ c!  80 lit tbf @ 1 lit + c!
+		18 lit 51F lit tcc @ 14 lit + @ tbf @ 6 lit hin
+		httpturn  tntx B lit asrt_eq  tlast 14 lit + be16@ 8A00 lit asrt_eq
+		10 lit 525 lit tcc @ 14 lit + @ 0 lit tin
+		\ a close: a close back, then our FIN; the slot is free
+		88 lit tbf @ c!
+		18 lit 525 lit tcc @ 14 lit + @ tbf @ 6 lit hin
+		httpturn  tntx D lit asrt_eq  hncls @ 1 lit asrt_eq
+		B lit tfr 14 lit + be16@ 8800 lit asrt_eq  tlast D lit + c@ 11 lit asrt_eq
+		tcc @ @ 5 lit asrt_eq  0 lit hslot @ 0 lit asrt_eq
+		\ a second client that never finishes its request: dropped when the buffer is full
+		15B4 lit tsrcpt !
+		2 lit 3E8 lit 0 lit 0 lit tin  tlast 4 lit + be32@ tiss !  10 lit 3E9 lit tiss @ 1 lit + 0 lit tin
+		httpturn  0 lit hslot @ dup tcc ! 0 lit <> assert
+		tbf @ 800 lit 0 lit do 'x' lit over i + c! loop drop
+		18 lit 3E9 lit tcc @ 14 lit + @ tbf @ 800 lit hin
+		httpturn  tcc @ @ 5 lit asrt_eq  0 lit hslot @ 0 lit asrt_eq
+	}
+	httplive {
+		netinit if
+			0A00020F lit FFFFFF00 lit 0A000202 lit ethinit assert
+			8 lit tcpinit  BA28 lit 4 lit httpinit
+			mtime@ drop
+			begin
+				narm netpoll httpturn tcptick
+				hncls @ if -1 lit else
+					mtime@ drop over - 1C9C380 lit u< if nbit 186A0 lit wait drop 0 lit else -1 lit then
+				then
+			until drop
+			hnreq @ 0= if " (no http prober on the host: skipped) " puts else
+				hnws @ 1 lit asrt_eq  hnmsg @ 1 lit asrt_eq  hncls @ 1 lit asrt_eq
+			then
+			hlsn @ tcpclose
+		then
+	}
+}
+
+Bench {
+	\ SHA-1 of 64 bytes (two blocks with the padding)
+	sha1 {
+		: bhd variable ;  14 lit alloc bhd !
+		14 lit alloc shh !  140 lit alloc shw !  200 lit alloc shm !
+		bgo
+		3E8 lit 0 lit do "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" 40 lit bhd @ sha1 loop
+		3E8 lit bops
+	}
+	\ The server's own cost on the scratch NIC (no network): a peer at 10.0.2.9
+	\ sends segments straight into tcpin, our frames go to the fake ring.
+	\ GET /, keep-alive: the request in, the page out, their ACK in
+	httpreq {
+		: bfake ( -- )
+			30 lit alloc net !
+			110 lit alloc dup 44 lit nzero net @ !
+			5000 lit alloc FFF lit + FFFFF000 lit and dup 1000 lit nzero
+			dup net @ 4 lit + !  2000 lit + net @ 8 lit + !
+			8000 lit alloc net @ C lit + !  8000 lit alloc net @ 10 lit + !
+			0 lit net @ 1C lit + !  0 lit net @ 20 lit + !
+			ntxinit
+			2 lit net @ @ 100 lit + c!  1 lit net @ @ 105 lit + c! ;
+		: bpk variable ;  800 lit alloc bpk !
+		: bsq variable ;  : bhc variable ;  : bsp variable ;  : bz variable ;
+		\ bseg ( flags str len -- )  a segment from 10.0.2.9:bsp to our 8080 at bsq, acking everything
+		: bseg
+			bpk @ 10 lit nzero
+			45 lit bpk @ c!  dup 28 lit + bpk @ 2 lit + be16!  40 lit bpk @ 8 lit + c!  6 lit bpk @ 9 lit + c!
+			0A000209 lit bpk @ C lit + be32!  0A00020F lit bpk @ 10 lit + be32!
+			bpk @ 14 lit 0 lit cksum ckfin bpk @ A lit + be16!
+			bsp @ bpk @ 14 lit + be16!  1F90 lit bpk @ 16 lit + be16!
+			bsq @ bpk @ 18 lit + be32!  bhc @ 14 lit + @ bpk @ 1C lit + be32!
+			50 lit bpk @ 20 lit + c!  2 lit pick bpk @ 21 lit + c!  2000 lit bpk @ 22 lit + be16!
+			0 lit bpk @ 24 lit + be16!
+			over bpk @ 28 lit + 2 lit pick mcopy
+			0A000209 lit tps @ be32!  0A00020F lit tps @ 4 lit + be32!  6 lit tps @ 8 lit + be16!  dup 14 lit + tps @ A lit + be16!
+			tps @ C lit 0 lit cksum bpk @ 14 lit + 2 lit pick 14 lit + rot cksum ckfin bpk @ 24 lit + be16!
+			bsq @ over + bsq !
+			28 lit + bpk @ swap tcpin drop drop ;
+		: bdone ( -- )  net @ 20 lit + @ net @ 8 lit + @ 1002 lit + h! ;         \ the scratch NIC completes everything
+		: back ( -- )  10 lit 0 lit 0 lit bseg ;                                   \ the peer acks everything
+		\ bopen ( -- )  a connection from the next port: SYN, ACK, accepted
+		: bopen
+			bsp @ 1 lit + FFFF lit and dup 400 lit u< if drop 400 lit then bsp !
+			bz @ bhc !  3E8 lit bsq !  2 lit 0 lit 0 lit bseg
+			1F90 lit 0A000209 lit bsp @ tcpfind bhc !  3E9 lit bsq !
+			back httpturn ;
+		\ bshut ( -- )  the peer's FIN; we close; their ACK frees the record
+		: bshut  11 lit 0 lit 0 lit bseg  bsq @ 1 lit + bsq !  httpturn  back  bdone ;
+		\ bpurge ( -- )  our own closes leave TIME_WAIT records for 1 s: expire them now
+		: bpurge  tcn @ 0 lit do i tcrec dup @ A lit = if tcfree else drop then loop ;
+		: bget ( -- )  18 lit "GET / HTTP/1.1\r\nHost: q\r\n\r\n" 1B lit bseg ;
+		: bupg ( -- )  18 lit "GET /ws HTTP/1.1\r\nHost: q\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n" 8E lit bseg ;
+		: bfr variable ;  10 lit alloc bfr !
+		: bsetup ( -- )
+			bfake
+			0A00020F lit FFFFFF00 lit 0A000202 lit ipgw ! ipmask ! ipaddr !
+			800 lit alloc txf !  80 lit alloc dup arpt ! 20 lit 0 lit do 0 lit over i 2 lit lshift + ! loop drop  0 lit arpn !
+			8 lit alloc dup bcast ! 6 lit 0 lit do FF lit over i + c! loop drop
+			0A000209 lit "QRSTUV" arpadd  0A000202 lit "GWGWGW" arpadd
+			10 lit tcpinit  1F90 lit 10 lit httpinit
+			50 lit alloc dup 14 lit nzero bz !  15B2 lit bsp !
+			\ a masked text frame "hi" (mask 37 FA 21 3D), and a masked close
+			81 lit bfr @ c!  82 lit bfr @ 1 lit + c!  37 lit bfr @ 2 lit + c!  FA lit bfr @ 3 lit + c!  21 lit bfr @ 4 lit + c!  3D lit bfr @ 5 lit + c!
+			'h' lit 37 lit xor bfr @ 6 lit + c!  'i' lit FA lit xor bfr @ 7 lit + c!
+			88 lit bfr @ 8 lit + c!  80 lit bfr @ 9 lit + c!  37 lit bfr @ A lit + c!  FA lit bfr @ B lit + c!  21 lit bfr @ C lit + c!  3D lit bfr @ D lit + c! ;
+		bsetup  bopen
+		bgo
+		3E8 lit 0 lit do bget httpturn bdone back loop
+		3E8 lit bops
+	}
+	\ a connection per request: SYN, ACK, GET, the page, FIN both ways
+	httpconn {
+		bsetup
+		bgo
+		3E8 lit 0 lit do bopen bget httpturn back bshut loop
+		3E8 lit bops
+	}
+	\ a socket per request: SYN, ACK, upgrade (SHA-1, 101), close frame both ways, FIN both ways
+	wsconn {
+		bsetup
+		bgo
+		3E8 lit 0 lit do
+			bopen bupg httpturn back
+			18 lit bfr @ 8 lit + 6 lit bseg httpturn                         \ their close: ours back, our FIN
+			back  11 lit 0 lit 0 lit bseg bsq @ 1 lit + bsq !                \ their FIN: TIME_WAIT
+			bdone bpurge
+		loop
+		3E8 lit bops
+	}
+	\ a socket echo: a masked 2-byte text frame in, "you said: hi" out, their ACK in
+	wsecho {
+		bsetup  bopen bupg httpturn back
+		bgo
+		3E8 lit 0 lit do 18 lit bfr @ 8 lit bseg httpturn bdone back loop
+		3E8 lit bops
+	}
+	\ the tick to 8 sockets (8 frames built and queued; 100 ticks fit the rings unacked)
+	wsbcast {
+		bsetup  8 lit 0 lit do bopen bupg httpturn back loop
+		bgo
+		64 lit 0 lit do hbcast bdone loop
+		64 lit bops
+	}
+}

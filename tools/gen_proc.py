@@ -362,16 +362,15 @@ WFI = asm("""
 """)
 
 # ,addr emitter: pop a compile-time output cursor from the cstack and emit a
-# runtime push of its FINAL address.  The compiler assembles the program in its
-# own heap, with s0 = output start; the image is loaded at 0x80000000, so the
-# final address is 0x80000000 + (cursor - s0).  (stdlib's `lit` pushes the raw
-# value, which is why `here lit` cannot be used for runtime addresses.)
+# runtime push of its address, PC-relative: `auipc t1, %hi(off); addi t1, t1,
+# %lo(off)` with off = cursor - (where the auipc lands), so the image may load
+# anywhere (tabernacle puts the node after itself, not at 0x80000000).  The
+# compiler assembles in its own heap, so cursors are heap addresses: only their
+# difference is meaningful (stdlib's `lit` would push the raw cursor).
 ADDR_EMIT = asm("""
     lw      t0, 0(tp)
     addi    tp, tp, 4
-    sub     t0, t0, s0
-    lui     t1, 0x80000
-    add     t0, t0, t1              # final address
+    sub     t0, t0, gp              # offset from the auipc about to be emitted
     li      t6, 0x800
     add     t1, t0, t6
     srli    t1, t1, 12              # %hi (rounded so a set bit 11 in %lo is right)
@@ -380,7 +379,7 @@ ADDR_EMIT = asm("""
     li      t3, 0xFFF
     and     t2, t2, t3
     slli    t4, t1, 12
-    ori     t4, t4, 0x337           # lui t1, %hi
+    ori     t4, t4, 0x317           # auipc t1, %hi
     sw      t4, 0(gp)
     addi    gp, gp, 4
     slli    t4, t2, 20
@@ -468,10 +467,10 @@ out = f"""\
 
 \\ ── compile-time helpers ──────────────────────────────────────────────────────
 
-\\ ,addr  ( C: cursor -- )  emit a runtime push of the FINAL address of an output
-\\ cursor taken with `here`.  The compiler assembles in its own heap (s0 = output
-\\ start) and the image loads at 0x80000000, so this pushes 0x80000000 + (cursor -
-\\ s0).  (`lit` would push the raw cursor.)
+\\ ,addr  ( C: cursor -- )  emit a runtime push of the address of an output cursor
+\\ taken with `here`, as auipc + addi from where it is emitted: position
+\\ independent, since the image is not always loaded at 0x80000000 (tabernacle
+\\ puts the node after itself).  (`lit` would push the raw compiler-heap cursor.)
 :M ,addr
 {ADDR_EMIT}
 ;

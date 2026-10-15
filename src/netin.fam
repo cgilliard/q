@@ -1,26 +1,28 @@
 \ ──────────────────────────────────────────────────────────────────────────────
-\ src/netin.fam — the receive dispatcher: frames from the NIC to ARP, ICMP and
-\ UDP.  A layer's input word returns what it did not consume, so this sits
+\ src/netin.fam — the receive dispatcher: frames from the NIC to ARP, ICMP,
+\ UDP and TCP.  A layer's input word returns what it did not consume, so this sits
 \ above them all and is the one place that knows the chain.
 \
 \   netin   ( buf len -- )   one frame
 \   netpoll ( -- )           drain the NIC through netin (after narm)
-\ Needs src/udp.fam (and what it needs).
+\ Needs src/tcp.fam (and what it needs).
 \ ──────────────────────────────────────────────────────────────────────────────
 
 : netin ( buf len -- )
 	over ethtype dup 806 lit = if drop arpin else
 		800 lit = if
-			E lit - swap E lit + swap ipin ?dup if 11 lit = if udpin else 2drop then then
+			E lit - swap E lit + swap ipin ?dup if dup 6 lit = if drop tcpin else 11 lit = if udpin else 2drop then then then
 		else 2drop then
 	then ;
 
 : netpoll ( -- )  begin netrx while netin netrel repeat ;
 
 \ ──────────────────────────────────────────────────────────────────────────────
-\ Test and benches against the host: scripts/udp_echo.py echoes on
-\ 127.0.0.1:47654, which the guest reaches as 10.0.2.2:47654.  Without --net
-\ they skip; without the echo server they report it and skip.
+\ Tests and benches against the host (scripts/net_host.py): a UDP echo on
+\ 127.0.0.1:47654 and a TCP echo on 47655, which the guest reaches as 10.0.2.2,
+\ and a knocker that connects to the guest's TCP port 47653 (forwarded by
+\ --hostfwd) every 0.3 s.  Without --net they skip; without the host script
+\ they report it and skip.
 \ ──────────────────────────────────────────────────────────────────────────────
 
 Test {
@@ -50,12 +52,82 @@ Test {
 			then
 		then
 	}
+	\ a TCP client: connect to the host's echo, a short message and 3000 bytes
+	\ (several segments each way), then a clean close
+	tcpecho {
+		: nbuf variable ;  2000 lit alloc nbuf !
+		: ncc variable ;  : nlsn variable ;
+		: ngot variable ;  : ngc variable ;  : ngb variable ;  : ngn variable ;  : ngt variable ;
+		: tturn ( -- )  narm netpoll tcptick ;
+		\ twaitst ( c st -- flag )  turns until the connection reaches state st, 2 s at most
+		: twaitst
+			mtime@ drop
+			begin
+				tturn
+				2 lit pick @ 2 lit pick = if -1 lit -1 lit else
+					mtime@ drop over - 1312D00 lit u< if nbit 186A0 lit wait drop 0 lit else 0 lit -1 lit then
+				then
+			until nip nip nip ;
+		\ tgath ( c buf n -- ok )  turns until n bytes have been received into buf, 2 s at most.
+		\ The tick runs after the application's turn (here: the receive), as in the loop.
+		: tgath
+			ngn ! ngb ! ngc !  0 lit ngot !  mtime@ drop ngt !
+			begin
+				narm netpoll
+				ngc @ ngb @ ngot @ + ngn @ ngot @ - tcprecv
+				dup 0< if drop 0 lit -1 lit else
+					ngot @ + ngot !
+					ngot @ ngn @ = if -1 lit -1 lit else                    \ done: no tick, so the ACK rides on the reply
+						tcptick
+						mtime@ drop ngt @ - 1312D00 lit u< if nbit 186A0 lit wait drop 0 lit else 0 lit -1 lit then
+					then
+				then
+			until ;
+		netinit if
+			0A00020F lit FFFFFF00 lit 0A000202 lit ethinit assert
+			8 lit tcpinit
+			0A000202 lit BA27 lit tcpconn dup ncc ! 0 lit <> assert
+			ncc @ 4 lit twaitst if
+				ncc @ "hello tcp" 9 lit tcpsend 9 lit asrt_eq
+				ncc @ nbuf @ 9 lit tgath assert  nbuf @ c@ 'h' lit asrt_eq  nbuf @ 8 lit + c@ 'p' lit asrt_eq
+				nbuf @ 1000 lit 0 lit do i 7 lit * FF lit and over i + c! loop drop
+				ncc @ nbuf @ BB8 lit tcpsend BB8 lit asrt_eq
+				ncc @ nbuf @ 1000 lit + BB8 lit tgath assert
+				-1 lit BB8 lit 0 lit do nbuf @ i + c@ nbuf @ 1000 lit + i + c@ <> if drop 0 lit then loop assert
+				ncc @ tcpclose
+				ncc @ 0 lit twaitst assert                                   \ FIN both ways, TIME_WAIT, freed
+			else " (no echo server on the host: skipped) " puts  ncc @ tcpclose then
+		then
+	}
+	\ a TCP server: the host's knocker connects to our 47653, sends "knock" and gets it back
+	tcpserve {
+		netinit if
+			0A00020F lit FFFFFF00 lit 0A000202 lit ethinit assert
+			8 lit tcpinit
+			BA25 lit tcplsn dup nlsn ! 0 lit <> assert
+			mtime@ drop
+			begin
+				tturn
+				nlsn @ tcpacc ?dup if nip -1 lit else
+					mtime@ drop over - 1C9C380 lit u< if nbit 186A0 lit wait drop 0 lit else drop 0 lit -1 lit then
+				then
+			until
+			?dup if
+				dup ncc !  nbuf @ 5 lit tgath assert  nbuf @ c@ 'k' lit asrt_eq  nbuf @ 4 lit + c@ 'k' lit asrt_eq
+				ncc @ "knock" 5 lit tcpsend 5 lit asrt_eq
+				ncc @ tcpclose
+				ncc @ 0 lit twaitst assert
+			else " (no knocker on the host: skipped) " puts then
+			nlsn @ tcpclose
+		then
+	}
+
 }
 
 Bench {
 	\ a UDP round trip to the host's echo server, through slirp both ways
 	udprtt {
-		: bbuf variable ;  400 lit alloc bbuf !
+		: bbuf variable ;  1000 lit alloc bbuf !
 		: bsock variable ;
 		: bwait ( sock -- len|-1 )
 			mtime@ drop
@@ -74,6 +146,65 @@ Bench {
 					3E8 lit 0 lit do bsock @ 0A000202 lit BA26 lit "ping!" 5 lit udpsend drop bsock @ bwait drop loop
 					3E8 lit bops
 				then
+			else bskip then
+		else bskip then
+	}
+	\ a TCP round trip: 5 bytes to the host's echo and back
+	tcprtt {
+		: bcc variable ;  : bsent variable ;
+		: bgot variable ;  : bgc variable ;  : bgb variable ;  : bgn variable ;  : bgt variable ;
+		: bturn ( -- )  narm netpoll tcptick ;
+		: bwaitst ( c st -- flag )
+			mtime@ drop
+			begin
+				bturn
+				2 lit pick @ 2 lit pick = if -1 lit -1 lit else
+					mtime@ drop over - 1312D00 lit u< if nbit 186A0 lit wait drop 0 lit else 0 lit -1 lit then
+				then
+			until nip nip nip ;
+		: bgath ( c buf n -- ok )
+			bgn ! bgb ! bgc !  0 lit bgot !  mtime@ drop bgt !
+			begin
+				narm netpoll
+				bgc @ bgb @ bgot @ + bgn @ bgot @ - tcprecv
+				dup 0< if drop 0 lit -1 lit else
+					bgot @ + bgot !
+					bgot @ bgn @ = if -1 lit -1 lit else                    \ done: no tick, so the ACK rides on the reply
+						tcptick
+						mtime@ drop bgt @ - 1312D00 lit u< if nbit 186A0 lit wait drop 0 lit else 0 lit -1 lit then
+					then
+				then
+			until ;
+		netinit if
+			0A00020F lit FFFFFF00 lit 0A000202 lit ethinit if
+				8 lit tcpinit  0A000202 lit BA27 lit tcpconn bcc !
+				bcc @ 4 lit bwaitst if
+					bgo
+					3E8 lit 0 lit do bcc @ "ping!" 5 lit tcpsend drop  bcc @ bbuf @ 5 lit bgath drop loop
+					3E8 lit bops
+					bcc @ tcpclose
+				else bskip then
+			else bskip then
+		else bskip then
+	}
+	\ TCP throughput: 256 KiB to the echo and back, 2 KiB at a time (ns per KiB)
+	tcpbw {
+		netinit if
+			0A00020F lit FFFFFF00 lit 0A000202 lit ethinit if
+				8 lit tcpinit  0A000202 lit BA27 lit tcpconn bcc !
+				bcc @ 4 lit bwaitst if
+					bgo
+					80 lit 0 lit do
+						0 lit bsent !
+						begin bsent @ 800 lit u< while
+							bcc @ bbuf @ bsent @ + 800 lit bsent @ - tcpsend dup bsent @ + bsent !
+							0= if bturn nbit 186A0 lit wait drop then
+						repeat
+						bcc @ bbuf @ 800 lit bgath drop
+					loop
+					100 lit bops
+					bcc @ tcpclose
+				else bskip then
 			else bskip then
 		else bskip then
 	}
