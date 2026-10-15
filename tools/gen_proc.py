@@ -187,6 +187,33 @@ MTIME = asm("""
     sw      t1, 0(sp)               # hi on top
 """)
 
+RTC = asm("""
+    lui  t0, 0x101
+    lw   t1, 0(t0)
+    lw   t2, 4(t0)
+    addi sp, sp, -8
+    sw   t1, 4(sp)
+    sw   t2, 0(sp)
+""")
+UDIV = asm("""
+    lw   a2, 0(sp)
+    lw   a1, 4(sp)
+    lw   a0, 8(sp)
+    addi sp, sp, 8
+    li   t0, 32
+1:  srli t2, a1, 31
+    srli t1, a0, 31
+    slli a1, a1, 1
+    or   a1, a1, t1
+    slli a0, a0, 1
+    bnez t2, 3f
+    bltu a1, a2, 2f
+3:  sub  a1, a1, a2
+    ori  a0, a0, 1
+2:  addi t0, t0, -1
+    bnez t0, 1b
+    sw   a0, 0(sp)
+""")
 MTIMECMP = asm("""
     lw      t1, 0(sp)               # hi
     lw      t2, 4(sp)               # lo
@@ -418,6 +445,9 @@ out = f"""\
 \\   texit   ( -- )            end the calling thread (what }}thread emits)
 \\   getpid  ( -- tid )
 \\   code{{ ... }}code           like thread{{ but without the trailing exit
+\\   rtc@    ( -- lo hi )      wall clock, ns since the Unix epoch (Goldfish RTC)
+\\   unix@   ( -- secs )       the same in seconds
+\\   ud/     ( lo hi d -- q )  64-by-32 unsigned division (quotient fits 32 bits)
 \\
 \\ Sleeping and waiting threads hold no tickets.  When nothing is runnable the
 \\ scheduler arms the timer for the earliest deadline and waits in `wfi`, which
@@ -721,6 +751,25 @@ out = f"""\
                                                       \\ wait until the slot is free
 : quantum! ( ticks -- )        K 24 lit + ! ;         \\ takes effect at the next arm
 
+\\ ── clock ─────────────────────────────────────────────────────────────────────
+
+\\ rtc@ ( -- lo hi )  wall clock: nanoseconds since the Unix epoch, from the virt
+\\ board's Goldfish RTC at 0x101000 (reading TIME_LOW latches TIME_HIGH).  No
+\\ trap: everything runs in M-mode, so a syscall would only add its cost.
+: rtc@
+{RTC}
+;
+
+\\ ud/ ( lo hi d -- q )  unsigned 64-by-32 division, shift-and-subtract (a
+\\ remainder bit carried out of the shift always clears the divisor); the
+\\ quotient must fit 32 bits (hi < d).  What the clock words need, and what
+\\ anything scaling a 64-bit tick count needs.
+: ud/
+{UDIV}
+;
+
+: unix@ ( -- secs )            rtc@ 3B9ACA00 lit ud/ ;   \\ seconds since the epoch
+
 \\ ── kinit ─────────────────────────────────────────────────────────────────────
 
 : kinit ( -- )
@@ -795,6 +844,19 @@ Test {{
 		rand 4080601 lit asrt_eq
 		rand 9DCCA8C5 lit asrt_eq
 		K C lit + !
+	}}
+	clock {{
+		\\ Goldfish RTC: ns since the Unix epoch; unix@ is seconds
+		rtc@ 0 lit u> assert drop                    \\ hi word nonzero: past 1970
+		unix@ dup 6955B900 lit u> assert             \\ after 2026-01-01
+		7FFFFFFF lit u< assert                       \\ before 2038: a sane host clock
+		rtc@ drop A lit msleep rtc@ drop swap -      \\ 10 ms: 1e7 .. 1e9 ns
+		dup 989680 lit u< 0= assert  3B9ACA00 lit u< assert
+		\\ ud/: 64-by-32 with a 32-bit quotient
+		0 lit 1 lit 4 lit ud/ 40000000 lit asrt_eq                     \\ 2^32 / 4
+		5 lit 0 lit 2 lit ud/ 2 lit asrt_eq
+		0 lit 1 lit 3B9ACA00 lit ud/ 4 lit asrt_eq                     \\ 2^32 ns = 4 s
+		FFFFFFFF lit FFFFFFFE lit FFFFFFFF lit ud/ FFFFFFFF lit asrt_eq \\ (2^64-2^32-1)/(2^32-1)
 	}}
 	lottery {{
 		int_off

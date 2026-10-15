@@ -42,6 +42,9 @@
 \   texit   ( -- )            end the calling thread (what }thread emits)
 \   getpid  ( -- tid )
 \   code{ ... }code           like thread{ but without the trailing exit
+\   rtc@    ( -- lo hi )      wall clock, ns since the Unix epoch (Goldfish RTC)
+\   unix@   ( -- secs )       the same in seconds
+\   ud/     ( lo hi d -- q )  64-by-32 unsigned division (quotient fits 32 bits)
 \
 \ Sleeping and waiting threads hold no tickets.  When nothing is runnable the
 \ scheduler arms the timer for the earliest deadline and waits in `wfi`, which
@@ -504,6 +507,46 @@ E39202FE ,   \ bnez t0,c <.L1^B1>
                                                       \ wait until the slot is free
 : quantum! ( ticks -- )        K 24 lit + ! ;         \ takes effect at the next arm
 
+\ ── clock ─────────────────────────────────────────────────────────────────────
+
+\ rtc@ ( -- lo hi )  wall clock: nanoseconds since the Unix epoch, from the virt
+\ board's Goldfish RTC at 0x101000 (reading TIME_LOW latches TIME_HIGH).  No
+\ trap: everything runs in M-mode, so a syscall would only add its cost.
+: rtc@
+B7121000 ,   \ lui t0,0x101
+03A30200 ,   \ lw t1,0(t0) # 101000 <.text+0x101000>
+83A34200 ,   \ lw t2,4(t0)
+130181FF ,   \ addi sp,sp,-8
+23226100 ,   \ sw t1,4(sp)
+23207100 ,   \ sw t2,0(sp)
+;
+
+\ ud/ ( lo hi d -- q )  unsigned 64-by-32 division, shift-and-subtract (a
+\ remainder bit carried out of the shift always clears the divisor); the
+\ quotient must fit 32 bits (hi < d).  What the clock words need, and what
+\ anything scaling a 64-bit tick count needs.
+: ud/
+03260100 ,   \ lw a2,0(sp)
+83254100 ,   \ lw a1,4(sp)
+03258100 ,   \ lw a0,8(sp)
+13018100 ,   \ addi sp,sp,8
+93020002 ,   \ li t0,32
+93D3F501 ,   \ srli t2,a1,0x1f
+1353F501 ,   \ srli t1,a0,0x1f
+93951500 ,   \ slli a1,a1,0x1
+B3E56500 ,   \ or a1,a1,t1
+13151500 ,   \ slli a0,a0,0x1
+63940300 ,   \ bnez t2,30 <.L3^B1>
+63E6C500 ,   \ bltu a1,a2,38 <.L2^B1>
+B385C540 ,   \ sub a1,a1,a2
+13651500 ,   \ ori a0,a0,1
+9382F2FF ,   \ addi t0,t0,-1
+E39C02FC ,   \ bnez t0,14 <.L1^B1>
+2320A100 ,   \ sw a0,0(sp)
+;
+
+: unix@ ( -- secs )            rtc@ 3B9ACA00 lit ud/ ;   \ seconds since the epoch
+
 \ ── kinit ─────────────────────────────────────────────────────────────────────
 
 : kinit ( -- )
@@ -658,6 +701,19 @@ Test {
 		rand 4080601 lit asrt_eq
 		rand 9DCCA8C5 lit asrt_eq
 		K C lit + !
+	}
+	clock {
+		\ Goldfish RTC: ns since the Unix epoch; unix@ is seconds
+		rtc@ 0 lit u> assert drop                    \ hi word nonzero: past 1970
+		unix@ dup 6955B900 lit u> assert             \ after 2026-01-01
+		7FFFFFFF lit u< assert                       \ before 2038: a sane host clock
+		rtc@ drop A lit msleep rtc@ drop swap -      \ 10 ms: 1e7 .. 1e9 ns
+		dup 989680 lit u< 0= assert  3B9ACA00 lit u< assert
+		\ ud/: 64-by-32 with a 32-bit quotient
+		0 lit 1 lit 4 lit ud/ 40000000 lit asrt_eq                     \ 2^32 / 4
+		5 lit 0 lit 2 lit ud/ 2 lit asrt_eq
+		0 lit 1 lit 3B9ACA00 lit ud/ 4 lit asrt_eq                     \ 2^32 ns = 4 s
+		FFFFFFFF lit FFFFFFFE lit FFFFFFFF lit ud/ FFFFFFFF lit asrt_eq \ (2^64-2^32-1)/(2^32-1)
 	}
 	lottery {
 		int_off
