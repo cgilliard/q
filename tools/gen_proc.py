@@ -1025,6 +1025,63 @@ Test {{
 		cnt2 @ cnt @ u> assert
 	}}
 }}
+
+\\ ──────────────────────────────────────────────────────────────────────────────
+\\ Benches (./tools/fam --bench src/fence.fam src/proc.fam ...).  kinit happens
+\\ in the first body: benches chain in file order, so every later module's bench
+\\ can use the syscalls.  Each figure is one trap round trip of some kind.
+\\ ──────────────────────────────────────────────────────────────────────────────
+
+Bench {{
+	\\ yield with nothing else runnable: trap in, lottery, resume the same thread
+	yield1 {{
+		kinit
+		bgo
+		2710 lit 0 lit do yield loop
+		2710 lit bops
+	}}
+	\\ yield ping-pong between two threads: every yield is a context switch
+	yield2 {{
+		: byf variable ;
+		0 lit byf !
+		thread{{ begin yield byf @ until }}thread A lit spawn
+		bgo
+		2710 lit 0 lit do yield loop
+		bstop
+		1 lit byf ! join
+		2710 lit bops
+	}}
+	\\ spawn an empty thread, run it to its exit, reap it with join
+	spawn1k {{
+		3E8 lit 0 lit do thread{{ }}thread 1 lit spawn join loop
+		3E8 lit bops
+	}}
+	\\ a software event round trip: post to a waiting thread, which posts back —
+	\\ two wake-ups and two context switches per op
+	postwait {{
+		thread{{ 3E8 lit 0 lit do 10000 lit 0 lit wait drop 20000 lit 0 lit post loop }}thread A lit spawn
+		bgo
+		3E8 lit 0 lit do 10000 lit over post 20000 lit 0 lit wait drop loop
+		bstop join
+		3E8 lit bops
+	}}
+	\\ the shortest sleep: trap, nothing runnable, wfi on the timer, wake, resume
+	sleep1 {{
+		64 lit 0 lit do 1 lit sleep loop
+		64 lit bops
+	}}
+	\\ an interrupt doorbell: raise the UART's THRE line (a fresh edge each time),
+	\\ enable the source, wait for its bit — the full trap + PLIC + wake path
+	uartirq {{
+		3E8 lit 0 lit do
+			0 lit 10000001 lit c!  2 lit 10000001 lit c!
+			A lit irqon
+			400 lit 989680 lit wait 400 lit asrt_eq
+		loop
+		0 lit 10000001 lit c!
+		3E8 lit bops
+	}}
+}}
 """
 dst = os.path.join(ROOT, "src", "proc.fam")
 open(dst, "w").write(out)

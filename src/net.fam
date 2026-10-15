@@ -32,7 +32,7 @@
 \ State block (the `net` variable points at it, 0x30 bytes):
 \   +00 dev   +04 rxq   +08 txq   +0C rxbufs   +10 txbufs   +1C rx used cursor
 \   +20 tx submitted   +28 head of the frame netrx last returned
-\ Needs src/fence.fam and src/proc.fam compiled before it.  The rings must come
+\ Needs src/fence.fam (mcopy, bus words) and src/proc.fam compiled before it.  The rings must come
 \ from the main thread's heap (a spawned thread's arena is only 108 KiB).
 \ ──────────────────────────────────────────────────────────────────────────────
 
@@ -90,8 +90,8 @@
 : nettx ( buf len -- ok )
 	net @ 20 lit + @ net @ 8 lit + @ nused@ - FFFF lit and 10 lit u< 0= if 2drop 0 lit else
 		net @ 20 lit + @ F lit and dup B lit lshift net @ 10 lit + @ + txb !   \ buf len slot
-		A lit 0 lit do 0 lit txb @ i + c! loop                                  \ header: no flags
-		over 0 lit do 2 lit pick i + c@ txb @ 10 lit + i + c! loop              \ the frame
+		0 lit txb @ !  0 lit txb @ 4 lit + !  0 lit txb @ 8 lit + h!            \ header: no flags
+		2 lit pick txb @ 10 lit + 3 lit pick mcopy                               \ the frame
 		net @ 8 lit + @                                                          \ buf len slot q
 		over 1 lit lshift 1 lit + 4 lit lshift over + 8 lit + 3 lit pick swap !  \ desc[2s+1].len = len
 		swap 1 lit lshift navail+                                                \ buf len
@@ -259,5 +259,88 @@ Test {
 				got @
 			until
 		then
+	}
+}
+
+\ ──────────────────────────────────────────────────────────────────────────────
+\ Benches (./tools/fam --bench src/fence.fam src/proc.fam src/net.fam --net).
+\ The first two time the driver alone on a scratch block standing in for the
+\ NIC; the rest need --net and self-skip without it.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+Bench {
+	\ nettx of a full-size frame with no device behind it: the header, the
+	\ byte-by-byte copy, the descriptor, the avail entry, the kick.  The used
+	\ index is advanced by hand so the 16 slots never run out.
+	tx1500 {
+		: bnfake
+			30 lit alloc net !
+			100 lit alloc dup 40 lit nzero net @ !
+			5000 lit alloc FFF lit + FFFFF000 lit and dup 1000 lit nzero
+			dup net @ 4 lit + !  2000 lit + net @ 8 lit + !
+			8000 lit alloc net @ C lit + !  8000 lit alloc net @ 10 lit + !
+			0 lit net @ 1C lit + !  0 lit net @ 20 lit + !
+			ntxinit ;
+		\ bnack ( -- )  the "device" consumed everything submitted
+		: bnack  net @ 20 lit + @ net @ 8 lit + @ 1002 lit + h! ;
+		bnfake
+		800 lit alloc bgo
+		3E8 lit 0 lit do dup 5DC lit nettx drop bnack loop
+		drop
+		3E8 lit bops
+	}
+	\ the same for a minimum-size frame: the fixed cost of a send
+	tx64 {
+		bnfake
+		800 lit alloc bgo
+		3E8 lit 0 lit do dup 40 lit nettx drop bnack loop
+		drop
+		3E8 lit bops
+	}
+	\ --net: 1000 ARP who-has 10.0.2.2 round trips on the doorbell: nettx, sleep
+	\ until the NIC interrupts, netrx the reply.  slirp answers from the host
+	\ process, so this is QEMU's whole frame path there and back.
+	arp1k {
+		: nb!   ( a x -- a+1 )  over c! 1 lit + ;
+		: nmac! ( a -- a+6 )    6 lit 0 lit do netmac i + c@ nb! loop ;
+		: barp  ( -- buf )      \ the broadcast ARP request the arp test sends
+			40 lit alloc dup
+			6 lit 0 lit do FF lit nb! loop  nmac!
+			8 lit nb! 6 lit nb!  0 lit nb! 1 lit nb!  8 lit nb! 0 lit nb!  6 lit nb! 4 lit nb!  0 lit nb! 1 lit nb!
+			nmac!  A lit nb! 0 lit nb! 2 lit nb! F lit nb!
+			6 lit 0 lit do 0 lit nb! loop  A lit nb! 0 lit nb! 2 lit nb! 2 lit nb!
+			drop ;
+		\ barply ( -- flag )  drain the NIC; -1 if an ARP reply was among the frames
+		: barply
+			0 lit
+			begin netrx while
+				2A lit u< 0= if
+					dup C lit + c@ 8 lit = over D lit + c@ 6 lit = and over 15 lit + c@ 2 lit = and
+					if nip -1 lit swap then
+				then
+				drop netrel
+			repeat ;
+		netinit if
+			barp narm bgo
+			3E8 lit 0 lit do
+				dup 2A lit nettx -1 lit asrt_eq
+				begin narm barply dup 0= if nbit 989680 lit wait drop then until
+			loop
+			bstop drop
+			3E8 lit bops
+		else bskip then
+	}
+	\ --net: 1000 minimum-size broadcast frames out as fast as the NIC takes
+	\ them, sleeping on the doorbell whenever all 16 transmit slots are with it
+	tx1k {
+		netinit if
+			800 lit alloc dup 6 lit 0 lit do FF lit nb! loop nmac! drop
+			bgo
+			3E8 lit 0 lit do
+				begin narm dup 40 lit nettx 0= while nbit 989680 lit wait drop repeat
+			loop
+			bstop drop
+			3E8 lit bops
+		else bskip then
 	}
 }

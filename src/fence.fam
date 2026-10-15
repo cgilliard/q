@@ -1,6 +1,6 @@
 \ ──────────────────────────────────────────────────────────────────────────────
-\ src/fence.fam — shared prelude for the device modules: fence macros and the
-\ virtio-mmio bus words (vfind / virqof / vack).
+\ src/fence.fam — shared prelude for the device modules: fence macros, a memory
+\ copy (mcopy) and the virtio-mmio bus words (vfind / virqof / vack).
 \
 \ Devices are driven by polling, with interrupts only as a doorbell for the idle
 \ case (src/proc.fam `wait`); correctness depends on ordering MMIO writes before
@@ -37,3 +37,110 @@
 
 \ vack ( dev -- )  acknowledge whatever the device is asserting (drops its line)
 : vack  dup 60 lit + @ swap 64 lit + ! ;
+
+\ ── memory copy ───────────────────────────────────────────────────────────────
+\ mcopy ( src dst n -- )  copy n bytes.  When both addresses are word-aligned
+\ (anything from alloc is) it moves 16 bytes, then 4, per iteration and only
+\ the tail byte by byte; otherwise bytes throughout.  Regions must not overlap.
+\ Machine code: a fam c@/c! loop costs ~10 instructions per byte, which made a
+\ 1500-byte frame the most expensive thing the NIC driver did (src/net.fam).
+: mcopy
+03260100 ,   \ lw a2,0(sp)          ( n )
+83254100 ,   \ lw a1,4(sp)          ( dst )
+03258100 ,   \ lw a0,8(sp)          ( src )
+1301C100 ,   \ addi sp,sp,12
+B362B500 ,   \ or t0,a0,a1
+93F23200 ,   \ andi t0,t0,3
+639E0204 ,   \ bnez t0,bytes        ( either unaligned: bytes only )
+13030001 ,   \ w16: li t1,16
+636A6602 ,   \ bltu a2,t1,w4
+83230500 ,   \ lw t2,0(a0)
+032E4500 ,   \ lw t3,4(a0)
+832E8500 ,   \ lw t4,8(a0)
+032FC500 ,   \ lw t5,12(a0)
+23A07500 ,   \ sw t2,0(a1)
+23A2C501 ,   \ sw t3,4(a1)
+23A4D501 ,   \ sw t4,8(a1)
+23A6E501 ,   \ sw t5,12(a1)
+13050501 ,   \ addi a0,a0,16
+93850501 ,   \ addi a1,a1,16
+130606FF ,   \ addi a2,a2,-16
+6FF0DFFC ,   \ j w16
+13034000 ,   \ w4: li t1,4
+636E6600 ,   \ bltu a2,t1,bytes
+83230500 ,   \ lw t2,0(a0)
+23A07500 ,   \ sw t2,0(a1)
+13054500 ,   \ addi a0,a0,4
+93854500 ,   \ addi a1,a1,4
+1306C6FF ,   \ addi a2,a2,-4
+6FF05FFE ,   \ j w4
+630E0600 ,   \ bytes: beqz a2,done
+83430500 ,   \ lbu t2,0(a0)
+23807500 ,   \ sb t2,0(a1)
+13051500 ,   \ addi a0,a0,1
+93851500 ,   \ addi a1,a1,1
+1306F6FF ,   \ addi a2,a2,-1
+6FF09FFE ,   \ j bytes
+;            \ done:
+
+\ ──────────────────────────────────────────────────────────────────────────────
+\ Tests and benches for mcopy.  mcfill writes a byte pattern that differs
+\ from the zeroed destination at every offset; mcsame compares.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+Test {
+	\ aligned, 1500 bytes: 16-byte chunks, one word, two tail bytes
+	copy1500 {
+		: mcfill ( a n -- )  0 lit do i 5A lit xor i 3 lit rshift + FF lit and over i + c! loop drop ;
+		: mcsame ( a b n -- flag )  -1 lit swap 0 lit do 2 lit pick i + c@ 2 lit pick i + c@ <> if drop 0 lit then loop nip nip ;
+		: mcs variable ;  : mcd variable ;
+		800 lit alloc mcs !  800 lit alloc mcd !
+		mcd @ 800 lit 0 lit do 0 lit over i + c! loop drop    \ alloc does not zero
+		mcs @ 800 lit mcfill
+		mcs @ mcd @ 5DC lit mcopy
+		mcs @ mcd @ 5DC lit mcsame assert
+		mcd @ 5DC lit + c@ 0 lit asrt_eq                 \ nothing past n
+	}
+	\ the three loops alone: 7 bytes, 20 (one chunk + a word), 23 (+ tail)
+	copyedge {
+		mcd @ 800 lit 0 lit do 0 lit over i + c! loop drop
+		mcs @ mcd @ 7 lit mcopy   mcs @ mcd @ 7 lit mcsame assert   mcd @ 7 lit + c@ 0 lit asrt_eq
+		mcs @ mcd @ 14 lit mcopy  mcs @ mcd @ 14 lit mcsame assert  mcd @ 14 lit + c@ 0 lit asrt_eq
+		mcs @ mcd @ 17 lit mcopy  mcs @ mcd @ 17 lit mcsame assert  mcd @ 17 lit + c@ 0 lit asrt_eq
+	}
+	\ n = 0 touches nothing
+	copy0 {
+		mcd @ 800 lit 0 lit do 0 lit over i + c! loop drop
+		mcs @ mcd @ 0 lit mcopy
+		mcd @ c@ 0 lit asrt_eq
+	}
+	\ an unaligned source, then an unaligned destination: the byte path
+	copyodd {
+		mcd @ 800 lit 0 lit do 0 lit over i + c! loop drop
+		mcs @ 1 lit + mcd @ 25 lit mcopy
+		mcs @ 1 lit + mcd @ 25 lit mcsame assert  mcd @ 25 lit + c@ 0 lit asrt_eq
+		mcd @ 800 lit 0 lit do 0 lit over i + c! loop drop
+		mcs @ mcd @ 3 lit + 25 lit mcopy
+		mcs @ mcd @ 3 lit + 25 lit mcsame assert  mcd @ 28 lit + c@ 0 lit asrt_eq
+		mcd @ 2 lit + c@ 0 lit asrt_eq
+	}
+}
+
+Bench {
+	\ a 1500-byte aligned copy (the NIC's frame size)
+	copy1500 {
+		800 lit alloc 800 lit alloc
+		bgo
+		2710 lit 0 lit do 2dup 5DC lit mcopy loop
+		2drop
+		2710 lit bops
+	}
+	\ the same copy through the byte path (unaligned source)
+	copyodd {
+		800 lit alloc 1 lit + 800 lit alloc
+		bgo
+		3E8 lit 0 lit do 2dup 5DC lit mcopy loop
+		2drop
+		3E8 lit bops
+	}
+}

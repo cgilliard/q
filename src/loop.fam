@@ -92,3 +92,31 @@ Test {
 		ndone @ -1 lit asrt_eq
 	}
 }
+
+\ ──────────────────────────────────────────────────────────────────────────────
+\ Benches: the fixed cost of a turn of the loop, with whatever devices are
+\ attached (--disk / --net) and none.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+Bench {
+	\ a turn with work already pending: arm both doorbells, drain an idle NIC
+	\ and disk, post an event to ourselves and take it back with evwait
+	evturn {
+		evinit
+		bgo
+		2710 lit 0 lit do
+			evarm
+			evnet? @ if begin netrx while drop netrel repeat then
+			evdsk @ if evdsk @ vpoll drop then
+			10000 lit 0 lit post
+			10000 lit 0 lit evwait drop
+		loop
+		2710 lit bops
+	}
+	\ an idle turn: nothing pending and the shortest timeout — what the loop
+	\ pays to go to sleep (wfi on the timer) and come back
+	evidle {
+		3E8 lit 0 lit do evarm 0 lit 1 lit evwait drop loop
+		3E8 lit bops
+	}
+}

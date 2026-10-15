@@ -649,7 +649,196 @@ Test {
 	}
 }
 
+\ ──────────────────────────────────────────────────────────────────────────────
+\ Benches (./tools/fam --bench src/fence.fam src/proc.fam src/disk.fam
+\ --disk=IMG).  stage10k needs no device; the rest self-skip without one.
+\
+\ Sector geometry: each request lands on its own host page, so a flush does
+\ realistic scattered writeback.  In 512-byte sectors: stride 0x40 (32 KiB),
+\ span 0xF9C1 (about 31 MiB for 1000 requests), mask 0x1FFFF (clamps to the
+\ 64 MiB image scripts/bench.sh creates).  bfits skips the device benches on a
+\ smaller disk rather than let them time out-of-range requests that fail fast
+\ and look like a speedup.  bok, after the clock stops, makes one write report
+\ success: a bench asserts nothing about its own I/O, so without it a wholesale
+\ device failure still yields a plausible number.
+\ ──────────────────────────────────────────────────────────────────────────────
+
 Bench {
-	btest1 {
+	\ vqsub staging cost, no device involved: 10000 single-sector writes staged
+	\ on a fake QueueNum=16 handle.  Also defines the helpers the rest use:
+	\   bfits  ( ds -- ds flag )  does the disk cover the span above?
+	\   bok    ( ds -- ds )       post-run sanity check (see the header)
+	\   bds    ( -- ds|0 )        dsinit, 0 when the disk is absent or too small
+	\   bdrain ( ds -- ds )       poll until every staged request has landed
+	\   bdwait ( ds -- ds )       the same, sleeping on the doorbell between polls
+	\   bspin  ( ds id -- ds st ) poll until this one request has landed
+	stage10k {
+		: bfits  dup @ 104 lit + @ if -1 lit else dup @ 100 lit + @ F9C1 lit u< 0= then ;
+		: bok
+			200 lit alloc over 0 lit 2 lit pick vwrite dwait nip nip 1 lit <> if
+				0A lit putc "bok: device write FAILED - every timing above is meaningless" puts 0A lit putc _fail
+			then ;
+		: bds     dsinit ?dup if bfits 0= if drop 0 lit then then ;
+		: bdrain  begin vpoll dup 8 lit + @ over C lit + @ = until ;
+		: bdwait  begin darm vpoll dup 8 lit + @ over C lit + @ = dup 0= if over dbit 0 lit wait drop then until ;
+		: bspin   begin over vpoll drop 2dup vstat nip ?dup if -1 lit else 0 lit then until nip ;
+		4C lit alloc tqset
+		100 lit alloc over !      \ fake dev (staging never touches it)
+		0 lit over 8 lit + !      \ subd 0
+		0 lit over 10 lit + !     \ next 0
+		200 lit alloc             \ ( ds buf )
+		bgo
+		2710 lit 0 lit do over 5 lit 2 lit pick 1 lit vqwrite 2drop loop
+		2drop
+		2710 lit bops
+	}
+	\ 1000 sync single-sector writes, each waited for on the doorbell (dwait:
+	\ arm, poll, sleep on the interrupt) — what a lone request costs the node
+	sync1k {
+		bds ?dup if
+			200 lit alloc bgo                                  \ ( ds buf )
+			3E8 lit 0 lit do over i 6 lit lshift 1FFFF lit and 2 lit pick vwrite dwait 2drop loop
+			bstop drop bok drop
+			3E8 lit bops
+		else bskip then
+	}
+	\ the same 1000 writes busy-polled (no interrupt, no wait): the floor the
+	\ doorbell path is measured against
+	spin1k {
+		bds ?dup if
+			200 lit alloc bgo
+			3E8 lit 0 lit do over i 6 lit lshift 1FFFF lit and 2 lit pick vwrite bspin 2drop loop
+			bstop drop bok drop
+			3E8 lit bops
+		else bskip then
+	}
+	\ 1000 writes staged in waves of 50 with ONE vkick per wave, busy-polling
+	\ until each wave has landed
+	batch1k {
+		bds ?dup if
+			200 lit alloc bgo                                  \ ( ds buf )
+			0 lit begin dup 3E8 lit u< while                   \ ( ds buf n )
+				0 lit begin dup 32 lit u< while                \ ( ds buf n k )
+					3 lit pick over 3 lit pick + 6 lit lshift 1FFFF lit and 4 lit pick 1 lit vqwrite 2drop
+					1 lit +
+				repeat drop
+				2 lit pick vkick drop
+				2 lit pick bdrain drop
+				32 lit +
+			repeat drop
+			bstop drop bok drop
+			3E8 lit bops
+		else bskip then
+	}
+	\ batch1k with the waves drained the event-loop way: arm, poll, and sleep on
+	\ the doorbell while the wave is in flight
+	batchev1k {
+		bds ?dup if
+			200 lit alloc bgo
+			0 lit begin dup 3E8 lit u< while
+				0 lit begin dup 32 lit u< while
+					3 lit pick over 3 lit pick + 6 lit lshift 1FFFF lit and 4 lit pick 1 lit vqwrite 2drop
+					1 lit +
+				repeat drop
+				2 lit pick vkick drop
+				2 lit pick bdwait drop
+				32 lit +
+			repeat drop
+			bstop drop bok drop
+			3E8 lit bops
+		else bskip then
+	}
+	\ 1000 writes with a SLIDING WINDOW: waves of 50 + one vkick as batch1k, but
+	\ polling only until fewer than win = nslots/2 are outstanding, so the ring
+	\ stays topped up and the device never idles waiting to be refilled.  Peak
+	\ depth win + 50 stays under nslots, so the slot allocator never reuses a
+	\ live slot.
+	pipe1k {
+		bds ?dup if
+			200 lit alloc
+			over 14 lit + @ 1 lit rshift bgo                   \ ( ds buf win )
+			0 lit begin dup 3E8 lit u< while                   \ ( ds buf win n )
+				0 lit begin dup 32 lit u< while                \ ( ds buf win n k )
+					4 lit pick over 3 lit pick + 6 lit lshift 1FFFF lit and 5 lit pick 1 lit vqwrite 2drop
+					1 lit +
+				repeat drop
+				3 lit pick vkick drop
+				begin 3 lit pick vpoll dup 8 lit + @ over C lit + @ - 3 lit pick u< nip until
+				32 lit +
+			repeat
+			3 lit pick bdrain drop                             \ everything in flight lands before the clock stops
+			2drop drop
+			bstop bok drop
+			3E8 lit bops
+		else bskip then
+	}
+	\ 1000 sync single-sector READS on the doorbell — the read mirror of sync1k
+	syncrd1k {
+		bds ?dup if
+			200 lit alloc bgo
+			3E8 lit 0 lit do over i 6 lit lshift 1FFFF lit and 2 lit pick vread dwait 2drop loop
+			bstop drop bok drop
+			3E8 lit bops
+		else bskip then
+	}
+	\ 1000 READS in waves of 50, one vkick each — the read mirror of batch1k.
+	\ A read has the device DMA INTO the buffer, so each request in a wave gets
+	\ its own 512-byte slice at buf + k*0x200.
+	batchrd1k {
+		bds ?dup if
+			6400 lit alloc bgo                                 \ 50 x 512 B landing slots
+			0 lit begin dup 3E8 lit u< while
+				0 lit begin dup 32 lit u< while
+					3 lit pick over 3 lit pick + 6 lit lshift 1FFFF lit and
+					4 lit pick 3 lit pick 9 lit lshift +       \ buf + k*512
+					1 lit vqread 2drop
+					1 lit +
+				repeat drop
+				2 lit pick vkick drop
+				2 lit pick bdrain drop
+				32 lit +
+			repeat drop
+			bstop drop bok drop
+			3E8 lit bops
+		else bskip then
+	}
+	\ 100 raw durability barriers (vflush + dwait) with nothing staged behind
+	\ them: the cost of the barrier itself.  Skips when the device did not offer
+	\ VIRTIO_BLK_F_FLUSH (writethrough: vflush returns -1 without submitting).
+	\ One unmeasured flush first: the benches ahead leave thousands of dirty
+	\ sectors in the host page cache, and writing them back is their cost.
+	flush100 {
+		bds ?dup if
+			dup @ 10 lit + @ 200 lit and if
+				vflush dup FFFFFFFF lit <> if dwait then drop
+				bgo
+				64 lit 0 lit do vflush dup FFFFFFFF lit <> if dwait then drop loop
+				bstop bok drop
+				64 lit bops
+			else drop bskip then
+		else bskip then
+	}
+	\ 1000 DURABLE writes: batch1k's waves of 50, each then sealed by a vflush
+	\ waited for on the doorbell.  What a node that must not lose acknowledged
+	\ state actually pays; batch1k's figure is writes landing in the host page
+	\ cache.  Primed with one flush like flush100.
+	durable1k {
+		bds ?dup if
+			200 lit alloc
+			over vflush dup FFFFFFFF lit <> if dwait then 2drop
+			bgo
+			0 lit begin dup 3E8 lit u< while
+				0 lit begin dup 32 lit u< while
+					3 lit pick over 3 lit pick + 6 lit lshift 1FFFF lit and 4 lit pick 1 lit vqwrite 2drop
+					1 lit +
+				repeat drop
+				2 lit pick vkick drop
+				2 lit pick bdrain drop
+				2 lit pick vflush dup FFFFFFFF lit <> if dwait then 2drop
+				32 lit +
+			repeat drop
+			bstop drop bok drop
+			3E8 lit bops
+		else bskip then
 	}
 }
