@@ -17,4 +17,7 @@ set -e
 # run.  fdatasync (rather than a bare sync) flushes only this file, so the script
 # never blocks on unrelated dirty data.
 dd if=/dev/zero of=./tmp/bench_disk.img bs=1M count=64 conv=fdatasync 2>/dev/null
+python3 scripts/udp_echo.py 47654 &
+ECHO=$!
+trap 'kill $ECHO 2>/dev/null' EXIT
 ./tools/fam --bench --net --hostfwd=udp::47653-:47653 `cat scripts/files.txt` --disk=./tmp/bench_disk.img

@@ -1,0 +1,185 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/eth.fam — Ethernet framing and ARP over src/net.fam, and the byte-order
+\ words the layers above share.
+\
+\   ethinit ( ip mask gw -- flag )  our address, netmask and gateway; resolves
+\                                   the gateway's MAC (waits up to 1 s); -1 when
+\                                   it answered.  Call after netinit.
+\   ethbuf  ( -- addr )             the transmit frame's payload (after the
+\                                   14-byte header); a layer builds its packet
+\                                   here, then calls ethsend
+\   ethsend ( dstip type len -- ok )  frame the payload to dstip (via the
+\                                   gateway when off our subnet); 0 when the
+\                                   MAC is not known yet (an ARP request has
+\                                   been sent: try again later)
+\   ethtype ( buf -- type )         a received frame's ethertype
+\   arpin   ( buf len -- )          an ARP frame: answer requests for our
+\                                   address, learn what it tells us
+\   arpfind ( ip -- entry|0 )       the ARP table entry (+4 is the MAC)
+\   be16@ be16! be32@ be32!         big-endian field access ( a -- n ) ( n a -- )
+\
+\ The ARP table holds 8 entries of 16 bytes (ip, mac, pad), filled round robin
+\ and never aged.  IP addresses are 32-bit numbers (10.0.2.15 = 0A00020F).
+\ Needs src/fence.fam src/proc.fam src/net.fam before it.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: be16@ ( a -- n )   dup c@ 8 lit lshift swap 1 lit + c@ or ;
+: be16! ( n a -- )   over 8 lit rshift over c! 1 lit + c! ;
+: be32@ ( a -- n )   dup be16@ 10 lit lshift swap 2 lit + be16@ or ;
+: be32! ( n a -- )   over 10 lit rshift over be16! 2 lit + swap FFFF lit and swap be16! ;
+
+: ipaddr variable ;  : ipmask variable ;  : ipgw variable ;
+: txf variable ;     \ the transmit frame, 0x800 bytes
+: arpt variable ;    \ the table
+: arpn variable ;    \ next entry to replace
+: bcast variable ;   \ ff:ff:ff:ff:ff:ff
+
+: ethbuf ( -- addr )  txf @ E lit + ;
+: ethtype ( buf -- type )  C lit + be16@ ;
+
+: arpfind ( ip -- entry|0 )
+	0 lit 8 lit 0 lit do
+		dup 0= if drop dup i 4 lit lshift arpt @ + dup @ 2 lit pick = if nip else 2drop 0 lit then then
+	loop nip ;
+
+: arpadd ( ip mac -- )
+	over arpfind ?dup 0= if arpn @ dup 1 lit + 7 lit and arpn ! 4 lit lshift arpt @ + then   \ ip mac entry
+	tuck 4 lit + 6 lit mcopy ! ;
+
+\ arpsend ( op tip tmac -- )  an ARP frame to tmac (ff.. for a request)
+: arpsend
+	txf @ 6 lit mcopy                                  \ dst
+	netmac txf @ 6 lit + 6 lit mcopy                   \ src
+	806 lit txf @ C lit + be16!
+	1 lit ethbuf be16!  800 lit ethbuf 2 lit + be16!   \ Ethernet, IPv4
+	6 lit ethbuf 4 lit + c!  4 lit ethbuf 5 lit + c!
+	swap ethbuf 6 lit + be16!                          \ op       ( tip )
+	netmac ethbuf 8 lit + 6 lit mcopy  ipaddr @ ethbuf E lit + be32!   \ sender
+	txf @ ethbuf 12 lit + 6 lit mcopy                  \ target MAC: the frame's dst (zeros come out as ff..: harmless)
+	ethbuf 18 lit + be32!                              \ target IP
+	txf @ 2A lit nettx drop ;
+
+: arpreq ( ip -- )  1 lit swap bcast @ arpsend ;
+
+: arpin ( buf len -- )
+	2A lit u< if drop else
+		dup 1C lit + be32@ ?dup if over 16 lit + arpadd then          \ learn the sender
+		dup 14 lit + be16@ 1 lit = over 26 lit + be32@ ipaddr @ = and if
+			2 lit over 1C lit + be32@ 2 lit pick 16 lit + arpsend       \ a request for us: reply
+		then drop
+	then ;
+
+: ethsend ( dstip type len -- ok )
+	rot dup ipaddr @ xor ipmask @ and if drop ipgw @ then             \ type len ip: off the subnet, the gateway
+	dup arpfind ?dup if
+		nip 4 lit + txf @ 6 lit mcopy  netmac txf @ 6 lit + 6 lit mcopy
+		swap txf @ C lit + be16!
+		E lit + txf @ swap nettx
+	else arpreq 2drop 0 lit then ;
+
+: ethinit ( ip mask gw -- flag )
+	ipgw ! ipmask ! ipaddr !
+	800 lit alloc txf !  80 lit alloc dup arpt ! 20 lit 0 lit do 0 lit over i 2 lit lshift + ! loop drop
+	0 lit arpn !  8 lit alloc dup bcast ! 6 lit 0 lit do FF lit over i + c! loop drop
+	ipgw @ arpreq
+	mtime@ drop                                                        \ t0
+	begin
+		narm
+		begin netrx while over ethtype 806 lit = if 2dup arpin then 2drop netrel repeat
+		ipgw @ arpfind if drop -1 lit -1 lit else
+			mtime@ drop over - 989680 lit u< if nbit 186A0 lit wait drop 0 lit else drop 0 lit -1 lit then
+		then
+	until ;
+
+\ ──────────────────────────────────────────────────────────────────────────────
+\ Tests: the ARP words on a scratch NIC (as in src/net.fam's tests), then the
+\ real gateway (--net; self-skips without it).
+\ ──────────────────────────────────────────────────────────────────────────────
+
+Test {
+	be {
+		: eb variable ;  10 lit alloc eb !
+		1234 lit eb @ be16!  eb @ c@ 12 lit asrt_eq  eb @ 1 lit + c@ 34 lit asrt_eq  eb @ be16@ 1234 lit asrt_eq
+		0A00020F lit eb @ be32!  eb @ c@ A lit asrt_eq  eb @ 3 lit + c@ F lit asrt_eq  eb @ be32@ 0A00020F lit asrt_eq
+	}
+	\ a scratch NIC: the transmit ring with slots at txbufs + i*0x800, frames at +0x10
+	arptab {
+		: efake ( -- )
+			30 lit alloc net !
+			110 lit alloc dup 44 lit nzero net @ !
+			5000 lit alloc FFF lit + FFFFF000 lit and dup 1000 lit nzero
+			dup net @ 4 lit + !  2000 lit + net @ 8 lit + !
+			8000 lit alloc net @ C lit + !  8000 lit alloc net @ 10 lit + !
+			0 lit net @ 1C lit + !  0 lit net @ 20 lit + !
+			ntxinit
+			\ the MAC the fake reports: 02:00:00:00:00:01 at dev+0x100
+			2 lit net @ @ 100 lit + c!  1 lit net @ @ 105 lit + c! ;
+		: etx ( i -- frame )  B lit lshift net @ 10 lit + @ + 10 lit + ;
+		: emac ( a b -- flag )  -1 lit -rot 6 lit 0 lit do 2dup i + c@ swap i + c@ <> if rot drop 0 lit -rot then loop 2drop ;
+		efake
+		0A00020F lit FFFFFF00 lit 0A000202 lit ipgw ! ipmask ! ipaddr !
+		800 lit alloc txf !  80 lit alloc dup arpt ! 20 lit 0 lit do 0 lit over i 2 lit lshift + ! loop drop  0 lit arpn !
+		8 lit alloc dup bcast ! 6 lit 0 lit do FF lit over i + c! loop drop
+		0A000201 lit "abcdef" arpadd
+		0A000203 lit "ABCDEF" arpadd
+		0A000201 lit arpfind dup 0 lit <> assert 4 lit + "abcdef" emac assert
+		0A000203 lit arpfind 4 lit + "ABCDEF" emac assert
+		0A000204 lit arpfind 0 lit asrt_eq
+		0A000201 lit "uvwxyz" arpadd  0A000201 lit arpfind 4 lit + "uvwxyz" emac assert   \ replaced in place
+		A lit 0 lit do i 10 lit + "123456" arpadd loop                                   \ wraps round: 8 live
+		0A000201 lit arpfind 0 lit asrt_eq
+		19 lit arpfind 0 lit <> assert
+	}
+	\ a request goes out broadcast with our addresses; a reply answers to the asker
+	arpframe {
+		0A000202 lit arpreq
+		0 lit etx dup bcast @ emac assert
+		dup 6 lit + netmac emac assert
+		dup ethtype 806 lit asrt_eq
+		dup 14 lit + be16@ 1 lit asrt_eq
+		dup 1C lit + be32@ 0A00020F lit asrt_eq
+		dup 26 lit + be32@ 0A000202 lit asrt_eq
+		drop
+		\ a request from 10.0.2.9 for us: learned, and answered
+		400 lit alloc dup
+		6 lit 0 lit do FF lit over i + c! loop                       \ dst broadcast
+		"QRSTUV" over 6 lit + 6 lit mcopy  806 lit over C lit + be16!
+		1 lit over E lit + be16!  800 lit over 10 lit + be16!  6 lit over 12 lit + c!  4 lit over 13 lit + c!
+		1 lit over 14 lit + be16!  "QRSTUV" over 16 lit + 6 lit mcopy  0A000209 lit over 1C lit + be32!
+		0A00020F lit over 26 lit + be32!
+		2A lit arpin
+		0A000209 lit arpfind dup 0 lit <> assert 4 lit + "QRSTUV" emac assert
+		1 lit etx dup "QRSTUV" emac assert
+		dup 14 lit + be16@ 2 lit asrt_eq
+		dup 1C lit + be32@ 0A00020F lit asrt_eq
+		dup 26 lit + be32@ 0A000209 lit asrt_eq
+		dup 20 lit + "QRSTUV" emac assert
+		drop
+		net @ 20 lit + @ 2 lit asrt_eq
+		\ a request for someone else: learned, not answered
+		dup 0A00020A lit swap 26 lit + be32!  0A000208 lit over 1C lit + be32!  dup 2A lit arpin
+		0A000208 lit arpfind 0 lit <> assert
+		net @ 20 lit + @ 2 lit asrt_eq
+		drop
+	}
+	\ ethsend: a known neighbour, the gateway for the rest, an ARP request otherwise
+	ethsend {
+		2 lit net @ 8 lit + @ 1002 lit + h!                          \ the fake consumed the 2 frames so far
+		"hello" ethbuf 5 lit mcopy
+		0A000209 lit 800 lit 5 lit ethsend assert
+		2 lit etx dup "QRSTUV" emac assert  dup ethtype 800 lit asrt_eq  dup E lit + c@ 'h' lit asrt_eq drop
+		0A000202 lit "GWGWGW" arpadd
+		C0A80001 lit 800 lit 5 lit ethsend assert                     \ off subnet: the gateway's MAC
+		3 lit etx "GWGWGW" emac assert
+		0A000277 lit 800 lit 5 lit ethsend 0 lit asrt_eq              \ unknown: a request went out instead
+		4 lit etx dup ethtype 806 lit asrt_eq 26 lit + be32@ 0A000277 lit asrt_eq
+	}
+	\ the real NIC: slirp's gateway answers our ARP
+	gateway {
+		netinit if
+			0A00020F lit FFFFFF00 lit 0A000202 lit ethinit assert
+			0A000202 lit arpfind dup 0 lit <> assert
+			4 lit + dup c@ 52 lit asrt_eq  dup 1 lit + c@ 55 lit asrt_eq  dup 2 lit + c@ A lit asrt_eq  5 lit + c@ 2 lit asrt_eq
+		then
+	}
+}

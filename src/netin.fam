@@ -1,0 +1,94 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/netin.fam — the receive dispatcher: frames from the NIC to ARP, ICMP and
+\ UDP.  A layer's input word returns what it did not consume, so this sits
+\ above them all and is the one place that knows the chain.
+\
+\   netin   ( buf len -- )   one frame
+\   netpoll ( -- )           drain the NIC through netin (after narm)
+\ Needs src/udp.fam (and what it needs).
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: netin ( buf len -- )
+	over ethtype dup 806 lit = if drop arpin else
+		800 lit = if
+			E lit - swap E lit + swap ipin ?dup if 11 lit = if udpin else 2drop then then
+		else 2drop then
+	then ;
+
+: netpoll ( -- )  begin netrx while netin netrel repeat ;
+
+\ ──────────────────────────────────────────────────────────────────────────────
+\ Test and benches against the host: scripts/udp_echo.py echoes on
+\ 127.0.0.1:47654, which the guest reaches as 10.0.2.2:47654.  Without --net
+\ they skip; without the echo server they report it and skip.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+Test {
+	echo {
+		: ebuf variable ;  400 lit alloc ebuf !
+		: esock variable ;
+		\ eturn ( -- )  one turn: arm, drain
+		: eturn  narm netpoll ;
+		\ ewait ( sock -- len|-1 )  a datagram within 1 s
+		: ewait
+			mtime@ drop                                                \ sock t0
+			begin
+				eturn
+				over ebuf @ 400 lit udprecv dup 0 lit < if
+					drop mtime@ drop over - 989680 lit u< if nbit 186A0 lit wait drop 0 lit else -1 lit -1 lit then
+				else -1 lit then
+			until nip nip ;
+		netinit if
+			0A00020F lit FFFFFF00 lit 0A000202 lit ethinit assert
+			udpinit  BA27 lit udpbind dup esock ! 0 lit <> assert
+			esock @ 0A000202 lit BA26 lit "echo me" 7 lit udpsend assert
+			esock @ ewait dup 0 lit < if
+				drop " (no echo server on the host: skipped) " puts
+			else
+				7 lit asrt_eq  ebuf @ c@ 'e' lit asrt_eq  ebuf @ 6 lit + c@ 'e' lit asrt_eq
+				udpfrom BA26 lit asrt_eq 0A000202 lit asrt_eq
+			then
+		then
+	}
+}
+
+Bench {
+	\ a UDP round trip to the host's echo server, through slirp both ways
+	udprtt {
+		: bbuf variable ;  400 lit alloc bbuf !
+		: bsock variable ;
+		: bwait ( sock -- len|-1 )
+			mtime@ drop
+			begin
+				narm netpoll
+				over bbuf @ 400 lit udprecv dup 0 lit < if
+					drop mtime@ drop over - 989680 lit u< if nbit 186A0 lit wait drop 0 lit else -1 lit -1 lit then
+				else -1 lit then
+			until nip nip ;
+		netinit if
+			0A00020F lit FFFFFF00 lit 0A000202 lit ethinit if
+				udpinit  BA28 lit udpbind bsock !
+				bsock @ 0A000202 lit BA26 lit "probe" 5 lit udpsend drop
+				bsock @ bwait 0 lit < if bskip else
+					bgo
+					3E8 lit 0 lit do bsock @ 0A000202 lit BA26 lit "ping!" 5 lit udpsend drop bsock @ bwait drop loop
+					3E8 lit bops
+				then
+			else bskip then
+		else bskip then
+	}
+	\ datagrams out as fast as the NIC takes them (the echoes are drained, not waited for)
+	udptx {
+		netinit if
+			0A00020F lit FFFFFF00 lit 0A000202 lit ethinit if
+				udpinit  BA29 lit udpbind bsock !
+				bgo
+				3E8 lit 0 lit do
+					begin narm bsock @ 0A000202 lit BA26 lit "fire and forget" F lit udpsend 0= while nbit 989680 lit wait drop repeat
+					netpoll
+				loop
+				3E8 lit bops
+			else bskip then
+		else bskip then
+	}
+}

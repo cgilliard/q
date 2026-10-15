@@ -1,0 +1,144 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/udp.fam — UDP over src/ip.fam: sockets with receive queues, polled.
+\
+\   udpinit ( -- )                        once
+\   udpbind ( port -- sock|0 )            a socket on port; 0 when all 8 are taken
+\   udpclose ( sock -- )
+\   udpsend ( sock dstip dstport data len -- ok )   0 when the frame could not
+\                                         go (MAC unknown yet, or the NIC full)
+\   udprecv ( sock buf cap -- len | -1 )  the oldest queued datagram, copied
+\                                         (at most cap bytes); -1 when none
+\   udpfrom ( -- ip port )                where the last udprecv came from
+\   udpin   ( buf len -- )                a received packet (from ipin), queued
+\                                         on its port's socket or dropped
+\
+\ A socket queues up to 8 datagrams of up to 1524 bytes; when the queue is
+\ full new ones are dropped.  Datagrams larger than that are dropped.  Needs
+\ src/ip.fam before it.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: usk variable ;     \ 8 sockets x 16: +0 port (0 free) +4 ring +8 head +C tail
+: ups variable ;     \ the 12-byte pseudo header
+: ufrom variable ;  : ufport variable ;
+: ub variable ;  : uu variable ;  : us variable ;  : ud variable ;  : ur variable ;  : ul variable ;
+
+: umn ( a b -- min )  2dup u> if swap then drop ;
+
+: udpinit ( -- )
+	80 lit alloc dup usk ! 20 lit 0 lit do 0 lit over i 2 lit lshift + ! loop drop
+	8 lit 0 lit do 3000 lit alloc usk @ i 4 lit lshift + 4 lit + ! loop
+	10 lit alloc ups ! ;
+
+: udpfind ( port -- sock|0 )
+	0 lit 8 lit 0 lit do
+		dup 0= if drop dup i 4 lit lshift usk @ + dup @ 2 lit pick = if nip else 2drop 0 lit then then
+	loop nip ;
+
+: udpbind ( port -- sock|0 )
+	0 lit 8 lit 0 lit do
+		dup 0= if drop i 4 lit lshift usk @ + dup @ if drop 0 lit then then
+	loop
+	?dup if tuck !  0 lit over 8 lit + !  0 lit over C lit + ! else drop 0 lit then ;
+
+: udpclose ( sock -- )  0 lit swap ! ;
+
+\ uslot ( sock idx -- slot )  slot idx & 7 of the socket's ring
+: uslot  7 lit and 600 lit * swap 4 lit + @ + ;
+
+: udpin ( buf len -- )
+	drop dup ub !  dup c@ F lit and 2 lit lshift + uu !
+	uu @ 2 lit + be16@ udpfind ?dup if us !
+		uu @ 4 lit + be16@ 8 lit - ud !
+		ud @ 5F4 lit u> 0=  us @ C lit + @ us @ 8 lit + @ - 8 lit u<  and if
+			us @ us @ C lit + @ uslot
+			ub @ C lit + be32@ over !  uu @ be16@ over 4 lit + !  ud @ over 8 lit + !
+			uu @ 8 lit + swap C lit + ud @ mcopy
+			us @ C lit + dup @ 1 lit + swap !
+		then
+	then ;
+
+: udpsend ( sock dstip dstport data len -- ok )
+	dup ul !  ipbuf 8 lit + swap mcopy                 \ sock dstip dstport
+	ipbuf 2 lit + be16!                                \ sock dstip
+	over @ ipbuf be16!
+	ul @ 8 lit + ipbuf 4 lit + be16!
+	0 lit ipbuf 6 lit + be16!
+	ipaddr @ ups @ be32!  dup ups @ 4 lit + be32!  11 lit ups @ 8 lit + be16!  ul @ 8 lit + ups @ A lit + be16!
+	ups @ C lit 0 lit cksum ipbuf ul @ 8 lit + rot cksum ckfin ?dup 0= if FFFF lit then ipbuf 6 lit + be16!
+	11 lit ul @ 8 lit + ipsend nip ;
+
+: udprecv ( sock buf cap -- len | -1 )
+	2 lit pick dup C lit + @ over 8 lit + @ = if drop 2drop drop -1 lit else
+		dup dup 8 lit + @ uslot ur !
+		ur @ @ ufrom !  ur @ 4 lit + @ ufport !
+		8 lit + dup @ 1 lit + swap !                   \ head++      ( sock buf cap )
+		rot drop                                       \ buf cap
+		ur @ 8 lit + @ dup 2 lit pick umn              \ buf cap len n
+		ur @ C lit + 4 lit pick rot mcopy              \ buf cap len
+		nip nip
+	then ;
+
+: udpfrom ( -- ip port )  ufrom @ ufport @ ;
+
+\ ──────────────────────────────────────────────────────────────────────────────
+\ Tests on the scratch NIC (efake, from src/eth.fam's tests).  The live echo
+\ test and bench are in src/netin.fam, which has the dispatcher.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+Test {
+	udpbind {
+		udpinit
+		1F90 lit udpbind dup 0 lit <> assert dup @ 1F90 lit asrt_eq
+		1F90 lit udpfind over asrt_eq
+		1F91 lit udpfind 0 lit asrt_eq
+		7 lit 0 lit do i 2000 lit + udpbind 0 lit <> assert loop
+		3000 lit udpbind 0 lit asrt_eq                            \ all 8 taken
+		dup udpclose  3000 lit udpbind 0 lit <> assert
+		udpclose  1F90 lit udpfind 0 lit asrt_eq
+	}
+	\ a datagram in: queued on its socket with its source; the queue bounds
+	udpin {
+		: up variable ;  400 lit alloc up !
+		: ubuf variable ;  800 lit alloc ubuf !
+		: udgram ( port -- )   \ a 10.0.2.9:5555 -> us:port packet carrying "datagram!" into up
+			up @ 400 lit 0 lit do 0 lit over i + c! loop drop
+			45 lit up @ c!  25 lit up @ 2 lit + be16!  40 lit up @ 8 lit + c!  11 lit up @ 9 lit + c!
+			0A000209 lit up @ C lit + be32!  0A00020F lit up @ 10 lit + be32!
+			15B3 lit up @ 14 lit + be16!  up @ 16 lit + be16!  11 lit up @ 18 lit + be16!
+			"datagram!" up @ 1C lit + 9 lit mcopy
+			up @ 14 lit 0 lit cksum ckfin up @ A lit + be16! ;
+		1F90 lit udpbind
+		1F91 lit udgram  up @ 25 lit udpin                       \ nobody on 8081: dropped
+		dup ubuf @ 100 lit udprecv -1 lit asrt_eq
+		1F90 lit udgram  up @ 25 lit udpin
+		dup ubuf @ 100 lit udprecv 9 lit asrt_eq
+		ubuf @ c@ 'd' lit asrt_eq  ubuf @ 8 lit + c@ '!' lit asrt_eq
+		udpfrom 15B3 lit asrt_eq 0A000209 lit asrt_eq
+		dup ubuf @ 100 lit udprecv -1 lit asrt_eq
+		A lit 0 lit do up @ 25 lit udpin loop                    \ 10 in: 8 kept
+		dup C lit + @ over 8 lit + @ - 8 lit asrt_eq
+		8 lit 0 lit do dup ubuf @ 4 lit udprecv 9 lit asrt_eq loop   \ the length is the whole, the copy the cap
+		ubuf @ 4 lit + c@ 'g' lit asrt_eq
+		dup ubuf @ 100 lit udprecv -1 lit asrt_eq
+		udpclose
+	}
+	\ a datagram out: ports, length, a valid checksum, to the gateway for a far address
+	udpsend {
+		efake
+		0A00020F lit FFFFFF00 lit 0A000202 lit ipgw ! ipmask ! ipaddr !
+		800 lit alloc txf !  80 lit alloc dup arpt ! 20 lit 0 lit do 0 lit over i 2 lit lshift + ! loop drop  0 lit arpn !
+		8 lit alloc dup bcast ! 6 lit 0 lit do FF lit over i + c! loop drop
+		0A000202 lit "GWGWGW" arpadd
+		1F90 lit udpbind
+		dup C0A80001 lit 35 lit "hello" 5 lit udpsend assert
+		0 lit etx
+		dup "GWGWGW" emac assert
+		dup 17 lit + c@ 11 lit asrt_eq  dup 10 lit + be16@ 21 lit asrt_eq     \ 20 + 8 + 5
+		dup 22 lit + be16@ 1F90 lit asrt_eq  dup 24 lit + be16@ 35 lit asrt_eq  dup 26 lit + be16@ D lit asrt_eq
+		dup 2A lit + c@ 'h' lit asrt_eq
+		\ the checksum: pseudo header + datagram sums to zero
+		ipaddr @ ups @ be32!  C0A80001 lit ups @ 4 lit + be32!  11 lit ups @ 8 lit + be16!  D lit ups @ A lit + be16!
+		ups @ C lit 0 lit cksum over 22 lit + D lit rot cksum ckfin 0 lit asrt_eq
+		drop udpclose
+	}
+}

@@ -1,0 +1,176 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/ip.fam — IPv4 and ICMP echo over src/eth.fam.
+\
+\   ipbuf   ( -- addr )               where a layer builds its payload (after
+\                                     the 20-byte IP header in the frame)
+\   ipsend  ( dstip proto len -- ok ) send the payload at ipbuf
+\   ipin    ( buf len -- buf len proto | 0 )  a received packet, buf at its IP
+\                                     header: checked (version, length, ours,
+\                                     header checksum); ICMP echo is answered
+\                                     here and 0 returned; otherwise the
+\                                     protocol, with len the packet's length
+\   cksum   ( addr n sum -- sum' )    the Internet checksum's running sum
+\   ckfin   ( sum -- ck )             folded and complemented, 16 bits
+\   pingrx  ( -- addr )               variable: sequence of the last echo reply
+\ No fragmentation, no options on output.  Needs src/eth.fam before it.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: ipid variable ;  : pingrx variable ;
+: ib variable ;  : ih variable ;  : il variable ;
+
+: ipbuf ( -- addr )  ethbuf 14 lit + ;
+
+\ cksum ( addr n sum -- sum' )  machine code: add the 16-bit big-endian words
+\ of n bytes (an odd last byte as the high half) to sum
+: cksum
+03260100 ,   \ lw a2,0(sp)
+83254100 ,   \ lw a1,4(sp)
+03258100 ,   \ lw a0,8(sp)
+13018100 ,   \ addi sp,sp,8
+93022000 ,   \ li t0,2
+63E25502 ,   \ bltu a1,t0,38 <.L2^B1>
+03430500 ,   \ lbu t1,0(a0)
+83431500 ,   \ lbu t2,1(a0)
+13138300 ,   \ slli t1,t1,0x8
+33637300 ,   \ or t1,t1,t2
+33066600 ,   \ add a2,a2,t1
+13052500 ,   \ addi a0,a0,2
+9385E5FF ,   \ addi a1,a1,-2
+6FF0DFFD ,   \ j 10 <.L1^B1>
+63880500 ,   \ beqz a1,48 <.L3^B1>
+03430500 ,   \ lbu t1,0(a0)
+13138300 ,   \ slli t1,t1,0x8
+33066600 ,   \ add a2,a2,t1
+2320C100 ,   \ sw a2,0(sp)
+;
+
+: ckfin ( sum -- ck )  dup 10 lit rshift swap FFFF lit and + dup 10 lit rshift + invert FFFF lit and ;
+
+: ipsend ( dstip proto len -- ok )
+	ethbuf                                             \ dstip proto len h
+	45 lit over c!  0 lit over 1 lit + c!
+	over 14 lit + over 2 lit + be16!                   \ total length
+	ipid @ dup 1 lit + ipid ! over 4 lit + be16!
+	4000 lit over 6 lit + be16!                        \ don't fragment
+	40 lit over 8 lit + c!
+	2 lit pick over 9 lit + c!
+	0 lit over A lit + be16!
+	ipaddr @ over C lit + be32!
+	3 lit pick over 10 lit + be32!
+	dup 14 lit 0 lit cksum ckfin over A lit + be16!
+	drop nip 14 lit + 800 lit swap ethsend ;
+
+\ icmpin ( buf len -- )  answer an echo request; note an echo reply's sequence
+: icmpin
+	over c@ F lit and 2 lit lshift dup ih !  -  il !  ib !
+	ib @ ih @ + c@
+	dup 8 lit = if drop
+		ib @ ih @ + ipbuf il @ mcopy
+		0 lit ipbuf c!  0 lit ipbuf 2 lit + be16!
+		ipbuf il @ 0 lit cksum ckfin ipbuf 2 lit + be16!
+		ib @ C lit + be32@ 1 lit il @ ipsend drop
+	else 0 lit = if ib @ ih @ + 6 lit + be16@ pingrx ! then then ;
+
+: ipin ( buf len -- buf len proto | 0 )
+	dup 14 lit u< if 2drop 0 lit else
+		over c@ 4 lit rshift 4 lit <> if 2drop 0 lit else
+			over 2 lit + be16@                             \ buf len tlen
+			dup 2 lit pick u> if drop 2drop 0 lit else     \ truncated
+				nip                                        \ buf tlen
+				over 10 lit + be32@ ipaddr @ <> if 2drop 0 lit else
+					over dup c@ F lit and 2 lit lshift 0 lit cksum ckfin if 2drop 0 lit else
+						over 9 lit + c@ dup 1 lit = if drop icmpin 0 lit then
+					then
+				then
+			then
+		then
+	then ;
+
+\ ──────────────────────────────────────────────────────────────────────────────
+\ Tests: checksum vectors, a packet out and in on the scratch NIC (efake from
+\ src/eth.fam's tests), an echo answered, then a real ping of the gateway.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+Test {
+	cksum {
+		: ipk variable ;  40 lit alloc ipk !
+		\ the textbook header: 45 00 00 73 00 00 40 00 40 11 [b8 61] c0 a8 00 01 c0 a8 00 c7
+		4500 lit ipk @ be16!  73 lit ipk @ 2 lit + be16!  0 lit ipk @ 4 lit + be16!  4000 lit ipk @ 6 lit + be16!
+		4011 lit ipk @ 8 lit + be16!  0 lit ipk @ A lit + be16!  C0A80001 lit ipk @ C lit + be32!  C0A800C7 lit ipk @ 10 lit + be32!
+		ipk @ 14 lit 0 lit cksum ckfin B861 lit asrt_eq
+		B861 lit ipk @ A lit + be16!  ipk @ 14 lit 0 lit cksum ckfin 0 lit asrt_eq        \ with it in: zero
+		ipk @ 13 lit 0 lit cksum ipk @ 13 lit + c@ + ipk @ 14 lit 0 lit cksum asrt_eq                 \ odd length: the last byte is the high half
+		ipk @ 8 lit 0 lit cksum ipk @ 8 lit + C lit rot cksum ipk @ 14 lit 0 lit cksum asrt_eq      \ continued
+	}
+	ipsend {
+		efake
+		0A00020F lit FFFFFF00 lit 0A000202 lit ipgw ! ipmask ! ipaddr !
+		800 lit alloc txf !  80 lit alloc dup arpt ! 20 lit 0 lit do 0 lit over i 2 lit lshift + ! loop drop  0 lit arpn !
+		8 lit alloc dup bcast ! 6 lit 0 lit do FF lit over i + c! loop drop
+		0A000202 lit "GWGWGW" arpadd  0 lit ipid !
+		"payload" ipbuf 7 lit mcopy
+		C0A80001 lit 11 lit 7 lit ipsend assert
+		0 lit etx
+		dup ethtype 800 lit asrt_eq
+		dup E lit + c@ 45 lit asrt_eq
+		dup 10 lit + be16@ 1B lit asrt_eq                       \ 20 + 7
+		dup 14 lit + be16@ 4000 lit asrt_eq
+		dup 16 lit + c@ 40 lit asrt_eq  dup 17 lit + c@ 11 lit asrt_eq
+		dup 1A lit + be32@ 0A00020F lit asrt_eq  dup 1E lit + be32@ C0A80001 lit asrt_eq
+		dup E lit + 14 lit 0 lit cksum ckfin 0 lit asrt_eq
+		dup 22 lit + c@ 'p' lit asrt_eq
+		drop
+		C0A80001 lit 11 lit 7 lit ipsend assert  1 lit etx 12 lit + be16@ 1 lit asrt_eq   \ the id counts
+	}
+	\ ipin: ours, checked, the protocol returned; bad ones dropped
+	ipin {
+		: ipp variable ;  400 lit alloc ipp !
+		0 lit etx E lit + ipp @ 1B lit mcopy                   \ the packet just sent, as if received
+		0A00020F lit ipp @ 10 lit + be32!  0 lit ipp @ A lit + be16!
+		ipp @ 14 lit 0 lit cksum ckfin ipp @ A lit + be16!
+		ipp @ 40 lit ipin 11 lit asrt_eq 1B lit asrt_eq ipp @ asrt_eq   \ ( buf tlen proto ): trimmed to the packet
+		ipp @ 10 lit ipin 0 lit asrt_eq                          \ shorter than its length
+		ipp @ A lit + dup be16@ 1 lit + swap be16!  ipp @ 40 lit ipin 0 lit asrt_eq   \ bad checksum
+		ipp @ A lit + dup be16@ 1 lit - swap be16!
+		C0A80001 lit ipp @ 10 lit + be32!  ipp @ 14 lit 0 lit cksum ckfin ipp @ A lit + be16!
+		ipp @ 40 lit ipin 0 lit asrt_eq                          \ not for us
+	}
+	\ an echo request for us is answered to its sender with the same payload
+	icmp {
+		2 lit net @ 8 lit + @ 1002 lit + h!
+		ipp @ 400 lit 0 lit do 0 lit over i + c! loop drop
+		45 lit ipp @ c!  26 lit ipp @ 2 lit + be16!  40 lit ipp @ 8 lit + c!  1 lit ipp @ 9 lit + c!
+		0A000209 lit ipp @ C lit + be32!  0A00020F lit ipp @ 10 lit + be32!
+		8 lit ipp @ 14 lit + c!  1234 lit ipp @ 18 lit + be16!  7 lit ipp @ 1A lit + be16!  "ping-data!" ipp @ 1C lit + A lit mcopy
+		ipp @ 14 lit + 12 lit 0 lit cksum ckfin ipp @ 16 lit + be16!
+		ipp @ 14 lit 0 lit cksum ckfin ipp @ A lit + be16!
+		0A000209 lit "QRSTUV" arpadd
+		ipp @ 26 lit ipin 0 lit asrt_eq
+		2 lit etx
+		dup "QRSTUV" emac assert
+		dup 1E lit + be32@ 0A000209 lit asrt_eq  dup 17 lit + c@ 1 lit asrt_eq
+		dup 22 lit + c@ 0 lit asrt_eq  dup 26 lit + be16@ 1234 lit asrt_eq  dup 28 lit + be16@ 7 lit asrt_eq
+		dup 2A lit + c@ 'p' lit asrt_eq
+		dup 22 lit + 12 lit 0 lit cksum ckfin 0 lit asrt_eq
+		drop
+	}
+	\ the real gateway answers a ping
+	ping {
+		netinit if
+			0A00020F lit FFFFFF00 lit 0A000202 lit ethinit assert
+			0 lit pingrx !
+			8 lit ipbuf c!  0 lit ipbuf 1 lit + c!  0 lit ipbuf 2 lit + be16!  1 lit ipbuf 4 lit + be16!  2A lit ipbuf 6 lit + be16!
+			"hello, gateway" ipbuf 8 lit + E lit mcopy
+			ipbuf 16 lit 0 lit cksum ckfin ipbuf 2 lit + be16!
+			0A000202 lit 1 lit 16 lit ipsend assert
+			mtime@ drop
+			begin
+				narm
+				begin netrx while over ethtype 800 lit = if 2dup E lit - swap E lit + swap ipin ?dup if drop 2drop then then 2drop netrel repeat
+				pingrx @ 2A lit = if drop -1 lit -1 lit else
+					mtime@ drop over - 989680 lit u< if nbit 186A0 lit wait drop 0 lit else drop 0 lit -1 lit then
+				then
+			until assert
+		then
+	}
+}
