@@ -20,8 +20,8 @@
 \ Keys are byte strings up to 511 bytes, ordered bytewise then by length.
 \ Values up to 1 KiB live in the leaf; larger ones go to a chain of overflow
 \ pages (4 bytes link + 4088 payload each) and the leaf keeps a 4-byte
-\ reference, so the leaf fanout never collapses.  A transaction may dirty 64
-\ pages (the pager's pool), which caps one value near 200 KiB.
+\ reference, so the leaf fanout never collapses.  The pager's cache bounds a
+\ transaction (see src/pager.fam): 512 dirty pages in all, 16 per set.
 \
 \ Page: +0 type (1 leaf, 2 branch, 3 overflow)  +4 nkeys  +8 upper (the cell
 \ area grows down from 4096)  +16 slot[i] = page offset of cell i, in key
@@ -31,6 +31,12 @@
 \ < key i+1.  Cells are 4-byte multiples; a deleted cell's bytes stay until the
 \ page is compacted (when an insert needs the room).
 \
+\ A read walks the tree in one machine-code routine (tdesc: cache lookup,
+\ search and child step per level), falling back to the pager only to load a
+\ missing page; a write does the same walk and then copies what is not yet its
+\ own.  The leaf insert and delete (lput, cdel) and the cursor's step within a
+\ leaf (cnext, ccell) and the value copies are machine code too; splits and
+\ merges stay in fam.
 \ A put copies the root-to-leaf path once per transaction (pgcow), splits a
 \ full leaf in half and pushes the separator up, splitting branches as needed.
 \ A del removes the cell; an emptied leaf is unlinked and a root with one child
@@ -43,7 +49,7 @@
 \ ──────────────────────────────────────────────────────────────────────────────
 
 : st variable ;      \ +0 txns(16 x 16)  +4 cursors(16 x 0x50)  +8 scratch page
-                     \ +C path(8 x 8: pgno, idx)  +10 key scratch (512)
+                     \ +C path(8 x 16: pgno, idx, slot)  +10 key scratch (512)
 
 : stdie ( msg -- )  pgdie ;
 
@@ -132,26 +138,76 @@ B3836200 ,   \ add t2,t0,t1
 	2drop
 	4 lit + dup @ 1 lit - swap ! ;
 
-: ccp variable ;  : ccs variable ;  : ccu variable ;
-\ pgcmpct ( page -- )  rebuild the page without its dead cells
-: pgcmpct
-	ccp !  st @ 8 lit + @ ccs !  1000 lit ccu !
-	ccp @ ccs @ 10 lit mcopy
-	ccp @ 4 lit + @ ?dup if 0 lit do
-		ccp @ i pgcell                               \ cell
-		ccp @ over cellsz ccu @ swap - ccu !
-		ccs @ ccu @ + ccp @ 2 lit pick cellsz mcopy
-		ccu @ ccs @ i 2 lit lshift + 10 lit + !
-	loop then
-	ccu @ ccs @ 8 lit + !
-	ccs @ ccp @ 1000 lit mcopy ;
+\ pgcmpa ( page scratch -- )  rebuild the page without its dead cells, via the
+\ scratch page: machine code (the fam version cost 127 us per call, and a
+\ replace-heavy leaf compacts every few dozen puts)
+: pgcmpa
+83250100 ,   \ lw a1,0(sp)
+03254100 ,   \ lw a0,4(sp)
+13018100 ,   \ addi sp,sp,8
+83220500 ,   \ lw t0,0(a0)
+23A05500 ,   \ sw t0,0(a1)
+83224500 ,   \ lw t0,4(a0)
+23A25500 ,   \ sw t0,4(a1)
+8322C500 ,   \ lw t0,12(a0)
+23A65500 ,   \ sw t0,12(a1)
+03230500 ,   \ lw t1,0(a0)
+83234500 ,   \ lw t2,4(a0)
+371E0000 ,   \ lui t3,0x1
+930E0000 ,   \ li t4,0
+63F07E08 ,   \ bgeu t4,t2,b4 <.L7^B1>
+139F2E00 ,   \ slli t5,t4,0x2
+330FAF00 ,   \ add t5,t5,a0
+032F0F01 ,   \ lw t5,16(t5)
+330FAF00 ,   \ add t5,t5,a0
+835F0F00 ,   \ lhu t6,0(t5)
+13061000 ,   \ li a2,1
+6310C302 ,   \ bne t1,a2,70 <.L4^B1>
+83562F00 ,   \ lhu a3,2(t5)
+93F61600 ,   \ andi a3,a3,1
+63860600 ,   \ beqz a3,68 <.L2^B1>
+938F4F00 ,   \ addi t6,t6,4
+6F00C000 ,   \ j 70 <.L4^B1>
+83264F00 ,   \ lw a3,4(t5)
+B38FDF00 ,   \ add t6,t6,a3
+938FBF00 ,   \ addi t6,t6,11
+93FFCFFF ,   \ andi t6,t6,-4
+330EFE41 ,   \ sub t3,t3,t6
+3386C501 ,   \ add a2,a1,t3
+93962E00 ,   \ slli a3,t4,0x2
+B386B600 ,   \ add a3,a3,a1
+23A8C601 ,   \ sw t3,16(a3)
+93860F00 ,   \ mv a3,t6
+638E0600 ,   \ beqz a3,ac <.L6^B1>
+03270F00 ,   \ lw a4,0(t5)
+2320E600 ,   \ sw a4,0(a2)
+130F4F00 ,   \ addi t5,t5,4
+13064600 ,   \ addi a2,a2,4
+9386C6FF ,   \ addi a3,a3,-4
+6FF09FFE ,   \ j 90 <.L5^B1>
+938E1E00 ,   \ addi t4,t4,1
+6FF05FF8 ,   \ j 34 <.L1^B1>
+23A4C501 ,   \ sw t3,8(a1)
+938E0500 ,   \ mv t4,a1
+130F0500 ,   \ mv t5,a0
+B71F0000 ,   \ lui t6,0x1
+03A60E00 ,   \ lw a2,0(t4)
+2320CF00 ,   \ sw a2,0(t5)
+938E4E00 ,   \ addi t4,t4,4
+130F4F00 ,   \ addi t5,t5,4
+938FCFFF ,   \ addi t6,t6,-4 # ffc <.L8^B1+0xf38>
+E3960FFE ,   \ bnez t6,c4 <.L8^B1>
+;
+
+: pgcmpct ( page -- )  st @ 8 lit + @ pgcmpa ;
 
 \ pginit ( pgno addr type -- pgno addr )  a fresh tree page
 : pginit  over !  0 lit over 4 lit + !  1000 lit over 8 lit + ! ;
 
 \ ── overflow chains ───────────────────────────────────────────────────────────
 
-: ovp variable ;
+: pb variable ;      \ the put parameters: +0 key +4 klen +8 val +C vlen +10 ovf +14 overflow page
+: ovp pb @ 14 lit + ;
 : owv variable ;  : owc variable ;  : owp variable ;  : owf variable ;
 : orb variable ;  : orc variable ;
 
@@ -208,41 +264,202 @@ B3836200 ,   \ add t2,t0,t1
 \ ── the path: root to leaf, one (pgno, idx) per level ─────────────────────────
 
 : depth variable ;   : lidx variable ;   : lfound variable ;
-: pathpg  ( i -- pgno )   3 lit lshift st @ C lit + @ + @ ;
-: pathpg! ( pgno i -- )   3 lit lshift st @ C lit + @ + ! ;
-: pathix  ( i -- idx )    3 lit lshift st @ C lit + @ + 4 lit + @ ;
-: pathix! ( idx i -- )    3 lit lshift st @ C lit + @ + 4 lit + ! ;
+: pathpg  ( i -- pgno )   4 lit lshift st @ C lit + @ + @ ;
+: pathpg! ( pgno i -- )   4 lit lshift st @ C lit + @ + ! ;
+: pathix  ( i -- idx )    4 lit lshift st @ C lit + @ + 4 lit + @ ;
+: pathix! ( idx i -- )    4 lit lshift st @ C lit + @ + 4 lit + ! ;
+: pathsl  ( i -- slot )   4 lit lshift st @ C lit + @ + 8 lit + @ ;
 : leafpg  ( -- pgno )     depth @ 1 lit - pathpg ;
+
+\ ── the read descent, machine code ────────────────────────────────────────────
+\ tdesc ( tb -- )  walk from tb.pgno to the leaf for tb.key: at each level look
+\ the page up in its cache set (stamping it), binary-search it, record
+\ (pgno, idx) in the path, and step to the child.  Ends with found = -1 (key at
+\ idx), 0 (not there, idx = insertion point) and the leaf's address, or
+\ found = 1 when a page is not cached: tb.pgno is that page, and the caller
+\ loads it and starts over.  Block tb: +00 key +04 klen +08 pgno +0C idx
+\ +10 found +14 depth +18 cache slots +1C path +20 leaf addr +24 &stamp tick
+\ +28 &depth +2C &lidx +30 &lfound: the fam variables, written directly at the
+\ leaf so no fam glue copies them out.
+\ A path entry is 16 bytes: pgno, idx, the cache slot the page was found in
+\ (a hint for the copy-on-write pass; it may have been evicted since), pad.
+: tdesc
+03250100 ,   \ lw a0,0(sp)
+13014100 ,   \ addi sp,sp,4
+83268500 ,   \ lw a3,8(a0)
+232A0500 ,   \ sw zero,20(a0)
+03278501 ,   \ lw a4,24(a0)
+93F7F601 ,   \ andi a5,a3,31
+93978700 ,   \ slli a5,a5,0x8
+3307F700 ,   \ add a4,a4,a5
+93070710 ,   \ addi a5,a4,256
+03280700 ,   \ lw a6,0(a4)
+630ED800 ,   \ beq a6,a3,44 <.L12^B1>
+13070701 ,   \ addi a4,a4,16
+E36AF7FE ,   \ bltu a4,a5,24 <.L11^B1>
+2324D500 ,   \ sw a3,8(a0)
+13081000 ,   \ li a6,1
+23280501 ,   \ sw a6,16(a0)
+6F008015 ,   \ j 198 <.L19^B1>
+83274502 ,   \ lw a5,36(a0)
+03A80700 ,   \ lw a6,0(a5)
+13081800 ,   \ addi a6,a6,1
+23A00701 ,   \ sw a6,0(a5)
+23260701 ,   \ sw a6,12(a4)
+83274501 ,   \ lw a5,20(a0)
+93974700 ,   \ slli a5,a5,0x4
+0328C501 ,   \ lw a6,28(a0)
+B3870701 ,   \ add a5,a5,a6
+23A0D700 ,   \ sw a3,0(a5)
+23A4E700 ,   \ sw a4,8(a5)
+03278700 ,   \ lw a4,8(a4)
+83250500 ,   \ lw a1,0(a0)
+03264500 ,   \ lw a2,4(a0)
+93020000 ,   \ li t0,0
+03234700 ,   \ lw t1,4(a4)
+63F06208 ,   \ bgeu t0,t1,104 <.L17^B1>
+B3836200 ,   \ add t2,t0,t1
+93D31300 ,   \ srli t2,t2,0x1
+139E2300 ,   \ slli t3,t2,0x2
+330EEE00 ,   \ add t3,t3,a4
+032E0E01 ,   \ lw t3,16(t3)
+330EEE00 ,   \ add t3,t3,a4
+835F0E00 ,   \ lhu t6,0(t3)
+930E8E00 ,   \ addi t4,t3,8
+138F0F00 ,   \ mv t5,t6
+6364CF00 ,   \ bltu t5,a2,b4 <.L1^B1>
+130F0600 ,   \ mv t5,a2
+13880E00 ,   \ mv a6,t4
+93880500 ,   \ mv a7,a1
+63020F02 ,   \ beqz t5,e0 <.L5^B1>
+034E0800 ,   \ lbu t3,0(a6)
+83CE0800 ,   \ lbu t4,0(a7)
+6366DE03 ,   \ bltu t3,t4,f4 <.L15^B1>
+63E8CE03 ,   \ bltu t4,t3,fc <.L16^B1>
+13081800 ,   \ addi a6,a6,1
+93881800 ,   \ addi a7,a7,1
+130FFFFF ,   \ addi t5,t5,-1
+6FF01FFE ,   \ j bc <.L2^B1>
+63EACF00 ,   \ bltu t6,a2,f4 <.L15^B1>
+636CF601 ,   \ bltu a2,t6,fc <.L16^B1>
+93820300 ,   \ mv t0,t2
+1303F0FF ,   \ li t1,-1
+6F008001 ,   \ j 108 <.L18^B1>
+93821300 ,   \ addi t0,t2,1
+6FF0DFF8 ,   \ j 84 <.L13^B1>
+13830300 ,   \ mv t1,t2
+6FF05FF8 ,   \ j 84 <.L13^B1>
+13030000 ,   \ li t1,0
+83270700 ,   \ lw a5,0(a4)
+13081000 ,   \ li a6,1
+63960705 ,   \ bne a5,a6,15c <.L14^B1>
+83274501 ,   \ lw a5,20(a0)
+13984700 ,   \ slli a6,a5,0x4
+8328C501 ,   \ lw a7,28(a0)
+33081801 ,   \ add a6,a6,a7
+23225800 ,   \ sw t0,4(a6)
+93871700 ,   \ addi a5,a5,1
+232AF500 ,   \ sw a5,20(a0)
+2324D500 ,   \ sw a3,8(a0)
+23265500 ,   \ sw t0,12(a0)
+23286500 ,   \ sw t1,16(a0)
+2320E502 ,   \ sw a4,32(a0)
+03288502 ,   \ lw a6,40(a0)
+2320F800 ,   \ sw a5,0(a6)
+0328C502 ,   \ lw a6,44(a0)
+23205800 ,   \ sw t0,0(a6)
+03280503 ,   \ lw a6,48(a0)
+23206800 ,   \ sw t1,0(a6)
+6F000004 ,   \ j 198 <.L19^B1>
+63140300 ,   \ bnez t1,164 <.L3^B1>
+9382F2FF ,   \ addi t0,t0,-1
+83274501 ,   \ lw a5,20(a0)
+13984700 ,   \ slli a6,a5,0x4
+8328C501 ,   \ lw a7,28(a0)
+33081801 ,   \ add a6,a6,a7
+23225800 ,   \ sw t0,4(a6)
+93871700 ,   \ addi a5,a5,1
+232AF500 ,   \ sw a5,20(a0)
+13982200 ,   \ slli a6,t0,0x2
+3308E800 ,   \ add a6,a6,a4
+03280801 ,   \ lw a6,16(a6)
+3308E800 ,   \ add a6,a6,a4
+83264800 ,   \ lw a3,4(a6)
+6FF0DFE7 ,   \ j 10 <.L10^B1>
+;            \ done:
+
+: tb variable ;  : droot variable ;
+\ rdesc ( root key klen -- )  the read descent: tdesc, loading each page it
+\ finds missing and starting over, then depth/lidx/lfound as descend leaves them
+: rdesc
+	tb @ 4 lit + !  tb @ !  dup droot !  tb @ 8 lit + !
+	tb @ tdesc
+	tb @ 10 lit + @ 1 lit = if                               \ a page to load: rare
+		begin
+			tb @ 8 lit + @ pgget drop  droot @ tb @ 8 lit + !  tb @ tdesc
+			tb @ 10 lit + @ 1 lit = 0=
+		until
+	then ;
 
 : dk variable ;  : dkl variable ;  : dcow variable ;
 \ descend ( txn key klen cow? -- )  fill the path for key; with cow?, copy every
 \ page on it (pgcow) and point each parent at its copy.  Leaves lidx/lfound.
+\ A read goes through rdesc (machine code); the copying walk stays in fam.
+: wdesc ( txn -- )
+	dup root@ dk @ dkl @ rdesc                               \ txn   (the path, no copying)
+	\ a page is only ever ours if its parent is: when the leaf is, the whole path is
+	depth @ 1 lit - dup pathsl dup @ rot pathpg = swap 4 lit + @ 2 lit and and if drop else
+		depth @ 0 lit do
+			i pathpg i pathsl                                \ txn pgno slot
+			dup @ 2 lit pick = over 4 lit + @ 2 lit and and 0= if   \ not already ours
+				drop pgcow                                   \ txn pgno' addr'
+				i depth @ 1 lit - = if tb @ 20 lit + ! else drop then   \ the leaf's new address
+				dup i pathpg!
+				i 0= if over root!
+				else i 1 lit - pathpg pgget i 1 lit - pathix pgcell 4 lit + ! then
+			else 2drop then
+		loop drop
+	then ;
+
 : descend
 	dcow ! dkl ! dk !
-	dup root@ dcow @ if pgcow drop 2dup swap root! then nip    \ pgno
-	0 lit depth !
-	begin
-		dup depth @ pathpg!
-		dup pgget                                            \ pgno page
-		dup @ 1 lit = if
-			dk @ dkl @ pgsearch lfound ! dup lidx ! depth @ pathix!
-			depth @ 1 lit + depth !  -1 lit
-		else
-			dk @ dkl @ pgsearch if else 1 lit - then         \ pgno ci
-			dup depth @ pathix!
-			over pgget over pgcell 4 lit + @                 \ pgno ci child
-			dcow @ if
-				pgcow drop                                   \ pgno ci child'
-				dup 3 lit pick pgget 3 lit pick pgcell 4 lit + !   \ parent cell -> child'
-			then
-			nip nip
-			depth @ 1 lit + depth !  0 lit
-		then
-	until drop ;
+	dcow @ 0= if root@ dk @ dkl @ rdesc else wdesc then ;
+
+
 
 \ ── get ───────────────────────────────────────────────────────────────────────
 
 : gbuf variable ;  : gcap variable ;
+
+\ lcopya ( cell buf cap -- vlen | -2 )  machine code: an inline value into buf
+\ (at most cap bytes); -2 for an overflow value (lcopy handles those)
+: lcopya
+83260100 ,   \ lw a3,0(sp)
+03264100 ,   \ lw a2,4(sp)
+032F8100 ,   \ lw t5,8(sp)
+13018100 ,   \ addi sp,sp,8
+83520F00 ,   \ lhu t0,0(t5)
+03532F00 ,   \ lhu t1,2(t5)
+13731300 ,   \ andi t1,t1,1
+63080300 ,   \ beqz t1,2c <.L3^B1>
+9302E0FF ,   \ li t0,-2
+23205100 ,   \ sw t0,0(sp)
+6F00C003 ,   \ j 64 <.L9^B1>
+83234F00 ,   \ lw t2,4(t5)
+930E8F00 ,   \ addi t4,t5,8
+B38E5E00 ,   \ add t4,t4,t0
+138E0300 ,   \ mv t3,t2
+6364DE00 ,   \ bltu t3,a3,44 <.L4^B1>
+138E0600 ,   \ mv t3,a3
+630E0E00 ,   \ beqz t3,60 <.L5^B1>
+83CF0E00 ,   \ lbu t6,0(t4)
+2300F601 ,   \ sb t6,0(a2)
+938E1E00 ,   \ addi t4,t4,1
+13061600 ,   \ addi a2,a2,1
+130EFEFF ,   \ addi t3,t3,-1
+6FF09FFE ,   \ j 44 <.L4^B1>
+23207100 ,   \ sw t2,0(sp)
+;
 
 \ lcopy ( cell -- vlen )  the cell's value into gbuf (at most gcap bytes)
 : lcopy
@@ -256,27 +473,20 @@ B3836200 ,   \ add t2,t0,t1
 
 : get ( txn key klen buf cap -- vlen|-1 )
 	gcap ! gbuf !
-	2 lit pick root@ 0= if 2drop drop -1 lit else
-		0 lit descend
-		lfound @ if leafpg pgget lidx @ pgcell lcopy else -1 lit then
+	rot root@ ?dup 0= if 2drop -1 lit else
+		-rot rdesc
+		lfound @ if
+			tb @ 20 lit + @ lidx @ pgcell dup gbuf @ gcap @ lcopya dup -2 lit = if drop lcopy else nip then
+		else -1 lit then
 	then ;
 
 \ ── put ───────────────────────────────────────────────────────────────────────
 
-: pt variable ;  : pk variable ;  : pkl variable ;  : pv variable ;  : pvl variable ;  : pov variable ;
+: pt variable ;
+: pk pb @ ;  : pkl pb @ 4 lit + ;  : pv pb @ 8 lit + ;  : pvl pb @ C lit + ;  : pov pb @ 10 lit + ;
 : bk variable ;  : bkl variable ;  : bc variable ;  : blv variable ;  : bpg variable ;  : bsz variable ;
 : bsa variable ;  : bsn variable ;  : bsh variable ;  : bskl variable ;
 : lsp variable ;  : lsn variable ;  : lsa variable ;  : lsh variable ;  : lvl variable ;
-
-\ lcell! ( cell key klen val n vlen ovf -- )  write a leaf cell; n bytes of
-\ value data (the bytes, or the 4-byte overflow page number)
-: lcell!
-	6 lit pick 2 lit + h!                                    \ flags
-	5 lit pick 4 lit + !                                     \ vlen
-	2 lit pick 5 lit pick h!                                 \ klen
-	4 lit pick 8 lit + 3 lit pick +                          \ cell key klen val n dst
-	swap mcopy                                               \ value
-	rot 8 lit + swap mcopy ;                                 \ key
 
 : bcell! ( cell -- )  bkl @ over h!  bc @ over 4 lit + !  bk @ swap 8 lit + bkl @ mcopy ;
 
@@ -336,19 +546,139 @@ B3836200 ,   \ add t2,t0,t1
 	lsa @ 0 lit pgcell dup 8 lit + swap h@ lsn @ lvl @ 1 lit - brins
 	lidx @ lsh @ u> if lidx @ lsh @ - lidx ! lsa @ else lsp @ then ;
 
-\ lkill ( page idx -- )  remove a leaf cell, freeing its overflow chain
-: lkill
-	2dup pgcell dup 2 lit + h@ 1 lit and if
-		dup 8 lit + over h@ + ovp 4 lit mcopy ovp @ ovfree
-	then drop celldel ;
+\ cdel ( page idx -- ovfpg|0 )  celldel in machine code for the leaf hot path;
+\ returns the removed cell's overflow page (0 if its value was inline) so the
+\ caller can free the chain
+: cdel
+83250100 ,   \ lw a1,0(sp)
+03254100 ,   \ lw a0,4(sp)
+13014100 ,   \ addi sp,sp,4
+93922500 ,   \ slli t0,a1,0x2
+B382A200 ,   \ add t0,t0,a0
+83A20201 ,   \ lw t0,16(t0)
+B382A200 ,   \ add t0,t0,a0
+03D32200 ,   \ lhu t1,2(t0)
+13731300 ,   \ andi t1,t1,1
+630E0302 ,   \ beqz t1,60 <.L2^B1>
+83D30200 ,   \ lhu t2,0(t0)
+B3835300 ,   \ add t2,t2,t0
+93838300 ,   \ addi t2,t2,8
+03C30300 ,   \ lbu t1,0(t2)
+03CE1300 ,   \ lbu t3,1(t2)
+131E8E00 ,   \ slli t3,t3,0x8
+3363C301 ,   \ or t1,t1,t3
+03CE2300 ,   \ lbu t3,2(t2)
+131E0E01 ,   \ slli t3,t3,0x10
+3363C301 ,   \ or t1,t1,t3
+03CE3300 ,   \ lbu t3,3(t2)
+131E8E01 ,   \ slli t3,t3,0x18
+3363C301 ,   \ or t1,t1,t3
+6F008000 ,   \ j 64 <.L3^B1>
+13030000 ,   \ li t1,0
+23206100 ,   \ sw t1,0(sp)
+83224500 ,   \ lw t0,4(a0)
+9382F2FF ,   \ addi t0,t0,-1
+63FE5500 ,   \ bgeu a1,t0,8c <.L5^B1>
+93932500 ,   \ slli t2,a1,0x2
+B383A300 ,   \ add t2,t2,a0
+03AE4301 ,   \ lw t3,20(t2)
+23A8C301 ,   \ sw t3,16(t2)
+93851500 ,   \ addi a1,a1,1
+6FF09FFE ,   \ j 70 <.L4^B1>
+23225500 ,   \ sw t0,4(a0)
+;
 
-\ lins ( -- )  the pending cell into the leaf at lidx
+\ cdelx ( page idx -- )  the old form, for the tests and probes
+: cdelx cdel drop ;
+
+
+\ lput ( page idx pb -- flag )  the leaf insert in machine code: the cell for
+\ the parameters in pb (key, klen, val, vlen, ovf; the overflow page number
+\ stands in for the value bytes when ovf is set) at slot idx; 0 when the page
+\ lacks room for the cell and its slot
+: lput
+83280100 ,   \ lw a7,0(sp)
+83254100 ,   \ lw a1,4(sp)
+03258100 ,   \ lw a0,8(sp)
+13018100 ,   \ addi sp,sp,8
+03A60800 ,   \ lw a2,0(a7)
+83A64800 ,   \ lw a3,4(a7)
+03A8C800 ,   \ lw a6,12(a7)
+83AF0801 ,   \ lw t6,16(a7)
+93FF1F00 ,   \ andi t6,t6,1
+63880F00 ,   \ beqz t6,34 <.L0^B1>
+13874801 ,   \ addi a4,a7,20
+93074000 ,   \ li a5,4
+6F00C000 ,   \ j 3c <.L10^B1>
+03A78800 ,   \ lw a4,8(a7)
+93070800 ,   \ mv a5,a6
+B382F600 ,   \ add t0,a3,a5
+9382B200 ,   \ addi t0,t0,11
+93F2C2FF ,   \ andi t0,t0,-4
+03238500 ,   \ lw t1,8(a0)
+032E4500 ,   \ lw t3,4(a0)
+93132E00 ,   \ slli t2,t3,0x2
+33037340 ,   \ sub t1,t1,t2
+130303FF ,   \ addi t1,t1,-16
+93834200 ,   \ addi t2,t0,4
+6362730A ,   \ bltu t1,t2,104 <.L9^B1>
+83238500 ,   \ lw t2,8(a0)
+B3835340 ,   \ sub t2,t2,t0
+63FEC501 ,   \ bgeu a1,t3,88 <.L2^B1>
+931E2E00 ,   \ slli t4,t3,0x2
+B38EAE00 ,   \ add t4,t4,a0
+03AFCE00 ,   \ lw t5,12(t4)
+23A8EE01 ,   \ sw t5,16(t4)
+130EFEFF ,   \ addi t3,t3,-1
+6FF09FFE ,   \ j 6c <.L1^B1>
+939E2500 ,   \ slli t4,a1,0x2
+B38EAE00 ,   \ add t4,t4,a0
+23A87E00 ,   \ sw t2,16(t4)
+23247500 ,   \ sw t2,8(a0)
+032E4500 ,   \ lw t3,4(a0)
+130E1E00 ,   \ addi t3,t3,1
+2322C501 ,   \ sw t3,4(a0)
+B30E7500 ,   \ add t4,a0,t2
+2390DE00 ,   \ sh a3,0(t4)
+2391FE01 ,   \ sh t6,2(t4)
+23A20E01 ,   \ sw a6,4(t4)
+938E8E00 ,   \ addi t4,t4,8
+138F0600 ,   \ mv t5,a3
+630E0F00 ,   \ beqz t5,d8 <.L4^B1>
+03430600 ,   \ lbu t1,0(a2)
+23806E00 ,   \ sb t1,0(t4)
+13061600 ,   \ addi a2,a2,1
+938E1E00 ,   \ addi t4,t4,1
+130FFFFF ,   \ addi t5,t5,-1
+6FF09FFE ,   \ j bc <.L3^B1>
+138F0700 ,   \ mv t5,a5
+630E0F00 ,   \ beqz t5,f8 <.L6^B1>
+03430700 ,   \ lbu t1,0(a4)
+23806E00 ,   \ sb t1,0(t4)
+13071700 ,   \ addi a4,a4,1
+938E1E00 ,   \ addi t4,t4,1
+130FFFFF ,   \ addi t5,t5,-1
+6FF09FFE ,   \ j dc <.L5^B1>
+1303F0FF ,   \ li t1,-1
+23206100 ,   \ sw t1,0(sp)
+6F008000 ,   \ j 108 <.L8^B1>
+23200100 ,   \ sw zero,0(sp)
+;
+
+
+\ lkill ( page idx -- )  remove a leaf cell, freeing its overflow chain
+: lkill  cdel ?dup if ovfree then ;
+
+\ lins ( -- )  the pending cell into the leaf at lidx: lput, making room by
+\ compaction and then by a split when it refuses
 : lins
-	lcsz depth @ 1 lit - dup lvl ! pathpg pgget              \ size page
-	dup pgfreesp 2 lit pick 4 lit + u< if dup pgcmpct then           \ the cell and its slot
-	dup pgfreesp 2 lit pick 4 lit + u< if lsplit then
-	lidx @ 2 lit pick cellins                                \ size cell
-	pk @ pkl @ pov @ if ovp 4 lit else pv @ pvl @ then pvl @ pov @ lcell! drop ;
+	depth @ 1 lit - lvl !  tb @ 20 lit + @                   \ page (from the descent)
+	begin
+		dup lidx @ pb @ lput 0=
+	while
+		dup pgfreesp lcsz 4 lit + u< if dup pgcmpct then
+		dup pgfreesp lcsz 4 lit + u< if lcsz swap lsplit nip then
+	repeat drop ;
 
 : put ( txn key klen val vlen -- )
 	pvl ! pv ! pkl ! pk ! pt !
@@ -357,7 +687,7 @@ B3836200 ,   \ add t2,t0,t1
 	pvl @ 400 lit u> dup pov ! if pv @ pvl @ ovwrite ovp ! then
 	pt @ root@ 0= if pgnew 1 lit pginit drop pt @ root! then
 	pt @ pk @ pkl @ -1 lit descend
-	lfound @ if leafpg pgget lidx @ lkill then
+	lfound @ if tb @ 20 lit + @ lidx @ lkill then
 	lins ;
 
 \ ── del ───────────────────────────────────────────────────────────────────────
@@ -388,7 +718,7 @@ B3836200 ,   \ add t2,t0,t1
 	pt @ wtx? 0= if "store: del in a read transaction" stdie then
 	pt @ root@ 0= if 2drop drop 0 lit else
 		-1 lit descend
-		lfound @ if leafpg pgget lidx @ lkill lshrink -1 lit else 0 lit then
+		lfound @ if tb @ 20 lit + @ lidx @ lkill lshrink -1 lit else 0 lit then
 	then ;
 
 \ ── cursors ───────────────────────────────────────────────────────────────────
@@ -408,6 +738,170 @@ B3836200 ,   \ add t2,t0,t1
 	tuck !  0 lit over 4 lit + ! ;
 
 : curclose ( cur -- )  0 lit swap ! ;
+
+\ cnext ( cur slots -- flag )  machine code: step to the next key within the
+\ current leaf (the usual case); 0 when the leaf is exhausted or not cached
+: cnext
+83250100 ,   \ lw a1,0(sp)          ( slots )
+03254100 ,   \ lw a0,4(sp)          ( cur )
+13014100 ,   \ addi sp,sp,4
+83228500 ,   \ lw t0,8(a0)
+9382F2FF ,   \ addi t0,t0,-1        ( leaf level )
+13933200 ,   \ slli t1,t0,0x3
+3303A300 ,   \ add t1,t1,a0
+1303C300 ,   \ addi t1,t1,12        ( &path[leaf] )
+83230300 ,   \ lw t2,0(t1)          ( pgno )
+13FEF301 ,   \ andi t3,t2,31
+131E8E00 ,   \ slli t3,t3,0x8
+330EBE00 ,   \ add t3,t3,a1         ( set )
+930E0E10 ,   \ addi t4,t3,256
+032F0E00 ,   \ scan: lw t5,0(t3)
+63087F00 ,   \ beq t5,t2,hit
+130E0E01 ,   \ addi t3,t3,16
+E36ADEFF ,   \ bltu t3,t4,scan
+6F008002 ,   \ j no
+032E8E00 ,   \ hit: lw t3,8(t3)     ( page )
+032F4300 ,   \ lw t5,4(t1)
+130F1F00 ,   \ addi t5,t5,1         ( idx + 1 )
+832F4E00 ,   \ lw t6,4(t3)
+637AFF01 ,   \ bgeu t5,t6,no        ( past the last cell )
+2322E301 ,   \ sw t5,4(t1)
+930FF0FF ,   \ li t6,-1
+2320F101 ,   \ sw t6,0(sp)
+6F008000 ,   \ j done
+23200100 ,   \ no: sw zero,0(sp)
+;            \ done:
+
+\ ccell ( cur slots -- cell|0 )  machine code: the cursor's cell, 0 when the
+\ leaf is not cached
+: ccell
+83250100 ,   \ lw a1,0(sp)
+03254100 ,   \ lw a0,4(sp)
+13014100 ,   \ addi sp,sp,4
+83228500 ,   \ lw t0,8(a0)
+9382F2FF ,   \ addi t0,t0,-1
+13933200 ,   \ slli t1,t0,0x3
+3303A300 ,   \ add t1,t1,a0
+1303C300 ,   \ addi t1,t1,12
+83230300 ,   \ lw t2,0(t1)
+13FEF301 ,   \ andi t3,t2,31
+131E8E00 ,   \ slli t3,t3,0x8
+330EBE00 ,   \ add t3,t3,a1
+930E0E10 ,   \ addi t4,t3,256
+032F0E00 ,   \ scan: lw t5,0(t3)
+630A7F00 ,   \ beq t5,t2,hit
+130E0E01 ,   \ addi t3,t3,16
+E36ADEFF ,   \ bltu t3,t4,scan
+23200100 ,   \ sw zero,0(sp)
+6F000002 ,   \ j done
+032E8E00 ,   \ hit: lw t3,8(t3)
+032F4300 ,   \ lw t5,4(t1)
+131F2F00 ,   \ slli t5,t5,0x2
+330FCF01 ,   \ add t5,t5,t3
+032F0F01 ,   \ lw t5,16(t5)
+330FCF01 ,   \ add t5,t5,t3         ( page + slot[idx] )
+2320E101 ,   \ sw t5,0(sp)
+;            \ done:
+
+\ cval ( buf cap cur slots -- vlen | -1 | -2 )  machine code: the cursor's
+\ value into buf (at most cap bytes); -1 when the leaf is not cached, -2 for
+\ an overflow value (curcell lcopy handles both)
+: cval
+83250100 ,   \ lw a1,0(sp)
+03254100 ,   \ lw a0,4(sp)
+83268100 ,   \ lw a3,8(sp)
+0326C100 ,   \ lw a2,12(sp)
+1301C100 ,   \ addi sp,sp,12
+83228500 ,   \ lw t0,8(a0)
+9382F2FF ,   \ addi t0,t0,-1
+13933200 ,   \ slli t1,t0,0x3
+3303A300 ,   \ add t1,t1,a0
+1303C300 ,   \ addi t1,t1,12
+83230300 ,   \ lw t2,0(t1)
+13FEF301 ,   \ andi t3,t2,31
+131E8E00 ,   \ slli t3,t3,0x8
+330EBE00 ,   \ add t3,t3,a1
+930E0E10 ,   \ addi t4,t3,256
+032F0E00 ,   \ lw t5,0(t3)
+630C7F00 ,   \ beq t5,t2,58 <.L2^B1>
+130E0E01 ,   \ addi t3,t3,16
+E36ADEFF ,   \ bltu t3,t4,3c <.L1^B1>
+9302F0FF ,   \ li t0,-1
+23205100 ,   \ sw t0,0(sp)
+6F000007 ,   \ j c4 <.L9^B1>
+032E8E00 ,   \ lw t3,8(t3)
+032F4300 ,   \ lw t5,4(t1)
+131F2F00 ,   \ slli t5,t5,0x2
+330FCF01 ,   \ add t5,t5,t3
+032F0F01 ,   \ lw t5,16(t5)
+330FCF01 ,   \ add t5,t5,t3
+83520F00 ,   \ lhu t0,0(t5)
+03532F00 ,   \ lhu t1,2(t5)
+13731300 ,   \ andi t1,t1,1
+63080300 ,   \ beqz t1,8c <.L3^B1>
+9302E0FF ,   \ li t0,-2
+23205100 ,   \ sw t0,0(sp)
+6F00C003 ,   \ j c4 <.L9^B1>
+83234F00 ,   \ lw t2,4(t5)
+930E8F00 ,   \ addi t4,t5,8
+B38E5E00 ,   \ add t4,t4,t0
+138E0300 ,   \ mv t3,t2
+6364DE00 ,   \ bltu t3,a3,a4 <.L4^B1>
+138E0600 ,   \ mv t3,a3
+630E0E00 ,   \ beqz t3,c0 <.L5^B1>
+83CF0E00 ,   \ lbu t6,0(t4)
+2300F601 ,   \ sb t6,0(a2)
+938E1E00 ,   \ addi t4,t4,1
+13061600 ,   \ addi a2,a2,1
+130EFEFF ,   \ addi t3,t3,-1
+6FF09FFE ,   \ j a4 <.L4^B1>
+23207100 ,   \ sw t2,0(sp)
+;
+
+\ ckey ( buf cap cur slots -- klen | -1 )  the same for the key
+: ckey
+83250100 ,   \ lw a1,0(sp)
+03254100 ,   \ lw a0,4(sp)
+83268100 ,   \ lw a3,8(sp)
+0326C100 ,   \ lw a2,12(sp)
+1301C100 ,   \ addi sp,sp,12
+83228500 ,   \ lw t0,8(a0)
+9382F2FF ,   \ addi t0,t0,-1
+13933200 ,   \ slli t1,t0,0x3
+3303A300 ,   \ add t1,t1,a0
+1303C300 ,   \ addi t1,t1,12
+83230300 ,   \ lw t2,0(t1)
+13FEF301 ,   \ andi t3,t2,31
+131E8E00 ,   \ slli t3,t3,0x8
+330EBE00 ,   \ add t3,t3,a1
+930E0E10 ,   \ addi t4,t3,256
+032F0E00 ,   \ lw t5,0(t3)
+630C7F00 ,   \ beq t5,t2,58 <.L2^B1>
+130E0E01 ,   \ addi t3,t3,16
+E36ADEFF ,   \ bltu t3,t4,3c <.L1^B1>
+9302F0FF ,   \ li t0,-1
+23205100 ,   \ sw t0,0(sp)
+6F000005 ,   \ j a4 <.L9^B1>
+032E8E00 ,   \ lw t3,8(t3)
+032F4300 ,   \ lw t5,4(t1)
+131F2F00 ,   \ slli t5,t5,0x2
+330FCF01 ,   \ add t5,t5,t3
+032F0F01 ,   \ lw t5,16(t5)
+330FCF01 ,   \ add t5,t5,t3
+83520F00 ,   \ lhu t0,0(t5)
+930E8F00 ,   \ addi t4,t5,8
+138E0200 ,   \ mv t3,t0
+6364DE00 ,   \ bltu t3,a3,84 <.L4^B1>
+138E0600 ,   \ mv t3,a3
+630E0E00 ,   \ beqz t3,a0 <.L5^B1>
+83CF0E00 ,   \ lbu t6,0(t4)
+2300F601 ,   \ sb t6,0(a2)
+938E1E00 ,   \ addi t4,t4,1
+13061600 ,   \ addi a2,a2,1
+130EFEFF ,   \ addi t3,t3,-1
+6FF09FFE ,   \ j 84 <.L4^B1>
+23205100 ,   \ sw t0,0(sp)
+;
 
 \ cdown ( cur -- )  from level cl, follow the current indices' children to the
 \ leaf, taking index 0 at each new level
@@ -434,6 +928,7 @@ B3836200 ,   \ add t2,t0,t1
 
 : curnext ( cur -- flag )
 	dup 4 lit + @ 0= if drop 0 lit else
+	dup pg @ 4 lit + @ cnext if drop -1 lit else                 \ within the leaf
 		cu !  cu @ 8 lit + @ 1 lit - cl !  -1 lit cok !
 		begin
 			cu @ cl @ cix 1 lit +  cu @ cl @ cpg pgget 4 lit + @  u< if -1 lit
@@ -444,7 +939,7 @@ B3836200 ,   \ add t2,t0,t1
 			cu @ cdown
 			-1 lit
 		else 0 lit cu @ 4 lit + ! 0 lit then
-	then ;
+	then then ;
 
 : curseek ( cur key klen -- flag )
 	2 lit pick @ root@ 0= if 2drop 0 lit over 4 lit + ! drop 0 lit else
@@ -461,17 +956,23 @@ B3836200 ,   \ add t2,t0,t1
 	then ;
 
 : curcell ( cur -- cell )
-	dup dup 8 lit + @ 1 lit - cpg pgget swap dup 8 lit + @ 1 lit - cix pgcell ;
+	dup pg @ 4 lit + @ ccell ?dup if nip else
+		dup dup 8 lit + @ 1 lit - cpg pgget swap dup 8 lit + @ 1 lit - cix pgcell
+	then ;
 
 : curkey ( cur buf cap -- klen|-1 )
 	gcap ! gbuf !
 	dup 4 lit + @ 0= if drop -1 lit else
-		curcell dup 8 lit + gbuf @ 2 lit pick h@ gcap @ umin mcopy h@
+		dup gbuf @ gcap @ rot pg @ 4 lit + @ ckey              \ cur r
+		dup -1 lit = if drop curcell dup 8 lit + gbuf @ 2 lit pick h@ gcap @ umin mcopy h@ else nip then
 	then ;
 
 : curval ( cur buf cap -- vlen|-1 )
 	gcap ! gbuf !
-	dup 4 lit + @ 0= if drop -1 lit else curcell lcopy then ;
+	dup 4 lit + @ 0= if drop -1 lit else
+		dup gbuf @ gcap @ rot pg @ 4 lit + @ cval              \ cur r
+		dup -2 lit u< 0= if drop curcell lcopy else nip then
+	then ;
 
 \ ── setup ─────────────────────────────────────────────────────────────────────
 
@@ -480,8 +981,12 @@ B3836200 ,   \ add t2,t0,t1
 	100 lit alloc dup 40 lit pgzero st @ !
 	500 lit alloc dup 140 lit pgzero st @ 4 lit + !
 	2000 lit alloc FFF lit + FFFFF000 lit and st @ 8 lit + !
-	40 lit alloc st @ C lit + !
-	200 lit alloc st @ 10 lit + ! ;
+	80 lit alloc st @ C lit + !
+	200 lit alloc st @ 10 lit + !
+	18 lit alloc pb !
+	40 lit alloc dup tb !
+	pg @ 4 lit + @ over 18 lit + !  st @ C lit + @ over 1C lit + !  pg @ 34 lit + over 24 lit + !
+	depth over 28 lit + !  lidx over 2C lit + !  lfound swap 30 lit + ! ;
 
 \ ──────────────────────────────────────────────────────────────────────────────
 \ Tests (--disk; self-skip without one).  Keys are 4 hex digits of a number,

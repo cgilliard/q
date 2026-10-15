@@ -34,11 +34,13 @@
 \   An address from pgget/pgnew/pgcow is good until the next pgget/pgnew/pgcow:
 \   the cache may evict a clean page to make room.  Hold page NUMBERS across
 \   calls, not addresses.  Dirty pages are never evicted, so a transaction can
-\   dirty at most the pool's 64 pages (256 KiB) before it commits.
+\   dirty at most 16 pages whose numbers share their low 5 bits (512 in all,
+\   2 MiB) before it commits.
 \
-\ Cache: 64 slots x 16 bytes (pgno, flags, addr, stamp), pages page-aligned,
-\ flags bit0 dirty, bit1 made in this transaction.  Lookup is a slot scan; the
-\ victim is an empty slot or the least recently used clean one.
+\ Cache: 512 slots x 16 bytes (pgno, flags, addr, stamp) in 32 sets of 16 (set
+\ = pgno & 31), pages page-aligned, flags bit0 dirty, bit1 made in this
+\ transaction.  Lookup is a scan of the set (machine code); the victim is an
+\ empty slot of the set, else its least recently used clean one.
 \
 \ Free space: pages freed in transaction N are PENDING until every reader's
 \ snapshot is >= N, then free.  Both lists are written into the meta page, so
@@ -52,6 +54,8 @@
 \ +14 next  +18 nfree +1C free  +20 npend +24 pend  +28 write txn (0 none)
 \ +2C meta buffer  +30 readers[16]  +34 stamp  +40 nfreed +44 freed (this txn)
 \ +48 pages on the disk  +4C,+50 next/nfree at txn begin (for abort)  +54 writes
+\ +58 ndirty +5C dirty (the slots made dirty this transaction, so a commit
+\ or abort walks those rather than all 512)
 \ Needs src/fence.fam src/proc.fam src/disk.fam before it.
 \ ──────────────────────────────────────────────────────────────────────────────
 
@@ -127,13 +131,13 @@
 
 \ ── cache ─────────────────────────────────────────────────────────────────────
 
-\ pgscan ( base pgno -- slot|0 )  the 64-slot scan, machine code: a fam loop
-\ here cost 12 us per page access, which a B+tree pays once per level.
+\ pgscan ( set pgno -- slot|0 )  the 16-slot scan of a set, machine code: a
+\ fam loop here cost 12 us per page access, which a B+tree pays per level.
 : pgscan
 03250100 ,   \ lw a0,0(sp)          ( pgno )
 83254100 ,   \ lw a1,4(sp)          ( base )
 13014100 ,   \ addi sp,sp,4
-13860540 ,   \ addi a2,a1,1024      ( end: 64 slots x 16 )
+13860510 ,   \ addi a2,a1,256       ( end: 16 slots x 16 )
 83A20500 ,   \ next: lw t0,0(a1)
 638AA200 ,   \ beq t0,a0,found
 93850501 ,   \ addi a1,a1,16
@@ -143,21 +147,23 @@ E3EAC5FE ,   \ bltu a1,a2,next
 2320B100 ,   \ found: sw a1,0(sp)
 ;            \ done:
 
-: pgfind ( pgno -- slot|0 )  pg @ 4 lit + @ swap pgscan ;
+: pgset  ( pgno -- set )     1F lit and 8 lit lshift pg @ 4 lit + @ + ;
+: pgfind ( pgno -- slot|0 )  dup pgset swap pgscan ;
 
-\ pgvictim ( -- slot )  an empty slot, else the least recently used clean one
+\ pgvictim ( pgno -- slot )  in the page's set: an empty slot, else the least
+\ recently used clean one
 : pgvictim
-	0 lit FFFFFFFF lit                               \ best stamp
-	40 lit 0 lit do
-		i pgslot dup @ FFFFFFFF lit = if
+	pgset 0 lit FFFFFFFF lit                         \ set best stamp
+	10 lit 0 lit do
+		2 lit pick i 4 lit lshift + dup @ FFFFFFFF lit = if
 			nip nip 0 lit                            \ empty: nothing beats it
 		else
 			dup 4 lit + @ 1 lit and if drop else     \ dirty: never
 				dup C lit + @ 2 lit pick u< if nip nip dup C lit + @ else drop then
 			then
 		then
-	loop drop
-	dup 0= if "pager: pool exhausted (transaction too large)" pgdie then ;
+	loop drop nip
+	dup 0= if "pager: cache set full of dirty pages (transaction too large)" pgdie then ;
 
 : pgstamp ( slot -- slot )
 	pg @ 34 lit + dup @ 1 lit + dup rot ! over C lit + ! ;
@@ -168,7 +174,7 @@ E3EAC5FE ,   \ bltu a1,a2,next
 	tuck !  0 lit over 4 lit + !  drop ;
 
 : pgget ( pgno -- addr )
-	dup pgfind ?dup if nip else dup pgvictim tuck pgload nip then
+	dup pgfind ?dup if nip else dup dup pgvictim tuck pgload nip then
 	pgstamp 8 lit + @ ;
 
 \ ── allocation ────────────────────────────────────────────────────────────────
@@ -182,11 +188,12 @@ E3EAC5FE ,   \ bltu a1,a2,next
 	then ;
 
 : pgnew ( -- pgno addr )
-	pgalloc dup dup pgfind ?dup 0= if pgvictim then  \ pgno pgno slot: a stale clean slot
+	pgalloc dup dup pgfind ?dup 0= if dup pgvictim then  \ pgno pgno slot: a stale clean slot
 	tuck !                                           \ for this page (a reader re-read it
 	                                                 \ after it was freed) is reused, never
 	                                                 \ doubled
 	3 lit over 4 lit + !                             \ dirty, made here
+	dup pg @ 58 lit + @ 2 lit lshift pg @ 5C lit + @ + !  pg @ 58 lit + dup @ 1 lit + swap !
 	pgstamp 8 lit + @
 	dup 400 lit pgzero ;
 
@@ -249,18 +256,21 @@ E3EAC5FE ,   \ bltu a1,a2,next
 : pgdrain ( ds -- ds )  \ every submitted request has landed (doorbell between polls)
 	begin darm vpoll dup 8 lit + @ over C lit + @ = dup 0= if over dbit 0 lit wait drop then until ;
 
+: pgdslot ( i -- slot )  2 lit lshift pg @ 5C lit + @ + @ ;   \ the i-th dirty slot
+: pgndirty ( -- n )     pg @ 58 lit + @ ;
+
 : pgwdirty ( -- )       \ write every dirty page and flush; the meta is NOT touched
 	0 lit pg @ 54 lit + !
-	40 lit 0 lit do
-		i pgslot dup 4 lit + @ 1 lit and if
+	pgndirty ?dup if 0 lit do
+		i pgdslot dup 4 lit + @ 1 lit and if             \ still dirty (not freed since)
 			pgds over @ 3 lit lshift 2 lit pick 8 lit + @ 8 lit vqwrite nip over C lit + !
 			pg @ 54 lit + dup @ 1 lit + swap !
 		then drop
-	loop
+	loop then
 	pg @ 54 lit + @ if
 		pgds vkick pgdrain drop
-		40 lit 0 lit do
-			i pgslot dup 4 lit + @ 1 lit and if
+		pgndirty 0 lit do
+			i pgdslot dup 4 lit + @ 1 lit and if
 				pgds over C lit + @ vstat nip 1 lit <> if "pager: page write failed" pgdie then
 			then drop
 		loop
@@ -272,14 +282,14 @@ E3EAC5FE ,   \ bltu a1,a2,next
 	pgreclm
 	pgtx 1 lit + pg @ 28 lit + !
 	pgnext pg @ 4C lit + !  pgnfree pg @ 50 lit + !
-	0 lit pg @ 40 lit + ! ;
+	0 lit pg @ 40 lit + !  0 lit pg @ 58 lit + ! ;
 
 : pgabort ( -- )
-	40 lit 0 lit do
-		i pgslot dup 4 lit + @ 1 lit and if FFFFFFFF lit over ! 0 lit over 4 lit + ! then drop
-	loop
+	pgndirty ?dup if 0 lit do
+		i pgdslot dup 4 lit + @ 1 lit and if FFFFFFFF lit over ! 0 lit over 4 lit + ! then drop
+	loop then
 	pg @ 4C lit + @ pg @ 14 lit + !  pg @ 50 lit + @ pg @ 18 lit + !
-	0 lit pg @ 40 lit + !  0 lit pg @ 28 lit + ! ;
+	0 lit pg @ 40 lit + !  0 lit pg @ 58 lit + !  0 lit pg @ 28 lit + ! ;
 
 : pgcommit ( root -- )
 	pgwtx 0= if "pager: no write transaction" pgdie then
@@ -289,8 +299,8 @@ E3EAC5FE ,   \ bltu a1,a2,next
 	dup pgmeta! pgwmeta
 	pg @ 10 lit + !
 	pgtx 1 lit + pg @ C lit + !
-	40 lit 0 lit do 0 lit i pgslot 4 lit + !  i pgslot pgstamp drop loop
-	0 lit pg @ 28 lit + ! ;
+	pgndirty ?dup if 0 lit do i pgdslot 0 lit over 4 lit + ! pgstamp drop loop then
+	0 lit pg @ 58 lit + !  0 lit pg @ 28 lit + ! ;
 
 : pgrbeg ( -- root )  pgtx pgpid 2 lit lshift pg @ 30 lit + @ + !  pgroot ;
 : pgrend ( -- )       0 lit pgpid 2 lit lshift pg @ 30 lit + @ + ! ;
@@ -298,21 +308,22 @@ E3EAC5FE ,   \ bltu a1,a2,next
 \ ── open ──────────────────────────────────────────────────────────────────────
 
 : pgopen ( ds -- flag )
-	60 lit alloc pg !
-	400 lit alloc pg @ 4 lit + !                                  \ 64 slots
-	41000 lit alloc FFF lit + FFFFF000 lit and pg @ 8 lit + !     \ 64 pages
+	60 lit alloc pg !                                             \ (block is 0x60: +58/+5C are its last words)
+	2000 lit alloc pg @ 4 lit + !                                 \ 512 slots
+	201000 lit alloc FFF lit + FFFFF000 lit and pg @ 8 lit + !    \ 512 pages
 	800 lit alloc pg @ 1C lit + !                                 \ free list
 	7E0 lit alloc pg @ 24 lit + !                                 \ pending pairs
 	2000 lit alloc FFF lit + FFFFF000 lit and pg @ 2C lit + !     \ meta buffer
 	40 lit alloc pg @ 30 lit + !                                  \ readers
 	400 lit alloc pg @ 44 lit + !                                 \ freed list
+	800 lit alloc pg @ 5C lit + !                                 \ dirty slots
 	pg @ !
-	40 lit 0 lit do
+	200 lit 0 lit do
 		i pgslot dup FFFFFFFF lit swap !  dup 0 lit swap 4 lit + !
 		pg @ 8 lit + @ i C lit lshift + swap 8 lit + !
 	loop
 	pg @ 30 lit + @ 10 lit pgzero
-	0 lit pg @ 34 lit + !  0 lit pg @ 28 lit + !  0 lit pg @ 40 lit + !
+	0 lit pg @ 34 lit + !  0 lit pg @ 28 lit + !  0 lit pg @ 40 lit + !  0 lit pg @ 58 lit + !
 	pgds @ 104 lit + @ if 1FFFFFFF lit else pgds @ 100 lit + @ 3 lit rshift then pg @ 48 lit + !
 	0 lit pg @ C lit + !  0 lit pg @ 10 lit + !  2 lit pg @ 14 lit + !
 	0 lit pg @ 18 lit + !  0 lit pg @ 20 lit + !
@@ -439,14 +450,14 @@ Test {
 			pds @ pgopen assert  pgtx 4 lit asrt_eq  pgroot 2 lit asrt_eq
 		then
 	}
-	\ the pool: clean pages are evicted least recently used first, dirty never
+	\ a set: clean pages are evicted least recently used first, dirty never
 	pool {
 		pds @ if
-			pgwbeg pgnew drop
-			46 lit 0 lit do i 64 lit + pgget drop loop
+			pgwbeg pgnew drop                                  \ a dirty page in some set
+			14 lit 0 lit do dup 1F lit and i 5 lit lshift + 200 lit + pgget drop loop   \ 20 clean ones into it
 			dup pgfind 0 lit <> assert
-			64 lit pgfind 0 lit asrt_eq
-			A9 lit pgfind 0 lit <> assert
+			dup 1F lit and 200 lit + pgfind 0 lit asrt_eq      \ the first went
+			dup 1F lit and 460 lit + pgfind 0 lit <> assert    \ the last stayed
 			drop pgabort
 		then
 	}
@@ -460,7 +471,7 @@ Test {
 			begin pgalloc 2 lit = until  2 lit pgfpush         \ bring 2 to the top of the free list
 			pgnew swap 2 lit asrt_eq drop
 			2 lit pgfind 4 lit + @ 3 lit asrt_eq               \ its slot is the dirty new page
-			0 lit 40 lit 0 lit do i pgslot @ 2 lit = if 1 lit + then loop 1 lit asrt_eq
+			0 lit 200 lit 0 lit do i pgslot @ 2 lit = if 1 lit + then loop 1 lit asrt_eq
 			pgabort
 		then
 	}
@@ -488,6 +499,7 @@ Bench {
 		else bskip then
 	}
 	\ a commit of 1 / 16 / 64 dirty pages: the writes, two flushes, the meta
+	\ (64 fresh pages spread over the sets: 2 per set)
 	commit1 {
 		pgds if
 			bgo A lit 0 lit do pgwbeg 1 lit pdirty pgcommit loop
