@@ -1,5 +1,5 @@
 \ ──────────────────────────────────────────────────────────────────────────────
-\ src/http.fam — an HTTP/1.1 server with WebSocket upgrades over src/tcp.fam,
+\ prog/http.fam — an HTTP/1.1 server with WebSocket upgrades over src/tcp.fam,
 \ driven by the event loop's turns.
 \
 \   httpinit ( port n -- )     once, after tcpinit: listen on port, serve at
@@ -15,7 +15,7 @@
 \ hpage: a hello, a WebSocket log and a store box, the socket closed cleanly on
 \ unload so Firefox does not count a reload as a failed socket), a GET carrying a Sec-WebSocket-Key is
 \ upgraded, anything else is a 404.  On a socket a text or binary message
-\ starting "kv " is a store command (src/kv.fam kvcmd answers it), any other
+\ starting "kv " is a store command (prog/kv.fam kvcmd answers it), any other
 \ is answered with "you said: " and the message, a ping with a pong, a close with
 \ a close; every second every socket gets a tick with the uptime.  Connections
 \ are kept alive; a request over 2 KiB without its end, or a frame over 2 KiB,
@@ -26,7 +26,7 @@
 \ bytes: a response goes out across turns when the send ring is full)
 \ +14 request buffer (0x800)  +18 scratch for the 101 (0x100).
 \ SHA-1 and base64 (the upgrade's accept key) are here too.  Needs src/tcp.fam
-\ and src/kv.fam (and what they need); the live test needs src/netin.fam.
+\ and prog/kv.fam (and what they need); the live test needs src/netin.fam.
 \ ──────────────────────────────────────────────────────────────────────────────
 
 : hsl variable ;  : hsn variable ;  : hlsn variable ;

@@ -9,7 +9,12 @@
 \   txcommit ( txn -- )   txabort ( txn -- )
 \   get      ( txn key klen buf cap -- vlen | -1 )   copy the value (at most
 \                                          cap bytes) and return its length
+\   getat    ( txn key klen off buf cap -- vlen | -1 )   the same from byte
+\                                          off of the value (nothing copied
+\                                          past its end)
 \   put      ( txn key klen val vlen -- )  insert or replace
+\   append   ( txn key klen data n -- )    add n bytes to the end of the value
+\                                          (a put when there is none)
 \   del      ( txn key klen -- flag )      -1 if it was there
 \   curopen  ( txn -- cur )   curclose ( cur -- )
 \   curfirst ( cur -- flag )               the smallest key; 0 = empty tree
@@ -20,7 +25,11 @@
 \ Keys are byte strings up to 511 bytes, ordered bytewise then by length.
 \ Values up to 1 KiB live in the leaf; larger ones go to a chain of overflow
 \ pages (4 bytes link + 4088 payload each) and the leaf keeps a 4-byte
-\ reference, so the leaf fanout never collapses.  The pager's cache bounds a
+\ reference, so the leaf fanout never collapses.  The chain is linked from its
+\ END: the leaf names the last page and each page names the one before it,
+\ so an append copies the tail page, adds pages after it and repoints the
+\ leaf, whatever the value's length; a read walks back from the end, filling
+\ the buffer from its tail.  The pager's cache bounds a
 \ transaction (see src/pager.fam): 512 dirty pages in all, 16 per set.
 \
 \ Page: +0 type (1 leaf, 2 branch, 3 overflow)  +4 nkeys  +8 upper (the cell
@@ -39,6 +48,8 @@
 \ merges stay in fam.
 \ A put copies the root-to-leaf path once per transaction (pgcow), splits a
 \ full leaf in half and pushes the separator up, splitting branches as needed.
+\ An append rewrites a leaf value in place (moving it to a chain once it
+\ passes 1 KiB) and extends a chain as above.
 \ A del removes the cell; an emptied leaf is unlinked and a root with one child
 \ collapses.  Underfull pages are not merged (space returns when they empty).
 \
@@ -54,6 +65,7 @@
 : stdie ( msg -- )  pgdie ;
 
 : umin ( a b -- min )  2dup u> if swap then drop ;
+: umax ( a b -- max )  2dup u< if swap then drop ;
 
 \ ── pages ─────────────────────────────────────────────────────────────────────
 
@@ -211,28 +223,46 @@ E3960FFE ,   \ bnez t6,c4 <.L8^B1>
 : owv variable ;  : owc variable ;  : owp variable ;  : owf variable ;
 : orb variable ;  : orc variable ;
 
-: ovwrite ( val vlen -- first )
-	owc ! owv !  0 lit owp !  0 lit owf !
+: ovwrite ( val vlen -- last )
+	owc ! owv !  0 lit owp !
 	begin
 		pgnew 3 lit pginit                           \ pgno addr
+		owp @ over 4 lit + !                         \ link: the page before (0 for the first)
 		owv @ over 8 lit + owc @ FF8 lit umin mcopy
 		owc @ FF8 lit umin dup owv @ + owv !  owc @ swap - owc !
-		drop                                         \ pgno
-		owf @ 0= if dup owf ! then
-		owp @ if dup owp @ pgget 4 lit + ! then      \ link the previous page here
-		owp !
+		drop owp !
 		owc @ 0=
 	until
-	owf @ ;
+	owp @ ;
 
-: ovread ( pgno buf cap -- )
-	orc ! orb !
-	begin ?dup while
-		dup pgget                                    \ pgno page
-		dup 8 lit + orb @ orc @ FF8 lit umin mcopy
-		orc @ FF8 lit umin dup orb @ + orb !  orc @ swap - orc !
-		4 lit + @ nip
-	repeat ;
+\ ovext ( last vlen data n -- last' )  n more bytes after a chain's vlen: the
+\ tail page copied (pgcow: itself when made in this transaction) and filled,
+\ then new pages
+: owt variable ;  : owa variable ;
+: ovext
+	owc ! owv !
+	FF8 lit % ?dup 0= if FF8 lit then owt !      \ bytes in the tail page
+	pgcow owa ! owp !
+	begin owc @ while
+		owt @ FF8 lit = if
+			pgnew 3 lit pginit  owp @ over 4 lit + !  owa ! owp !  0 lit owt !
+		then
+		owv @ owa @ 8 lit + owt @ +  owc @ FF8 lit owt @ - umin  mcopy
+		owc @ FF8 lit owt @ - umin  dup owv @ + owv !  dup owt @ + owt !  owc @ swap - owc !
+	repeat
+	owp @ ;
+
+\ ovread ( vlen last buf cap off -- )  bytes off..off+cap of a chain of vlen
+: orl variable ;  : oro variable ;  : ors variable ;  : olo variable ;  : ohi variable ;
+: ovread
+	ors ! orc ! orb !
+	begin over while                              \ pos pgno
+		over FF8 lit % ?dup 0= if FF8 lit then orl !
+		over orl @ - oro !
+		oro @ ors @ umax olo !  oro @ orl @ + ors @ orc @ + umin ohi !
+		olo @ ohi @ u< if dup pgget 8 lit + olo @ oro @ - +  orb @ olo @ ors @ - +  ohi @ olo @ -  mcopy then
+		pgget 4 lit + @ swap drop oro @ swap
+	repeat 2drop ;
 
 : ovfree ( pgno -- )  begin ?dup while dup pgget 4 lit + @ swap pgfree repeat ;
 
@@ -429,7 +459,7 @@ B3836200 ,   \ add t2,t0,t1
 
 \ ── get ───────────────────────────────────────────────────────────────────────
 
-: gbuf variable ;  : gcap variable ;
+: gbuf variable ;  : gcap variable ;  : goff variable ;
 
 \ lcopya ( cell buf cap -- vlen | -2 )  machine code: an inline value into buf
 \ (at most cap bytes); -2 for an overflow value (lcopy handles those)
@@ -461,23 +491,30 @@ B38E5E00 ,   \ add t4,t4,t0
 23207100 ,   \ sw t2,0(sp)
 ;
 
-\ lcopy ( cell -- vlen )  the cell's value into gbuf (at most gcap bytes)
+\ lcopy ( cell -- vlen )  the cell's value from byte goff into gbuf (at most gcap bytes)
 : lcopy
 	dup 4 lit + @ swap                                       \ vlen cell
 	dup 8 lit + over h@ +                                    \ vlen cell vaddr
 	swap 2 lit + h@ 1 lit and if
-		ovp 4 lit mcopy  ovp @ gbuf @ gcap @ ovread
+		ovp 4 lit mcopy  dup ovp @ gbuf @ gcap @ goff @ ovread
 	else
-		gbuf @ 2 lit pick gcap @ umin mcopy
+		goff @ + gbuf @ 2 lit pick goff @ - dup 0< if drop 0 lit then gcap @ umin mcopy
 	then ;
 
 : get ( txn key klen buf cap -- vlen|-1 )
-	gcap ! gbuf !
+	gcap ! gbuf !  0 lit goff !
 	rot root@ ?dup 0= if 2drop -1 lit else
 		-rot rdesc
 		lfound @ if
 			tb @ 20 lit + @ lidx @ pgcell dup gbuf @ gcap @ lcopya dup -2 lit = if drop lcopy else nip then
 		else -1 lit then
+	then ;
+
+: getat ( txn key klen off buf cap -- vlen|-1 )
+	gcap ! gbuf ! goff !
+	rot root@ ?dup 0= if 2drop -1 lit else
+		-rot rdesc
+		lfound @ if tb @ 20 lit + @ lidx @ pgcell lcopy else -1 lit then
 	then ;
 
 \ ── put ───────────────────────────────────────────────────────────────────────
@@ -689,6 +726,34 @@ B30E7500 ,   \ add t4,a0,t2
 	pt @ pk @ pkl @ -1 lit descend
 	lfound @ if tb @ 20 lit + @ lidx @ lkill then
 	lins ;
+
+\ ── append ────────────────────────────────────────────────────────────────────
+
+: apb variable ;      \ a leaf value grown in place (1 KiB)
+: append ( txn key klen data n -- )
+	pvl ! pv ! pkl ! pk ! pt !
+	pkl @ 1FF lit u> if "store: key too long" stdie then
+	pt @ wtx? 0= if "store: append in a read transaction" stdie then
+	pt @ root@ 0= if pt @ pk @ pkl @ pv @ pvl @ put else
+		pt @ pk @ pkl @ -1 lit descend
+		lfound @ 0= if pt @ pk @ pkl @ pv @ pvl @ put else
+			tb @ 20 lit + @ lidx @ pgcell                                  \ cell
+			dup 2 lit + h@ 1 lit and if                                      \ a chain: extend it, repoint the cell
+				dup 8 lit + over h@ +                                          \ cell vaddr
+				dup @ 2 lit pick 4 lit + @ pv @ pvl @ ovext swap !
+				4 lit + dup @ pvl @ + swap !
+			else dup 4 lit + @ pvl @ + 400 lit u> 0= if                     \ still a leaf value: rewrite it
+				dup 8 lit + over h@ + apb @ 2 lit pick 4 lit + @ mcopy
+				pv @ apb @ 2 lit pick 4 lit + @ + pvl @ mcopy
+				pt @ pk @ pkl @ apb @ 4 lit pick 4 lit + @ pvl @ + put drop
+			else                                                           \ past 1 KiB: a chain of the old bytes, extended
+				dup 8 lit + over h@ + over 4 lit + @ ovwrite
+				over 4 lit + @ pv @ pvl @ ovext ovp !  -1 lit pov !
+				4 lit + @ pvl @ + pvl !
+				tb @ 20 lit + @ lidx @ lkill lins
+			then then
+		then
+	then ;
 
 \ ── del ───────────────────────────────────────────────────────────────────────
 
@@ -968,7 +1033,7 @@ E36ADEFF ,   \ bltu t3,t4,3c <.L1^B1>
 	then ;
 
 : curval ( cur buf cap -- vlen|-1 )
-	gcap ! gbuf !
+	gcap ! gbuf !  0 lit goff !
 	dup 4 lit + @ 0= if drop -1 lit else
 		dup gbuf @ gcap @ rot pg @ 4 lit + @ cval              \ cur r
 		dup -2 lit u< 0= if drop curcell lcopy else nip then
@@ -983,7 +1048,7 @@ E36ADEFF ,   \ bltu t3,t4,3c <.L1^B1>
 	2000 lit alloc FFF lit + FFFFF000 lit and st @ 8 lit + !
 	80 lit alloc st @ C lit + !
 	200 lit alloc st @ 10 lit + !
-	18 lit alloc pb !
+	18 lit alloc pb !  400 lit alloc apb !
 	40 lit alloc dup tb !
 	pg @ 4 lit + @ over 18 lit + !  st @ C lit + @ over 1C lit + !  pg @ 34 lit + over 24 lit + !
 	depth over 28 lit + !  lidx over 2C lit + !  lfound swap 30 lit + ! ;
@@ -1116,6 +1181,50 @@ Test {
 			stx @ "big" 3 lit del -1 lit asrt_eq
 			stx @ txcommit
 			0 lit txbeg stx !  stx @ "big" 3 lit sbuf @ 100 lit get -1 lit asrt_eq  stx @ txcommit
+		then
+	}
+	\ append: into a leaf value, over the 1 KiB edge onto a chain, along the chain
+	\ and across pages; read back whole and through a cursor; a snapshot keeps
+	\ its length; delete returns every page
+	grow {
+		: gexp ( i -- b )
+			dup 4 lit u< if "abcd" + c@ else
+			dup 400 lit u< if 4 lit - 5 lit * FF lit and else
+			dup 400 lit = if drop 0 lit else 401 lit - 5 lit * FF lit and then then then ;
+		: gchk ( buf n -- flag )  -1 lit -rot 0 lit do dup i + c@ i gexp <> if swap drop 0 lit swap then loop drop ;
+		sds @ if
+			1002 lit 0 lit do i 5 lit * FF lit and sbuf @ i + c! loop
+			-1 lit txbeg stx !
+			stx @ "log" 3 lit "ab" 2 lit append                               \ absent: a put
+			stx @ "log" 3 lit "cd" 2 lit append
+			stx @ "log" 3 lit sbuf @ 1800 lit + 100 lit get 4 lit asrt_eq  sbuf @ 1800 lit + 4 lit gchk assert
+			stx @ "log" 3 lit sbuf @ 3FC lit append                            \ exactly 1 KiB: still in the leaf
+			stx @ "log" 3 lit sbuf @ 1800 lit + 1800 lit get 400 lit asrt_eq  sbuf @ 1800 lit + 400 lit gchk assert
+			tb @ 20 lit + @ lidx @ pgcell 2 lit + h@ 1 lit and 0 lit asrt_eq
+			stx @ "log" 3 lit sbuf @ 1 lit append                              \ one byte over: a chain
+			stx @ "log" 3 lit sbuf @ 1800 lit + 1800 lit get 401 lit asrt_eq  sbuf @ 1800 lit + 401 lit gchk assert
+			tb @ 20 lit + @ lidx @ pgcell 2 lit + h@ 1 lit and 1 lit asrt_eq
+			stx @ "log" 3 lit sbuf @ 1000 lit append                           \ fills the tail page and one more
+			stx @ "log" 3 lit sbuf @ 1800 lit + 1800 lit get 1401 lit asrt_eq  sbuf @ 1800 lit + 1401 lit gchk assert
+			stx @ "log" 3 lit sbuf @ 1800 lit + 10 lit get 1401 lit asrt_eq  sbuf @ 1800 lit + 10 lit gchk assert   \ a short read
+			sbuf @ 1800 lit + 400 lit pgzero                                                                   \ reads from an offset
+			stx @ "log" 3 lit 3FE lit sbuf @ 1800 lit + 1000 lit getat 1401 lit asrt_eq
+			-1 lit 1000 lit 0 lit do sbuf @ 1800 lit + i + c@ i 3FE lit + gexp <> if drop 0 lit then loop assert
+			stx @ "log" 3 lit 1400 lit sbuf @ 1800 lit + 10 lit getat 1401 lit asrt_eq  sbuf @ 1800 lit + c@ 1400 lit gexp asrt_eq
+			stx @ "log" 3 lit 1401 lit sbuf @ 1800 lit + 10 lit getat 1401 lit asrt_eq
+			stx @ "log" 3 lit 2000 lit sbuf @ 1800 lit + 10 lit getat 1401 lit asrt_eq  sbuf @ 1800 lit + c@ 1400 lit gexp asrt_eq   \ past the end: nothing copied
+			stx @ "log" 3 lit 2 lit sbuf @ 1800 lit + 2 lit getat 1401 lit asrt_eq  sbuf @ 1800 lit + c@ 'c' lit asrt_eq
+			stx @ txcommit
+			0 lit txbeg stx !                                                   \ from the disk, and through a cursor
+			stx @ "log" 3 lit sbuf @ 1800 lit + 1800 lit get 1401 lit asrt_eq  sbuf @ 1800 lit + 1401 lit gchk assert
+			stx @ curopen dup "log" 3 lit curseek -1 lit asrt_eq
+			dup sbuf @ 1800 lit + 1800 lit curval 1401 lit asrt_eq  sbuf @ 1800 lit + 1401 lit gchk assert  curclose
+			-1 lit txbeg dup "log" 3 lit sbuf @ 1000 lit + 2 lit append txcommit      \ the snapshot keeps 0x1401
+			stx @ "log" 3 lit sbuf @ 1800 lit + 1800 lit get 1401 lit asrt_eq
+			stx @ txcommit
+			0 lit txbeg stx !  stx @ "log" 3 lit sbuf @ 1800 lit + 1800 lit get 1403 lit asrt_eq  sbuf @ 1800 lit + 1403 lit gchk assert  stx @ txcommit
+			-1 lit txbeg stx !  stx @ "log" 3 lit del -1 lit asrt_eq  pg @ 40 lit + @ 2 lit u< 0= assert  stx @ txcommit   \ both chain pages
+			0 lit txbeg stx !  stx @ "log" 3 lit sbuf @ 100 lit get -1 lit asrt_eq  stx @ txcommit
 		then
 	}
 	\ a reader opened before a commit keeps its snapshot

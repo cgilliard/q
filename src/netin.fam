@@ -1,5 +1,6 @@
 \ ──────────────────────────────────────────────────────────────────────────────
 \ src/netin.fam — the receive dispatcher: frames from the NIC to ARP, ICMP,
+\ the ports programs hold (src/ports.fam: the whole frame goes to the program),
 \ UDP and TCP.  A layer's input word returns what it did not consume, so this sits
 \ above them all and is the one place that knows the chain.
 \
@@ -11,7 +12,10 @@
 : netin ( buf len -- )
 	over ethtype dup 806 lit = if drop arpin else
 		800 lit = if
-			E lit - swap E lit + swap ipin ?dup if dup 6 lit = if drop tcpin else 11 lit = if udpin else 2drop then then then
+			E lit - swap E lit + swap ipin ?dup if
+				2 lit pick 2 lit pick 2 lit pick pdeliver if 2drop drop else
+				dup 6 lit = if drop tcpin else 11 lit = if udpin else 2drop then then then
+			then
 		else 2drop then
 	then ;
 

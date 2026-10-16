@@ -11,7 +11,7 @@ loopback as 10.0.2.2 under slirp):
   guest's 47656), GET / and check the page, upgrade to a WebSocket and check
   the accept key, send "ping" and expect "you said: ping", close — each step
   only after the previous one checked out, so the guest's counters say how far
-  a real client got (src/http.fam httplive)."""
+  a real client got (prog/http.fam httplive)."""
 import base64, hashlib, os, socket, threading, time
 
 def udp_echo():
@@ -124,7 +124,7 @@ def http_probe_once():
 
 def udp_knocker():
     """every 0.3 s a datagram to 127.0.0.1:47653 (forwarded to the guest's
-    47653), expecting it back: the guest's UDP endpoint test (src/udpsrv.fam)"""
+    47653), expecting it back: the guest's UDP endpoint test (prog/udpsrv.fam)"""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.settimeout(1)
     while True:

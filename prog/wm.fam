@@ -1,0 +1,16 @@
+\ prog/wm.fam — the window manager, in embryo: the HTTP and WebSocket server
+\ (prog/http.fam) and the page's store box (lib/pkv.fam), as a program holding
+\ TCP port 8080.  It is what src/kernel.fam used to serve from the kernel.
+\ Built with lib/pnet.fam, src/eth.fam, src/ip.fam, src/udp.fam, src/tcp.fam,
+\ lib/pstack.fam, lib/pkv.fam and prog/http.fam (scripts/build.sh).  Later it
+\ owns windows and binds other programs' handle 0 to them.
+40 lit pstack
+6 lit 1F90 lit pbind ?dup if "wm: cannot hold TCP port 8080: " puts u. '\n' lit putc texit then
+20 lit tcpinit  -1 lit kvinit  1F90 lit 20 lit httpinit
+"wm: serving http on port 8080\n" puts
+begin
+	nbit F4240 lit wait drop                      \ frames, or 100 ms for the timers
+	begin netrx while pnetin netrel repeat
+	httpturn
+	tcptick
+0 lit until

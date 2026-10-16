@@ -1,0 +1,153 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/ports.fam — ports a program holds: the frames for them go to the program.
+\
+\   pinit    ( -- )                              once, after kinit
+\   pbind    ( tid proto port ring size -- r )   the thread holds (proto, port);
+\            frames for it are copied into ring, a buffer of size bytes in the
+\            thread's memory: 0, -1 taken, -2 the ring is not the thread's or
+\            is malformed, -3 the table is full
+\   punbind  ( tid proto port -- )
+\   pfind    ( proto port -- entry|0 )
+\   pdeliver ( buf len proto -- flag )           buf/len the IP packet of a
+\            received frame: -1 when a program holds its port (the whole frame
+\            is in its ring now and the thread was posted bit 18, or it was
+\            dropped: ring full or frame too long for a slot)
+\   psweep   ( -- )                              free the ports and transmit
+\            rings of threads that are gone
+\   pdlv     variable                            set by pdeliver when a frame
+\            went to a program; the loop clears it and yields so the program
+\            answers within the same turn
+\   ptxset   ( tid ring size -- r )              the thread's transmit ring (one
+\            per thread, the same shape): 0, -2 not its memory or malformed
+\   ptxdrain ( tid -- )                          send what the thread has put in it
+\   tin?     ( tid ptr len -- flag )             is ptr..ptr+len in the thread's
+\            own region or its process's
+\
+\ A ring: +0 slots (a power of two, at most 1024)  +4 head (the program's: frames
+\ taken)  +8 tail (the kernel's: frames put)  +C slot size (at least 0x604)
+\ +10 the slots: +0 len, +4 the frame.  Only masked indices are used, so a
+\ program can corrupt its own ring and nothing else.  A transmit ring is the
+\ same thing the other way: the program puts frames at its tail and posts
+\ thread 0 bit 16; the loop thread takes them at the head and sends them (a
+\ frame over 0x7F0 bytes is dropped).  32 ports (0x18 each:
+\ proto, port, tid, ring, size, dropped); TCP and UDP are told apart by proto
+\ (6, 17); the port is the destination port.  lib/pnet.fam is the program's
+\ side.  Needs src/proc.fam (rrec, post, tstate), src/eth.fam (be16@).
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: ptab variable ;  : pp variable ;  : pl variable ;  : pr variable ;  : ps variable ;  : pe variable ;  : pdlv variable ;
+: ptxt variable ;                                     \ 16 x 8: ring, size
+: pent ( i -- entry )  18 lit * ptab @ + ;
+: ptx ( tid -- rec )  3 lit lshift ptxt @ + ;
+: pinit ( -- )
+	300 lit alloc dup ptab !  C0 lit 0 lit do 0 lit over i 2 lit lshift + ! loop drop
+	80 lit alloc dup ptxt !  20 lit 0 lit do 0 lit over i 2 lit lshift + ! loop drop ;
+
+: pin ( lo hi -- flag )  pp @ 2 lit pick u< 0=  -rot pp @ pl @ + swap u> 0=  nip and ;
+: tin? ( tid ptr len -- flag )  pl ! pp !  rrec dup @ dup 2 lit pick 4 lit + @ + pin  swap dup C lit + @ swap 14 lit + @ pin  or ;
+
+: pfind ( proto port -- entry|0 )
+	0 lit 20 lit 0 lit do
+		dup 0= if drop i pent dup 8 lit + @ if dup @ 3 lit pick = over 4 lit + @ 3 lit pick = and 0= if drop 0 lit then else drop 0 lit then then
+	loop nip nip ;
+: pfree ( -- entry|0 )  0 lit 20 lit 0 lit do dup 0= if drop i pent dup 8 lit + @ if drop 0 lit then then loop ;
+
+\ pring? ( -- flag )  is the ring at pr (ps bytes) well formed
+: pring?
+	pr @ @ dup 0= over 400 lit u> or over dup 1 lit - and 0= 0= or nip  pr @ C lit + @ 604 lit u< or
+	pr @ @ pr @ C lit + @ * 10 lit + ps @ u> or 0= ;
+
+: pbind ( tid proto port ring size -- r )
+	ps ! pr !
+	2 lit pick pr @ ps @ tin? 0= if 2drop drop -2 lit else
+	pring? 0= if 2drop drop -2 lit else
+	2dup pfind if 2drop drop -1 lit else
+	pfree ?dup 0= if 2drop drop -3 lit else
+		tuck 4 lit + !  tuck !  tuck 8 lit + !
+		pr @ over C lit + !  ps @ over 10 lit + !  0 lit swap 14 lit + !
+		0 lit pr @ 4 lit + !  0 lit pr @ 8 lit + !
+		0 lit
+	then then then then ;
+
+: punbind ( tid proto port -- )  pfind ?dup if dup 8 lit + @ rot = if 0 lit swap 8 lit + ! else drop then else drop then ;
+
+: pdeliver ( buf len proto -- flag )
+	dup 3 lit pick dup c@ F lit and 2 lit lshift + 2 lit + be16@ pfind ?dup 0= if 2drop drop 0 lit else
+		pe !  drop  E lit + swap E lit -                                    \ flen frame
+		pe @ C lit + @ pr !
+		pr @ 8 lit + @ pr @ 4 lit + @ - pr @ @ u< 0=  2 lit pick pr @ C lit + @ 4 lit - u>  or if
+			2drop pe @ 14 lit + dup @ 1 lit + swap !
+		else
+			pr @ 8 lit + @ pr @ @ 1 lit - and pr @ C lit + @ * pr @ + 10 lit +   \ flen frame slot
+			over over 4 lit + 4 lit pick mcopy  nip !
+			pr @ 8 lit + dup @ 1 lit + swap !
+			40000 lit pe @ 8 lit + @ kpostd  -1 lit pdlv !
+		then
+		-1 lit
+	then ;
+
+: psweep ( -- )
+	20 lit 0 lit do i pent dup 8 lit + @ ?dup if ktstate 0= if 0 lit over 8 lit + ! then then drop loop
+	10 lit 1 lit do i ptx @ if i ktstate 0= if 0 lit i ptx ! then then loop ;
+
+: ptxset ( tid ring size -- r )
+	ps ! pr !
+	dup pr @ ps @ tin? 0= if drop -2 lit else
+	pring? 0= if drop -2 lit else
+		ptx pr @ over !  ps @ swap 4 lit + !  0 lit pr @ 4 lit + !  0 lit pr @ 8 lit + !  0 lit
+	then then ;
+
+: ptxdrain ( tid -- )
+	ptx @ ?dup if
+		pr !
+		begin pr @ 4 lit + @ pr @ 8 lit + @ <> while
+			pr @ 4 lit + @ pr @ @ 1 lit - and pr @ C lit + @ * pr @ + 10 lit +     \ slot
+			dup @ 7F0 lit u> 0= if dup 4 lit + over @ nettx drop then drop
+			pr @ 4 lit + dup @ 1 lit + swap !
+		repeat
+	then ;
+
+\ ──────────────────────────────────────────────────────────────────────────────
+\ Test: a ring standing in for thread 15's region; binding, lookup, delivery,
+\ a full ring, a frame too long, unbinding, the sweep.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+Test {
+	ports {
+		: prg variable ;  : pfr variable ;
+		pinit
+		2000 lit alloc prg !  prg @ F lit rrec !  2000 lit F lit rrec 4 lit + !
+		4 lit prg @ !  604 lit prg @ C lit + !
+		F lit 11 lit E99 lit prg @ 2000 lit pbind 0 lit asrt_eq
+		11 lit E99 lit pfind dup 0 lit <> assert 8 lit + @ F lit asrt_eq
+		F lit 11 lit E99 lit prg @ 2000 lit pbind -1 lit asrt_eq                      \ taken
+		F lit 6 lit E99 lit prg @ 2000 lit pbind 0 lit asrt_eq                        \ the TCP port is another
+		F lit 11 lit 1 lit prg @ 1000 lit pbind -2 lit asrt_eq                        \ too small for its slots
+		F lit 11 lit 1 lit ptab @ 2000 lit pbind -2 lit asrt_eq                       \ not the thread's memory
+		3 lit prg @ !  F lit 11 lit 1 lit prg @ 2000 lit pbind -2 lit asrt_eq  4 lit prg @ !   \ slots not a power of two
+		\ a frame: 14 bytes of ethernet, an IPv4 header, UDP to 3737, 5 bytes
+		100 lit alloc pfr !  40 lit 0 lit do 0 lit pfr @ i 2 lit lshift + ! loop
+		45 lit pfr @ E lit + c!  11 lit pfr @ 17 lit + c!  E99 lit pfr @ 24 lit + be16!
+		pfr @ E lit + 21 lit 11 lit pdeliver -1 lit asrt_eq
+		prg @ 8 lit + @ 1 lit asrt_eq  prg @ 10 lit + @ 2F lit asrt_eq  prg @ 22 lit + c@ 45 lit asrt_eq
+		pfr @ E lit + 21 lit 6 lit pdeliver -1 lit asrt_eq                            \ TCP to 3737: the other entry
+		pfr @ E lit + 21 lit 1 lit pdeliver 0 lit asrt_eq                             \ ICMP: nobody's
+		1 lit pfr @ 24 lit + be16!  pfr @ E lit + 21 lit 11 lit pdeliver 0 lit asrt_eq   \ port 1: nobody's
+		E99 lit pfr @ 24 lit + be16!
+		pfr @ E lit + 21 lit 11 lit pdeliver drop  pfr @ E lit + 21 lit 11 lit pdeliver drop
+		prg @ 8 lit + @ 4 lit asrt_eq
+		pfr @ E lit + 21 lit 11 lit pdeliver -1 lit asrt_eq  prg @ 8 lit + @ 4 lit asrt_eq   \ full: dropped
+		11 lit E99 lit pfind 14 lit + @ 1 lit asrt_eq
+		2 lit prg @ 4 lit + !  pfr @ E lit + 21 lit 11 lit pdeliver drop  prg @ 8 lit + @ 5 lit asrt_eq   \ two taken: room again
+		pfr @ E lit + 6F8 lit 11 lit pdeliver -1 lit asrt_eq  11 lit E99 lit pfind 14 lit + @ 2 lit asrt_eq   \ too long for a slot
+		F lit 11 lit E99 lit punbind  11 lit E99 lit pfind 0 lit asrt_eq
+		6 lit E99 lit pfind 0 lit <> assert  psweep  6 lit E99 lit pfind 0 lit asrt_eq    \ thread 15 is not alive
+		\ a transmit ring: two frames put, drained (onto the wire when there is one), one too long skipped
+		F lit prg @ 2000 lit ptxset 0 lit asrt_eq  F lit ptx @ prg @ asrt_eq
+		F lit ptab @ 2000 lit ptxset -2 lit asrt_eq
+		40 lit prg @ 10 lit + !  800 lit prg @ 614 lit + !  3C lit prg @ C18 lit + !  3 lit prg @ 8 lit + !
+		net @ if F lit ptxdrain  prg @ 4 lit + @ 3 lit asrt_eq then
+		psweep  F lit ptx @ 0 lit asrt_eq
+		0 lit F lit rrec !  0 lit F lit rrec 4 lit + !
+	}
+}

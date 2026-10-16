@@ -10,9 +10,20 @@
 \ registers into its TCB, switches to the kernel's stacks, runs `ktrap` (a plain
 \ fam word), and resumes whichever TCB `ktrap` left in K.  The lottery draws a
 \ random ticket from the runnable threads' total; the holder runs next.  Thread
-\ 0 is the program's original context; threads 1..15 get a 128 KiB slot each
-\ (RID stack, heap + data stack, loop stack) carved from the main heap by
-\ `kinit`.
+\ 0 is the program's original context; every other thread runs in a region of
+\ its own (RID stack, heap + data stack, loop stack), taken from the region
+\ pool at spawn and given back at exit.
+\
+\ Regions: `kinit` carves the pool from the main heap once, in three size
+\ classes whose counts it is given (128 KiB, 1 MiB, 8 MiB; the node asks for
+\ 64, 24 and 8, 96 MiB of the 128 MiB machine; the tests for 32, 4 and 1), each
+\ region aligned to its size so one PMP entry can cover it later.  `region`
+\ hands out the smallest class that fits (a larger one when that class is
+\ empty), `release` returns one.  A region is laid out like the old slot, scaled: [0,1000) RID
+\ stack, [1000,size-4000) heap up + data stack down, [size-4000,size) loop
+\ stack.  A thread's region belongs to it: `spawn` takes a 128 KiB one and
+\ `spawnin` runs the thread in a region the caller took; either way exit
+\ releases it.
 \
 \ Events: each thread has a pending-events word and a subscription mask.  Bit
 \ n (n = 1..31) is PLIC source n: the virtio-mmio slot at 0x1000n000 is source
@@ -25,9 +36,43 @@
 \ `wait` is never lost.
 \
 \ API (user side):
-\   kinit                     set up the table, timer and trap vector (once)
+\   kinit   ( n128k n1m n8m -- )   set up the table, the region pool with
+\                             that many regions of each class, the timer and
+\                             the trap vector (once)
 \   thread{ ... }thread       compile a thread body; at runtime pushes its address
-\   spawn   ( addr tickets -- tid )   new thread, 0 if the table is full
+\   spawn   ( addr tickets -- tid )   new thread in a 128 KiB region, 0 if
+\                             the table or the pool is empty
+\   spawnin ( addr tickets base size -- tid )   new thread in that region
+\   region  ( size -- addr )  a region of at least size bytes, 0 if none
+\   release ( addr -- )       give a region back (not one a thread is using)
+\   rfree   ( class -- n )    free regions in class 0/1/2 (128 KiB/1 MiB/8 MiB)
+\   tstate  ( tid -- state )  0 free (gone), 1 runnable, 2 sleeping, 3 waiting
+\   texcode ( tid -- code )   how the thread in that slot last ended: 0 exited,
+\                             cause+1 killed (valid until the slot is reused)
+\   ktstate ( tid -- state )  tstate and post for thread 0's own use, without
+\   kpostd  ( mask tid -- )   a trap (the kernel's loop thread only)
+\   myregion ( -- base size ) the calling thread's region (0 0 for thread 0)
+\   uspawn  ( base size imgend tickets -- tid )   a USER-MODE thread running
+\                             the image at base (imgend = where its code
+\                             ends) in that region: what exec uses
+\ A thread starts with a5 = 'EXEC' (0x43455845), a6 = its region's base and
+\ a7 = the size: a program image started at the base (src/exec.fam) lays its
+\ stacks out from them in the stdlib's init; a thread body ignores them.
+\ lib/sys.fam gives a program built on its own the same words as syscalls.
+\
+\ Modes: the kernel and its own threads run in M-mode; a program exec'd from
+\ the store runs in U-mode (uspawn), and so does every thread it spawns.  A
+\ user thread is fenced by PMP, written at every switch to it: its process's
+\ image (to a page boundary: QEMU stops caching a page a PMP boundary cuts
+\ through) is read + execute, the rest of the process region read + write, its
+\ own region (for a spawned thread; the same region for the main thread) read
+\ + write, the UART page read + write, the mtime register read only; nothing
+\ else, so the kernel, other programs and the devices are out of reach, the
+\ RID stack cannot grow down into the code, and no stack can leave the region.
+\ Any other trap from a user thread (an access, alignment or illegal-
+\ instruction fault) kills that thread with a line on the UART naming the
+\ cause, the pc and the address; its region goes back.  The same fault from
+\ a kernel thread is a kernel bug and halts the machine, as before.
 \   yield   ( -- )            give up the rest of the quantum
 \   sleep   ( ticks -- )      block for at least ticks mtime ticks (10 MHz)
 \   msleep  ( ms -- )         the same in milliseconds
@@ -54,13 +99,25 @@
 \ Layout — TCB (0xA0 bytes, 16 of them):  4*n saved x_n   80 pc   84 state
 \   (0 free, 1 runnable, 2 sleeping, 3 waiting)   88 tickets   8C pid
 \   90 wait mask   94 wake lo   98 wake hi   9C pending events.
-\ Kernel block K:  0 current   4 t1 stash   8 table   C rng   10 slot pool
+\ Kernel block K:  0 current   4 t1 stash   8 table   C rng   10 kernel region
 \   14 ksp   18 ks8   1C ks11   20 kgp   24 quantum   28 ticks   2C IRQ events
-\   that no thread was subscribed to (claimed by the next wait that asks).
-\ Slot (0x20000 bytes): [0,1000) RID stack (s11 down)   [1000,1C000) heap (gp
-\   up) + data stack (sp down)   [1C000,20000) loop stack (s8 down).  Slot 0
-\   holds the kernel's own stacks.  s10 stays global so `variable` cells are
-\   shared by every thread.
+\   that no thread was subscribed to (claimed by the next wait that asks)
+\   30 region classes (3 x 0x18: size, base, count, free head, nfree, end)
+\   34 thread records (16 x 0x80: 0 region base, 4 size, 8 mode (1 = user),
+\   C process image base, 10 its code's end, 14 the process region's end,
+\   18 the binding of handle 0 (its length; 0 = the console), 1C the exit
+\   code (0 exited, cause+1 killed), 20..5F the binding's key, 64 a pending
+\   request (op, 68..74 four arguments, 78 the reply, 7C 1 pending 2 answered;
+\   src/ksrv.fam serves them); base 0 = no region)   38 the kernel's s10
+\   3C the slot last handed out (kfind goes round)   40 the thread the last
+\   post woke: sched runs it next, once, instead of drawing a ticket (a posted
+\   thread answers at once instead of waiting out the poster's turn)
+\   (its variable base: the trap switches to it, since a program exec'd in a
+\   region has one of its own).
+\ Region: [0,1000) RID stack (s11 down)   [1000,size-4000) heap (gp up) + data
+\   stack (sp down)   [size-4000,size) loop stack (s8 down).  The kernel's own
+\   stacks are a 128 KiB region taken at kinit.  s10 stays global so
+\   `variable` cells are shared by every thread.
 \ ──────────────────────────────────────────────────────────────────────────────
 
 \ ── compile-time helpers ──────────────────────────────────────────────────────
@@ -131,6 +188,11 @@ B7121000 ,   \ lui t0,0x101
 ;
 :M mcause@    \ ( -- cause )
 F3222034 ,   \ csrr t0,mcause
+1301C1FF ,   \ addi sp,sp,-4
+23205100 ,   \ sw t0,0(sp)
+;
+:M mtval@     \ ( -- addr )  the faulting address
+F3223034 ,   \ csrr t0,mtval
 1301C1FF ,   \ addi sp,sp,-4
 23205100 ,   \ sw t0,0(sp)
 ;
@@ -333,6 +395,7 @@ E39202FE ,   \ bnez t0,c <.L1^B1>
             2dup swap 9C lit + dup @ rot xor swap !      \ events ^= hit
             over tpush
             1 lit over 84 lit + !
+            dup K 40 lit + !                             \ run it next
         then
     then drop ;
 : tpost ( mask tcb -- )  swap over 9C lit + dup @ rot or swap ! twake ;
@@ -388,27 +451,102 @@ E39202FE ,   \ bnez t0,c <.L1^B1>
             ktab -1 lit -1 lit mindl mtcmp! wfi irq!
             0 lit
         else
-            rand swap %
-            ktab swap pickt K !
-            -1 lit
+            K 40 lit + @ ?dup if 0 lit K 40 lit + ! dup 84 lit + @ 1 lit = if K ! drop -1 lit else drop
+                rand swap % ktab swap pickt K ! -1 lit then
+            else
+                rand swap %
+                ktab swap pickt K !
+                -1 lit
+            then
         then
     until ;
+
+\ the kernel's own thread (0) reading and posting without a trap: a syscall
+\ costs 13 us under QEMU and the loop made three or four a turn
+: ktstate ( tid -- state )  F lit and tcb 84 lit + @ ;
+: kpostd  ( mask tid -- )   int_off F lit and tcb tpost int_on ;
+
+: khalt  begin wfi 0 lit until ;
+
+\ ── regions ───────────────────────────────────────────────────────────────────
+\ A free region's first word links to the next free one (the list is pushed in
+\ reverse, so the lowest free region of a class is handed out first).  kregion
+\ and krelease are the kernel's own (inside the trap, or before it is armed);
+\ threads use the syscalls region and release.
+
+: rcls ( c -- rec )  18 lit * K 30 lit + @ + ;
+: rrec ( tid -- rec )  7 lit lshift K 34 lit + @ + ;
+: rfree ( c -- n )  rcls 10 lit + @ ;
+: rpush ( addr c -- )  rcls  dup C lit + @ 2 lit pick !  swap over C lit + !  10 lit + dup @ 1 lit + swap ! ;
+: rpop ( c -- addr|0 )
+    rcls dup C lit + @ ?dup if
+        dup @ 2 lit pick C lit + !  over 10 lit + dup @ 1 lit - swap !  nip
+    else drop 0 lit then ;
+: kregion ( size -- addr|0 )
+    0 lit swap 3 lit 0 lit do
+        over 0= if dup i rcls @ u> 0= if i rpop rot drop swap then then
+    loop drop ;
+: rclsof ( addr -- c|-1 )
+    -1 lit 3 lit 0 lit do
+        over i rcls 4 lit + @ -  i rcls 14 lit + @ i rcls 4 lit + @ -  u< if drop i then
+    loop nip ;
+: krelease ( addr -- )
+    dup rclsof dup 0< if "proc: release: not a region\n" puts khalt then
+    over over rcls @ 1 lit - and if "proc: release: not a region's base\n" puts khalt then
+    rpush ;
+\ rpinit ( n128k n1m n8m -- )  the pool from the main heap, the base aligned to
+\ 8 MiB, the largest class first so every region is aligned to its size
+: rpinit
+    48 lit alloc K 30 lit + !
+    800 lit alloc K 34 lit + !  K 34 lit + @ 200 lit 0 lit do 0 lit over i 2 lit lshift + ! loop drop
+    800000 lit 2 lit rcls !  2 lit rcls 8 lit + !
+    100000 lit 1 lit rcls !  1 lit rcls 8 lit + !
+    20000 lit 0 lit rcls !   0 lit rcls 8 lit + !
+    0 lit 3 lit 0 lit do i rcls @ i rcls 8 lit + @ * + loop
+    7FFFFF lit + alloc ?dup 0= if "proc: no room for the region pool\n" puts khalt then
+    7FFFFF lit + FF800000 lit and
+    3 lit 0 lit do                                                     \ classes 2, 1, 0 in memory order
+        2 lit i - rcls                                                 \ base rec
+        2dup 4 lit + !  0 lit over C lit + !  0 lit over 10 lit + !
+        dup @ over 8 lit + @ * 2 lit pick + over 14 lit + !            \ end
+        dup 8 lit + @ 0 lit do                                         \ push from the top down
+            dup 14 lit + @ i 1 lit + 2 lit pick @ * -  2 lit j - rpush
+        loop
+        14 lit + @ swap drop                                           \ the next class starts at end
+    loop drop ;
 
 \ ── syscalls ──────────────────────────────────────────────────────────────────
 \ 0 yield   1 exit   2 spawn ( addr tickets -- tid )   3 getpid ( -- tid )
 \ 4 sleep ( ticks -- )   5 wait ( mask ticks -- events )   6 post ( mask tid -- )
+\ 7 spawnin ( addr tickets base size -- tid )   8 region ( size -- addr )
+\ 9 release ( addr -- )   A tstate ( tid -- state )   B myregion ( -- base size )
+\ C uspawn ( base size imgend tickets -- tid )   D request ( op a b c d -- events )
+\ E reply ( -- r )   F texcode ( tid -- code )
 
-: slotof ( i -- base )  20000 lit * K 10 lit + @ + ;
+\ kfind ( -- tcb|0 )  a free slot, round robin from the last one handed out
+\ (K+3C), so a slot that just died is not reused while 14 others are free:
+\ a parent that polls its children by tid sees them go before the number
+\ means someone else
+: kfind
+    0 lit 11 lit 1 lit do                   \ 16 steps: every slot but the one it starts after, then that one too
+        dup 0= if drop K 3C lit + @ i + F lit and
+            dup 0= if drop 0 lit else dup tcb 84 lit + @ if drop 0 lit else dup K 3C lit + ! tcb then then
+        then
+    loop ;
 
-\ build a fresh context in tcb for the body at addr
+\ build a fresh context in tcb for the body at addr, in the region of tcb's rrec
+: rgb variable ;  : rgt variable ;  : rgr variable ;  : ust variable ;  : usi variable ;
 : tinit ( tickets addr tcb -- )
     dup zregs                           \ tickets addr tcb
-    dup 8C lit + @ slotof               \ tickets addr tcb slot
-    2dup 1000 lit + swap 6C lit + !     \ s11 = slot + 0x1000 (RID top)
-    2dup 1000 lit + swap C lit + !      \ gp  = slot + 0x1000 (heap base)
-    2dup 1C000 lit + swap 8 lit + !     \ sp  = slot + 0x1C000 (data stack top)
-    20000 lit + over 60 lit + !         \ s8  = slot + 0x20000 (loop stack top)
+    dup 8C lit + @ rrec dup @ rgb ! 4 lit + @ rgb @ + rgt !
+    rgb @ 1000 lit + over 6C lit + !    \ s11 = base + 0x1000 (RID top)
+    rgb @ 1000 lit + over C lit + !     \ gp  = base + 0x1000 (heap base)
+    rgt @ 4000 lit - over 8 lit + !     \ sp  = top - 0x4000 (data stack top)
+    rgt @ over 60 lit + !               \ s8  = top (loop stack top)
     cur 68 lit + @ over 68 lit + !      \ s10 = the global RID floor / var base
+    43455845 lit over 3C lit + !        \ a5 = 'EXEC', a6 = base, a7 = size: the handoff
+    rgb @ over 40 lit + !
+    rgt @ rgb @ - over 44 lit + !
     dup 1 lit swap 84 lit + !           \ state = runnable
     dup 0 lit swap 90 lit + !           \ no subscription
     dup 0 lit swap 9C lit + !           \ no pending events
@@ -416,16 +554,47 @@ E39202FE ,   \ bnez t0,c <.L1^B1>
     88 lit + ! ;                        \ tickets
 
 : spid variable ;
+\ tspawn ( tickets addr base size -- tid )  a thread in that region; 0 (and the region untouched) when the table is full
+: tspawn
+    kfind dup 0= if drop 2drop 2drop 0 lit else
+        dup 8C lit + @ rrec rgr !
+        -rot rgr @ 4 lit + ! rgr @ !    \ tickets addr tcb
+        cur 8C lit + @ rrec 8 lit + rgr @ 8 lit + 58 lit mcopy   \ the spawner's mode, process and binding
+        0 lit rgr @ 1C lit + !  0 lit rgr @ 7C lit + !
+        dup 8C lit + @ spid !
+        tinit spid @
+    then ;
 : sysspawn ( -- )
     upop upop                           \ tickets addr
-    ktab findfree dup 0= if
-        drop 2drop 0 lit upush
-    else
-        dup 8C lit + @ spid !
-        tinit spid @ upush
-    then ;
+    20000 lit kregion ?dup if
+        dup rgb !  20000 lit tspawn dup 0= if rgb @ krelease then upush
+    else 2drop 0 lit upush then ;
+: sysspwin ( -- )
+    upop rgt ! upop rgb ! upop upop     \ tickets addr
+    rgb @ rgt @ tspawn upush ;
 
-: sysexit ( -- )  0 lit cur 84 lit + ! ;
+\ tgone ( code -- )  the thread ends: its exit code kept, the region back, the
+\ slot free; when handle 0 was bound to a key the loop thread (0) is posted
+\ bit 16 so it flushes what the thread had buffered (src/ksrv.fam).  The
+\ binding stays for that flush.
+: tgone
+    cur 8C lit + @ rrec dup 1C lit + rot swap !
+    0 lit cur 84 lit + !
+    dup @ ?dup if krelease then
+    6 lit 0 lit do 0 lit over i 2 lit lshift + ! loop
+    dup 0 lit swap 7C lit + !
+    18 lit + @ 0= 0=  cur 0 lit tcb <>  and if 10000 lit 0 lit tcb tpost then ;
+: sysexit ( -- )  0 lit tgone ;
+\ a user-mode thread for the image at base: its process is that region
+: sysuspwn ( -- )
+    upop ust ! upop usi ! upop rgt ! upop rgb !
+    ust @ rgb @ rgb @ rgt @ tspawn
+    dup if dup rrec 1 lit over 8 lit + !  rgb @ over C lit + !  usi @ over 10 lit + !  rgb @ rgt @ + swap 14 lit + ! then
+    upush ;
+: sysregn ( -- )  upop kregion upush ;
+: sysrels ( -- )  upop krelease ;
+: systst  ( -- )  upop F lit and tcb 84 lit + @ upush ;
+: sysmyrg ( -- )  cur 8C lit + @ rrec dup @ upush 4 lit + @ upush ;
 : sysgpid ( -- )  cur 8C lit + @ upush ;
 
 \ deadline = mtime + ticks (64-bit) into the current TCB
@@ -462,6 +631,18 @@ E39202FE ,   \ bnez t0,c <.L1^B1>
 : syspost ( -- )
     upop tcb upop over 84 lit + @ if swap tpost else 2drop then ;
 
+\ a request to the loop thread: five words into the record, bit 16 to thread
+\ 0, then the caller waits for bit 17 as `wait` would (the events land on
+\ its stack; lib/sys.fam drops them and reads the reply)
+: sysreq ( -- )
+    cur 8C lit + @ rrec
+    upop over 74 lit + !  upop over 70 lit + !  upop over 6C lit + !  upop over 68 lit + !  upop over 64 lit + !
+    1 lit swap 7C lit + !
+    10000 lit 0 lit tcb tpost
+    20000 lit upush 0 lit upush syswait ;
+: sysrep  ( -- )  cur 8C lit + @ rrec dup 78 lit + @ upush 0 lit swap 7C lit + ! ;
+: sysxcod ( -- )  upop F lit and rrec 1C lit + @ upush ;
+
 : syscall! ( -- )
     cur 80 lit + dup @ 4 lit + swap !   \ resume after the ecall
     cur 44 lit + @                      \ a7
@@ -472,19 +653,34 @@ E39202FE ,   \ bnez t0,c <.L1^B1>
     dup 4 lit = if drop syssleep else
     dup 5 lit = if drop syswait else
     dup 6 lit = if drop syspost else
-    drop then then then then then then then ;
-
-: khalt  begin wfi 0 lit until ;
+    dup 7 lit = if drop sysspwin else
+    dup 8 lit = if drop sysregn else
+    dup 9 lit = if drop sysrels else
+    dup A lit = if drop systst else
+    dup B lit = if drop sysmyrg else
+    dup C lit = if drop sysuspwn else
+    dup D lit = if drop sysreq else
+    dup E lit = if drop sysrep else
+    dup F lit = if drop sysxcod else
+    drop then then then then then then then then then then then then then then then then ;
 
 \ the trap entry: everything between the two asm pieces is ordinary fam running
 \ on the kernel's stacks with interrupts masked.
+\ tkill ( cause -- )  a user thread faulted: say so and end it
+: tkill
+    "proc: thread " puts cur 8C lit + @ u. " killed: cause " puts dup u. " at " puts cur 80 lit + @ u.x
+    ", address " puts mtval@ u.x '\n' lit putc
+    1 lit + tgone ;
+
 : ktrap ( -- )
     mcause@ 
     dup 80000007 lit = if drop K 28 lit + dup @ 1 lit + swap ! else
     dup 8000000B lit = if drop irq! else
     dup B lit = if drop syscall! else
+    dup 8 lit = if drop syscall! else
+    cur 8C lit + @ rrec 8 lit + @ if tkill else
         "proc: unexpected trap " puts u.x '\n' lit putc khalt
-    then then then
+    then then then then then
     sched arm ;
 
 
@@ -493,6 +689,13 @@ E39202FE ,   \ bnez t0,c <.L1^B1>
 : yield   ( -- )               0 lit syscall ;
 : texit   ( -- )               1 lit syscall ;
 : spawn   ( addr tickets -- tid ) 2 lit syscall ;
+: spawnin ( addr tickets base size -- tid ) 7 lit syscall ;
+: region  ( size -- addr )     8 lit syscall ;
+: release ( addr -- )          9 lit syscall ;
+: tstate  ( tid -- state )     A lit syscall ;
+: myregion ( -- base size )    B lit syscall ;
+: uspawn  ( base size imgend tickets -- tid ) C lit syscall ;
+: texcode ( tid -- code )      F lit syscall ;
 : getpid  ( -- tid )           3 lit syscall ;
 : sleep   ( ticks -- )         4 lit syscall ;
 : msleep  ( ms -- )            2710 lit * sleep ;     \ 10000 ticks per ms
@@ -547,20 +750,24 @@ E39C02FC ,   \ bnez t0,14 <.L1^B1>
 
 \ ── kinit ─────────────────────────────────────────────────────────────────────
 
-: kinit ( -- )
-    \ K block, the table, the slot pool
-    40 lit alloc kblk !
+: kinit ( n128k n1m n8m -- )
+    \ K block, the table, the region pool
+    48 lit alloc kblk !
+    0 lit K 40 lit + !                  \ nobody woken yet
     0 lit K 28 lit + !                  \ ticks = 0
     0 lit K 2C lit + !                  \ no unclaimed interrupts
+    0 lit K 3C lit + !                  \ slots are handed out from 1
     A00 lit alloc K 8 lit + !           \ 16 TCBs, zeroed, pid = index
     10 lit 0 lit do
         i tcb dup
         A0 lit 0 lit do 0 lit over i + ! loop
         i swap 8C lit + ! drop
     loop
-    200000 lit alloc K 10 lit + !       \ 16 slots of 128 KiB
-    \ the kernel's own stacks live in slot 0
-    0 lit slotof
+    rpinit                              \ ( n128k n1m n8m -- )
+    \ the kernel's own stacks: a 128 KiB region
+    20000 lit kregion dup K 10 lit + !
+    1301C1FF , 2320A101 ,                \ addi sp,sp,-4 ; sw s10,0(sp): push s10
+    K 38 lit + !                        \ the kernel's variable base, for the trap
     dup 1000 lit + K 1C lit + !         \ ks11
     dup 1000 lit + K 20 lit + !         \ kgp
     dup 1C000 lit + K 14 lit + !        \ ksp
@@ -619,13 +826,52 @@ F3231034 ,   \ csrr t2,mepc
 03AC8201 ,   \ lw s8,24(t0)
 83ADC201 ,   \ lw s11,28(t0)
 83A10202 ,   \ lw gp,32(t0)
+03AD8203 ,   \ lw s10,56(t0)
     ktrap
 F3220034 ,   \ csrr t0,mscratch
 03A30200 ,   \ lw t1,0(t0)
 83230308 ,   \ lw t2,128(t1)
 73901334 ,   \ csrw mepc,t2
-B7230000 ,   \ lui t2,0x2
-93830388 ,   \ addi t2,t2,-1920 # 1880 <.text+0x1880>
+8323C308 ,   \ lw t2,140(t1)
+93937300 ,   \ slli t2,t2,0x7
+03AE4203 ,   \ lw t3,52(t0)
+B383C301 ,   \ add t2,t2,t3
+03AE8300 ,   \ lw t3,8(t2)
+B72E0000 ,   \ lui t4,0x2
+938E0E80 ,   \ addi t4,t4,-2048 # 1800 <.L2^B1+0x1754>
+73B00E30 ,   \ csrc mstatus,t4
+63160E00 ,   \ bnez t3,3c <.L1^B1>
+73A00E30 ,   \ csrs mstatus,t4
+6F004007 ,   \ j ac <.L2^B1>
+03AEC300 ,   \ lw t3,12(t2)
+135E2E00 ,   \ srli t3,t3,0x2
+73100E3B ,   \ csrw pmpaddr0,t3
+03AE0301 ,   \ lw t3,16(t2)
+135E2E00 ,   \ srli t3,t3,0x2
+73101E3B ,   \ csrw pmpaddr1,t3
+03AE4301 ,   \ lw t3,20(t2)
+135E2E00 ,   \ srli t3,t3,0x2
+73102E3B ,   \ csrw pmpaddr2,t3
+03AE0300 ,   \ lw t3,0(t2)
+83AE4300 ,   \ lw t4,4(t2)
+93DE1E00 ,   \ srli t4,t4,0x1
+938EFEFF ,   \ addi t4,t4,-1
+336EDE01 ,   \ or t3,t3,t4
+135E2E00 ,   \ srli t3,t3,0x2
+73103E3B ,   \ csrw pmpaddr3,t3
+370E0004 ,   \ lui t3,0x4000
+130EFE1F ,   \ addi t3,t3,511 # 40001ff <.L2^B1+0x4000153>
+73104E3B ,   \ csrw pmpaddr4,t3
+373E8000 ,   \ lui t3,0x803
+130EEEFF ,   \ addi t3,t3,-2 # 802ffe <.L2^B1+0x802f52>
+73105E3B ,   \ csrw pmpaddr5,t3
+371E0B1B ,   \ lui t3,0x1b0b1
+130E0ED0 ,   \ addi t3,t3,-768 # 1b0b0d00 <.L2^B1+0x1b0b0c54>
+73100E3A ,   \ csrw pmpcfg0,t3
+372E0000 ,   \ lui t3,0x2
+130EBE91 ,   \ addi t3,t3,-1765 # 191b <.L2^B1+0x186f>
+73101E3A ,   \ csrw pmpcfg1,t3
+93030008 ,   \ li t2,128
 73A00330 ,   \ csrs mstatus,t2
 83204300 ,   \ lw ra,4(t1)
 03218300 ,   \ lw sp,8(t1)
@@ -672,7 +918,7 @@ B7230000 ,   \ lui t2,0x2
 
 Test {
 	kinit {
-		kinit
+		20 lit 4 lit 1 lit kinit
 		getpid 0 lit asrt_eq
 		cur 0 lit tcb asrt_eq
 		0 lit tcb 84 lit + @ 1 lit asrt_eq         \ thread 0 runnable
@@ -681,8 +927,30 @@ Test {
 		ktab ntickets A lit asrt_eq
 		ktab nwait 0 lit asrt_eq
 		ktab findfree 1 lit tcb asrt_eq            \ slot 1 is the first free
-		K 1C lit + @ 0 lit slotof 1000 lit + asrt_eq
-		K 14 lit + @ 0 lit slotof 1C000 lit + asrt_eq
+		K 1C lit + @ K 10 lit + @ 1000 lit + asrt_eq
+		K 14 lit + @ K 10 lit + @ 1C000 lit + asrt_eq
+	}
+	\ the pool: counts, alignment, the smallest class that fits, spill, release
+	regions {
+		: rg variable ;  : rg2 variable ;  : xr0 variable ;
+		0 lit rfree 1F lit asrt_eq  1 lit rfree 4 lit asrt_eq  2 lit rfree 1 lit asrt_eq
+		K 10 lit + @ 1FFFF lit and 0 lit asrt_eq
+		K 10 lit + @ rclsof 0 lit asrt_eq
+		1 lit region dup rg ! 1FFFF lit and 0 lit asrt_eq  0 lit rfree 1E lit asrt_eq
+		rg @ rclsof 0 lit asrt_eq
+		20001 lit region dup rg2 ! FFFFF lit and 0 lit asrt_eq  1 lit rfree 3 lit asrt_eq
+		rg2 @ rclsof 1 lit asrt_eq  rg2 @ 20000 lit + rclsof 1 lit asrt_eq
+		rg2 @ release  1 lit rfree 4 lit asrt_eq
+		800000 lit region dup rg2 ! 7FFFFF lit and 0 lit asrt_eq  2 lit rfree 0 lit asrt_eq
+		rg2 @ release  2 lit rfree 1 lit asrt_eq
+		800001 lit region 0 lit asrt_eq
+		rg @ release  0 lit rfree 1F lit asrt_eq
+		1E lit 0 lit do 20000 lit region drop loop  0 lit rfree 1 lit asrt_eq        \ all but the last
+		20000 lit region drop  0 lit rfree 0 lit asrt_eq
+		20000 lit region dup rg ! FFFFF lit and 0 lit asrt_eq  1 lit rfree 3 lit asrt_eq   \ spilled to 1 MiB
+		rg @ release  1 lit rfree 4 lit asrt_eq
+		K 10 lit + @ 1F lit 0 lit do 20000 lit + dup release loop drop  0 lit rfree 1F lit asrt_eq
+		K 30 lit + @ 14 lit + @ rclsof -1 lit asrt_eq
 	}
 	table {
 		3 lit tcb 0 lit tcb - 1E0 lit asrt_eq
@@ -690,7 +958,6 @@ Test {
 			i tcb 8C lit + @ i asrt_eq             \ pid = index
 			i tcb 84 lit + @ i 0= 1 lit and asrt_eq          \ only 0 is live
 		loop
-		1 lit slotof 0 lit slotof - 20000 lit asrt_eq
 	}
 	rand {
 		K C lit + @                                \ save the seed
@@ -751,17 +1018,21 @@ Test {
 	tinit {
 		: tsp variable ;
 		int_off
+		100000 lit region F lit rrec !  100000 lit F lit rrec 4 lit + !
 		thread{ }thread 3 lit swap F lit tcb tinit
 		F lit tcb 84 lit + @ 1 lit asrt_eq
 		F lit tcb 88 lit + @ 3 lit asrt_eq
 		F lit tcb 8C lit + @ F lit asrt_eq
-		F lit tcb 8 lit + @ F lit slotof 1C000 lit + asrt_eq    \ sp
-		F lit tcb C lit + @ F lit slotof 1000 lit + asrt_eq     \ gp
-		F lit tcb 6C lit + @ F lit slotof 1000 lit + asrt_eq    \ s11
-		F lit tcb 60 lit + @ F lit slotof 20000 lit + asrt_eq   \ s8
+		F lit tcb 8 lit + @ F lit rrec @ FC000 lit + asrt_eq    \ sp
+		F lit tcb C lit + @ F lit rrec @ 1000 lit + asrt_eq     \ gp
+		F lit tcb 6C lit + @ F lit rrec @ 1000 lit + asrt_eq    \ s11
+		F lit tcb 60 lit + @ F lit rrec @ 100000 lit + asrt_eq  \ s8
 		F lit tcb 68 lit + @ 0 lit tcb 68 lit + @ asrt_eq       \ s10 shared
+		F lit tcb 3C lit + @ 43455845 lit asrt_eq               \ a5 a6 a7: the handoff
+		F lit tcb 40 lit + @ F lit rrec @ asrt_eq  F lit tcb 44 lit + @ 100000 lit asrt_eq
 		F lit tcb 4 lit + @ 0 lit asrt_eq                       \ ra zeroed
 		0 lit F lit tcb 84 lit + !
+		F lit rrec @ release  0 lit F lit rrec !
 		int_on
 	}
 	spawn {
@@ -776,16 +1047,57 @@ Test {
 		1 lit tcb 84 lit + @ 0 lit asrt_eq
 		ktab ntickets A lit asrt_eq
 		ktab findfree 1 lit tcb asrt_eq
+		0 lit rfree 1F lit asrt_eq                 \ the thread's region came back
+		1 lit rrec @ 0 lit asrt_eq
 	}
 	stacks {
 		: tgp variable ;
 		: mgp variable ;
+		: tbase variable ;
 		0 lit alloc mgp !
-		thread{ sp@ tsp !  10 lit alloc tgp ! }thread 1 lit spawn join
-		tsp @ 1 lit slotof 1000 lit + u> assert
-		tsp @ 1 lit slotof 1C000 lit + 4 lit + u< assert
-		tgp @ 1 lit slotof 1000 lit + asrt_eq
+		thread{ sp@ tsp !  10 lit alloc tgp !  getpid rrec @ tbase ! }thread 1 lit spawn join
+		tbase @ 1FFFF lit and 0 lit asrt_eq
+		tsp @ tbase @ 1000 lit + u> assert
+		tsp @ tbase @ 1C000 lit + 4 lit + u< assert
+		tgp @ tbase @ 1000 lit + asrt_eq
 		0 lit alloc mgp @ asrt_eq                  \ thread allocs do not move ours
+	}
+	\ user mode: a hand-made image that writes into its own region and exits; one that
+	\ writes a kernel variable and is killed for it, the variable untouched
+	umode {
+		: umb variable ;  : umv variable ;
+		0 lit rfree xr0 !  20000 lit region umb !
+		11082023 lit umb @ !  00100893 lit umb @ 4 lit + !  00000073 lit umb @ 8 lit + !       \ sw a6,256(a6); li a7,1; ecall
+		0 lit umb @ 100 lit + !
+		umb @ 20000 lit umb @ C lit + 5 lit uspawn dup 0 lit <> assert join
+		umb @ 100 lit + @ umb @ asrt_eq  0 lit rfree xr0 @ asrt_eq
+		20000 lit region umb !  12345678 lit umv !
+		umv 800 lit + FFFFF000 lit and 2B7 lit or umb @ !                                    \ lui t0,%hi(umv)
+		umv FFF lit and 14 lit lshift 28293 lit or umb @ 4 lit + !                            \ addi t0,t0,%lo(umv)
+		0102A023 lit umb @ 8 lit + !  00100893 lit umb @ C lit + !  00000073 lit umb @ 10 lit + !   \ sw a6,0(t0); li a7,1; ecall
+		umb @ 20000 lit umb @ 14 lit + 5 lit uspawn dup 0 lit <> assert dup join
+		dup tstate 0 lit asrt_eq  texcode 8 lit asrt_eq  umv @ 12345678 lit asrt_eq  0 lit rfree xr0 @ asrt_eq
+	}
+	\ a thread in a 1 MiB region the caller took: its stacks are laid out in it, exit gives it back
+	spawnin {
+		: rsz variable ;  : stid variable ;
+		100000 lit region rg !
+		thread{ sp@ tsp !  myregion rsz ! tbase ! }thread 1 lit rg @ 100000 lit spawnin
+		dup 0 lit <> assert  dup stid !  join
+		tbase @ rg @ asrt_eq  rsz @ 100000 lit asrt_eq  myregion 0 lit asrt_eq 0 lit asrt_eq
+		stid @ tstate 0 lit asrt_eq  0 lit tstate 1 lit asrt_eq  stid @ texcode 0 lit asrt_eq
+		tsp @ rg @ FC000 lit + 4 lit + u< assert  tsp @ rg @ F0000 lit + u> assert
+		1 lit rfree 4 lit asrt_eq  stid @ rrec @ 0 lit asrt_eq
+		\ slots go round: the next spawn gets the slot after this one
+		thread{ }thread 1 lit spawn dup stid @ 1 lit + F lit and asrt_eq join
+		0 lit rfree 1F lit asrt_eq
+		\ the pool empty: spawn fails cleanly and the table stays free
+		1F lit 0 lit do 20000 lit region drop loop  4 lit 0 lit do 100000 lit region drop loop  1 lit 0 lit do 800000 lit region drop loop
+		thread{ }thread 1 lit spawn 0 lit asrt_eq  ktab findfree 1 lit tcb asrt_eq
+		K 10 lit + @ 1F lit 0 lit do 20000 lit + dup release loop drop
+		1 lit rcls 4 lit + @ 4 lit 0 lit do dup release 100000 lit + loop drop
+		2 lit rcls 4 lit + @ 1 lit 0 lit do dup release 800000 lit + loop drop
+		0 lit rfree 1F lit asrt_eq  1 lit rfree 4 lit asrt_eq  2 lit rfree 1 lit asrt_eq
 	}
 	yield {
 		yield
@@ -794,7 +1106,7 @@ Test {
 	}
 	tabfull {
 		: flag variable ;
-		0 lit flag !
+		0 lit flag !  0 lit K 3C lit + !            \ slots from 1 again
 		10 lit 1 lit do
 			thread{ begin yield flag @ until }thread 1 lit spawn i asrt_eq
 		loop
@@ -849,7 +1161,7 @@ Test {
 		: wlog variable ;
 		: wlogn variable ;
 		: wlog! ( pid -- )  wlogn @ 1 lit + dup wlogn ! wlog + c! ;
-		0 lit wlogn !  0 lit wlog !
+		0 lit wlogn !  0 lit wlog !  0 lit K 3C lit + !            \ slots from 1 again
 		thread{ 1E lit msleep getpid wlog! }thread 1 lit spawn
 		thread{ A lit msleep getpid wlog! }thread 1 lit spawn
 		thread{ 14 lit msleep getpid wlog! }thread 1 lit spawn
@@ -952,7 +1264,7 @@ Test {
 Bench {
 	\ yield with nothing else runnable: trap in, lottery, resume the same thread
 	yield1 {
-		kinit
+		20 lit 4 lit 1 lit kinit
 		bgo
 		2710 lit 0 lit do yield loop
 		2710 lit bops

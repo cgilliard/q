@@ -1,0 +1,131 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/exec.fam — programs: images kept in the store, run in regions of their own.
+\
+\   exinit   ( -- )                      once, after stinit
+\   exec     ( key klen size tickets -- tid )   the image stored under key,
+\            into a fresh region of at least size bytes (the image may take
+\            half of it), started as a thread with that many tickets; 0 when
+\            there is no such key, no region, or it does not fit.  Thread 0
+\            only: the read may wait on the disk.
+\   proginst ( blob -- n )               install the programs packed by
+\            scripts/progs.sh ("QPRG", count, then a 16-byte name and a size
+\            per program, then the images, each 4-byte aligned) under bin/NAME;
+\            n programs, 0 when blob does not start with the magic
+\   progsize ( blob -- bytes )           how long such a blob is (0 without
+\            the magic): what src/kernel.fam allocs past to keep it
+\
+\ A program is a fam build of its own (./tools/fam --prog, lib/sys.fam).  exec
+\ copies its image to the region's base, zeroes the 20 KiB after it from the
+\ next page boundary (the RID stack and the variables: nothing else zeroes
+\ them; the stdlib's init starts them on a page, and the PMP boundary between
+\ code and data has to be one for QEMU to cache either page), and starts the
+\ thread at the base with a5 = 'EXEC', a6 = base, a7 = size, from which init
+\ places the stacks at the region's top, in user mode behind PMP (uspawn).
+\ Needs src/store.fam and src/proc.fam.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: exk variable ;  : exkl variable ;  : exb variable ;  : exs variable ;  : ext variable ;  : exn variable ;
+: pgi variable ;  : pgk variable ;  : pgn variable ;
+
+: exinit ( -- )  20 lit alloc pgk ! ;
+: pgalign ( n -- n' )  3 lit + FFFFFFFC lit and ;
+
+: exec ( key klen size tickets -- tid )
+	ext ! exs ! exkl ! exk !
+	exs @ region ?dup 0= if 0 lit else
+		exb !
+		0 lit txbeg dup exk @ exkl @ exb @ exs @ 1 lit rshift get exn ! txcommit
+		exn @ 0<  exn @ exs @ 1 lit rshift u>  or if exb @ release 0 lit else
+			exb @ exn @ + FFF lit + FFFFF000 lit and 1400 lit pgzero
+			exb @ exs @ exb @ exn @ + FFF lit + FFFFF000 lit and ext @ uspawn
+			dup 0= if exb @ release then
+		then
+	then ;
+
+\ ── the blob ──────────────────────────────────────────────────────────────────
+\ +0 "QPRG"  +4 count  +8 count x (name[16], size)  then the images
+
+: pgent ( blob i -- entry )  14 lit * + 8 lit + ;
+: pgnlen ( entry -- n )  0 lit begin 2dup + c@ over 10 lit u< and while 1 lit + repeat nip ;
+: pgdata ( blob -- addr )  dup 4 lit + @ 14 lit * 8 lit + + ;
+
+: progsize ( blob -- bytes )
+	dup @ 47525051 lit <> if drop 0 lit else
+		dup pgdata
+		over 4 lit + @ ?dup if 0 lit do over i pgent 10 lit + @ pgalign + loop then
+		swap -
+	then ;
+
+: proginst ( blob -- n )
+	dup @ 47525051 lit <> if drop 0 lit else
+		dup pgdata pgi !
+		dup 4 lit + @ ?dup if 0 lit do
+			dup i pgent                                                     \ blob entry
+			dup pgnlen pgn !
+			"bin/" pgk @ 4 lit mcopy  dup pgk @ 4 lit + pgn @ mcopy
+			-1 lit txbeg dup pgk @ pgn @ 4 lit + 4 lit pick 10 lit + @ pgi @ swap put txcommit
+			10 lit + @ pgalign pgi @ + pgi !
+		loop then
+		4 lit + @
+	then ;
+
+\ ──────────────────────────────────────────────────────────────────────────────
+\ Tests (the store src/store.fam's tests opened, sds; skipped without a disk):
+\ a hand-made image that records its handoff in its own region, sleeps 100 ms
+\ (so the test can look) and exits; one that writes a kernel variable and is
+\ killed in user mode for it; then a blob.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+Test {
+	execs {
+		: xi variable ;  : xf variable ;  : xb variable ;  : xr variable ;
+		: xcmp ( a s n -- flag )  -1 lit swap 0 lit do 2 lit pick i + c@ 2 lit pick i + c@ <> if drop 0 lit then loop nip nip ;
+		sds @ if
+			exinit
+			40 lit alloc xi !  10 lit alloc xf !  10004 lit alloc xb !  xf @ 4 lit pgzero
+			\ t0 = a6 + 0x1000 (the page after the image)  sw a6,0(t0)  sw a7,4(t0)  li t1,1  sw t1,8(t0)
+			\ li t0,1000000  push it  li a7,4  ecall (sleep)  li a7,1  ecall
+			000012B7 lit xi @ !           010282B3 lit xi @ 4 lit + !
+			0102A023 lit xi @ 8 lit + !   0112A223 lit xi @ C lit + !
+			00100313 lit xi @ 10 lit + !  0062A423 lit xi @ 14 lit + !
+			000F42B7 lit xi @ 18 lit + !  24028293 lit xi @ 1C lit + !
+			FFC10113 lit xi @ 20 lit + !  00512023 lit xi @ 24 lit + !
+			00400893 lit xi @ 28 lit + !  00000073 lit xi @ 2C lit + !
+			00100893 lit xi @ 30 lit + !  00000073 lit xi @ 34 lit + !
+			-1 lit txbeg dup "bin/t" 5 lit xi @ 38 lit put txcommit
+			0 lit rfree xr !
+			"bin/t" 5 lit 20000 lit 5 lit exec dup 0 lit <> assert
+			begin dup tstate 2 lit = 0= while yield repeat                   \ asleep: look at what it wrote
+			dup rrec @ dup 1000 lit + @ over asrt_eq  dup 1004 lit + @ 20000 lit asrt_eq  1008 lit + @ 1 lit asrt_eq
+			dup rrec 8 lit + @ 1 lit asrt_eq                                 \ a user thread
+			join  0 lit rfree xr @ asrt_eq                                   \ gone, the region back
+			\ lui t0,%hi(xf)  addi t0,t0,%lo(xf)  sw a6,0(t0)  li a7,1  ecall: a kernel variable, so it is killed
+			xf @ 800 lit + FFFFF000 lit and 2B7 lit or xi @ !
+			xf @ FFF lit and 14 lit lshift 28293 lit or xi @ 4 lit + !
+			0102A023 lit xi @ 8 lit + !  00100893 lit xi @ C lit + !  00000073 lit xi @ 10 lit + !
+			-1 lit txbeg dup "bin/t" 5 lit xi @ 14 lit put txcommit
+			"bin/t" 5 lit 20000 lit 5 lit exec dup 0 lit <> assert join
+			xf @ @ 0 lit asrt_eq  0 lit rfree xr @ asrt_eq
+			"bin/none" 8 lit 20000 lit 5 lit exec 0 lit asrt_eq  0 lit rfree xr @ asrt_eq
+			-1 lit txbeg dup "bin/big" 7 lit xb @ 10001 lit put txcommit     \ over half the region: refused
+			"bin/big" 7 lit 20000 lit 5 lit exec 0 lit asrt_eq  0 lit rfree xr @ asrt_eq
+			-1 lit txbeg dup "bin/t" 5 lit del drop dup "bin/big" 7 lit del drop txcommit
+		then
+	}
+	blob {
+		sds @ if
+			xb @ 10 lit pgzero
+			47525051 lit xb @ !  2 lit xb @ 4 lit + !
+			'a' lit xb @ 8 lit + c!  8 lit xb @ 18 lit + !
+			'b' lit xb @ 1C lit + c!  'b' lit xb @ 1D lit + c!  5 lit xb @ 2C lit + !
+			"ABCDEFGH12345" xb @ 30 lit + D lit mcopy
+			xb @ progsize 40 lit asrt_eq
+			xb @ 9 lit + pgnlen 0 lit asrt_eq  xb @ 8 lit + pgnlen 1 lit asrt_eq  xb @ 1C lit + pgnlen 2 lit asrt_eq
+			xb @ proginst 2 lit asrt_eq
+			0 lit txbeg dup "bin/a" 5 lit xi @ 40 lit get 8 lit asrt_eq  xi @ "ABCDEFGH" 8 lit xcmp assert
+			dup "bin/bb" 6 lit xi @ 40 lit get 5 lit asrt_eq  xi @ "12345" 5 lit xcmp assert  txcommit
+			"x" progsize 0 lit asrt_eq  "x" proginst 0 lit asrt_eq
+			-1 lit txbeg dup "bin/a" 5 lit del drop dup "bin/bb" 6 lit del drop txcommit
+		then
+	}
+}

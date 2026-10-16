@@ -9,9 +9,9 @@
 #
 # Boot ABI (we set up our own gp via auto-prologue below):
 #     PC = 0x80000000     entry of this binary
-#     gp = end_marker     byte just past tabernacle.bin
-#                         (full_node.bin is concatenated after, so
-#                          gp = full_node base; gp-40 = config [nchunks,bin_size,hash].)
+#     gp = end_marker     byte just past tabernacle.bin (page-aligned: the node loads there)
+#                         (kernel.bin is concatenated after, so
+#                          gp = kernel base; gp-40 = config [nchunks,bin_size,hash].)
 #
 # Calling convention — NO JALR.  Subroutines are reached via direct `j`
 # with a per-call-site dispatch tag.  Mirrors the CALL/BST macros in
@@ -19,7 +19,7 @@
 #     s11 = current return ID (set by CALL)
 #     s10 = RID-stack ptr     (decreases on push)
 #     s9  = RID-stack bottom  (bounds check)
-#     s7  = full_node base    (page-aligned, persists for handoff)
+#     s7  = kernel base    (page-aligned, persists for handoff)
 # Callee saves nothing on RID stack itself; CALL pushes/pops s11.
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -135,7 +135,7 @@ _start:
 	LOAD_ADDRESS gp, end_marker
 
 	# ── §1 Page-align s7, then carve sp / s10 / s9 above it. ─────────
-	# s7 = full_node base (page-aligned).
+	# s7 = kernel base (page-aligned).
 	# sp     = s7 + STACK_SIZE              (data stack top, grows down)
 	# s10    = s7 + STACK_SIZE + RID_SIZE   (RID stack top, grows down)
 	# s9     = s7 + STACK_SIZE              (RID stack bottom — when s10
@@ -383,7 +383,7 @@ ph2_skip:
 
 # ──────────────────────────────────────────────────────────────────────────────
 # §3 Disk boot:
-#     scan_disk → init virtio-blk → read full_node into [s7..s7+BIN_SIZE)
+#     scan_disk → init virtio-blk → read the kernel into [s7..s7+BIN_SIZE)
 #     → gimli_hash → compare to hash_data → handoff.
 # A missing block device or a read error halts (halt_no_disk); a successful
 # read whose hash does not match falls through to §5 net boot.
@@ -420,10 +420,10 @@ ph2_skip:
 
 
 # ── Read loop: load BIN_SIZE bytes from disk into [gp..gp+BIN_SIZE). ─────
-# gp = full_node base (where the bin gets loaded); s7 = queue/stack base
-# (post-full_node, page-aligned).  We mustn't write disk data into s7's
+# gp = kernel base (where the bin gets loaded); s7 = queue/stack base
+# (post-kernel, page-aligned).  We mustn't write disk data into s7's
 # region or we'd clobber descriptors / status / stack.
-	mv      s0, gp                          # dest walker = full_node base
+	mv      s0, gp                          # dest walker = kernel base
 	lw      t0, -36(gp)
 	mv      s1, t0                          # bytes remaining
 	li      s2, 0                           # sector counter
@@ -471,7 +471,7 @@ read_done:
 	# Allocate 32-B scratch on stack for computed hash.
 	addi    sp, sp, -32
 	mv      a2, sp                          # output buf
-	mv      a0, gp                          # data = full_node base
+	mv      a0, gp                          # data = kernel base
 	lw      a1, -36(gp)
 	CALL    gimli_hash
 
@@ -499,9 +499,9 @@ hash_cmp:
 	mv      a2, s4                          # a2 = bind_port
 	addi    t0, a0, DBGFLAG - SEED_LIST_OFFSET   # t0 = s7 + DBGFLAG (= a0 - 40)
 	lw      a3, 0(t0)                       # a3 = debug flag
-	mv      a4, gp                          # a4 = full_node base address (handoff arg)
+	mv      a4, gp                          # a4 = kernel base address (handoff arg)
 	nop                                     # layout pad
-	j       end_marker                      # gp = end_marker = full_node entry
+	j       end_marker                      # gp = end_marker = kernel entry
 
 
 hash_mismatch:
@@ -528,7 +528,7 @@ hash_mismatch:
 	# disk_read uses the same V_QPFN = s7 (legacy MMIO 1-page-per-queue
 	# layout) as the net RX queue.  Each disk read bumps the device's
 	# used.idx at s7+0x1002 and writes a status entry at s7+0x1004.
-	# After the 48 disk reads needed to load a 3 MiB full_node.bin,
+	# After the 48 disk reads needed to load a 3 MiB kernel.bin,
 	# used.idx = 48; net rx_loop would then walk through 48 phantom
 	# 1-byte "packets" pointing into zero-filled buffers, never see a
 	# real BIN0 reply in time, and halt 'N'.  Just zero used.flags +
@@ -667,7 +667,7 @@ rx_desc_done:
 #     s2 = NCHUNKS                    s3 = virtio-net MMIO base
 #     s4 = bind port                  s5 = seed count (parsed)
 #     s7 = data region base           s8 = UART base
-#     gp = full_node base (write target)
+#     gp = kernel base (write target)
 # Per packet: a2 = RX buffer, a1 = its bytes, a7 = its descriptor.
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -1160,7 +1160,7 @@ net_hash_cmp:
 	mv      a2, s4
 	addi    t0, a0, DBGFLAG - SEED_LIST_OFFSET   # t0 = s7 + DBGFLAG (= a0 - 40)
 	lw      a3, 0(t0)                       # a3 = debug flag
-	mv      a4, gp                          # a4 = full_node base address (handoff arg)
+	mv      a4, gp                          # a4 = kernel base address (handoff arg)
 	nop                                     # layout pad
 	j       end_marker
 
@@ -2128,6 +2128,15 @@ msg_nogood: .asciz "tabernacle: no peer has a good copy of this build of the nod
 msg_nodev:  .asciz "tabernacle: no disk or network device\n"
 msg_nonet:  .asciz "tabernacle: no progress fetching the node: giving up\n"
 	.balign 4, 0                            # zeros: nops can't pad odd bytes (no C)
+	# The node is loaded at end_marker.  Its data starts on a page (its stdlib's
+	# init rounds gp up to one) and scripts/build.sh pads its image to a page
+	# before the programs blob, so the two line up only if end_marker is
+	# page-aligned: the pack stub (src/fampack.fam) unpacks tabernacle at
+	# 0x80001000, and this pads it to a page less the 40 bytes of config.  The fill is
+	# 0x13 bytes, not zeros, because tools/s2fam0_tabernacle.py scrapes
+	# objdump's listing and objdump elides runs of zeros.
+	.balign 4096, 0x13
+	.fill 1014, 4, 0x13131313
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Config, patched by scripts/build.sh (patch_config): [nchunks][bin_size][hash].

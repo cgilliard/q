@@ -1,0 +1,26 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ lib/pstack.fam — a program's network stack, set up: src/eth.fam's state from
+\ the kernel's addresses (the program does no ARP of its own: the gateway's MAC
+\ comes from the kernel, peers are learned from their frames), src/udp.fam's
+\ sockets, and the dispatcher for the frames in the ring.
+\
+\   pstack ( slots -- )      pnetinit, netinfo, the ethernet and UDP state
+\                            (TCP's is the program's: tcpinit when it listens)
+\   pnetin ( buf len -- )    one frame from the ring: the sender learned, IPv4
+\                            to ipin, UDP to udpin, TCP to tcpin, the rest dropped
+\ Needs lib/pnet.fam src/eth.fam src/ip.fam src/udp.fam src/tcp.fam.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: pstack ( slots -- )
+	pnetinit netinfo
+	pinfo @ @ ipaddr !  pinfo @ 4 lit + @ ipmask !  pinfo @ 8 lit + @ ipgw !
+	800 lit alloc txf !  80 lit alloc dup arpt ! 20 lit 0 lit do 0 lit over i 2 lit lshift + ! loop drop
+	0 lit arpn !  8 lit alloc dup bcast ! 6 lit 0 lit do FF lit over i + c! loop drop
+	ipgw @ pinfo @ C lit + arpadd
+	udpinit ;
+
+: pnetin ( buf len -- )
+	over ethtype 800 lit = if
+		over 1A lit + be32@ 2 lit pick 6 lit + arpadd
+		E lit - swap E lit + swap ipin ?dup if dup 11 lit = if drop udpin else 6 lit = if tcpin else 2drop then then then
+	else 2drop then ;

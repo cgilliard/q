@@ -56,7 +56,7 @@
 \   ds+0x40 donep      ptr to done[nslots] array (0 pending, 1 ok, >1 error)
 \ Needs src/fence.fam (fences, vfind/virqof/vack) and src/proc.fam (wait, irqon)
 \ compiled before it.  The queue memory must come from the main thread's heap:
-\ a spawned thread's heap arena is only 108 KiB.
+\ a thread spawned with `spawn` has only 108 KiB of heap.
 \ ──────────────────────────────────────────────────────────────────────────────
 
 \ ── qlayout ( ds qnum -- ds )  cache the split-ring layout for this QueueNum into the

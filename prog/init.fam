@@ -1,0 +1,50 @@
+\ prog/init.fam — the first program the node runs.  It execs the programs named
+\ in the store's "init" value (names separated by spaces; each is the key
+\ bin/NAME, run in 8 MiB with 5 tickets), then watches them: one the kernel
+\ killed is restarted, up to three times; one that exited stays down; when none
+\ is left init exits too.  Its own lines go to the UART directly, as every
+\ program's puts does for now.
+: ibuf variable ;  : ikey variable ;  : ich variable ;  : ilen variable ;  : inn variable ;
+: irec ( i -- rec )  4 lit lshift ich @ + ;        \ +0 tid  +4 name  +8 name length  +C restarts
+
+: istart ( i -- )
+	irec dup 4 lit + @ ikey @ 4 lit + 2 lit pick 8 lit + @ scopy
+	ikey @ over 8 lit + @ 4 lit + 800000 lit 5 lit sexec
+	dup 0= if "init: could not start " puts over 4 lit + @ puts '\n' lit putc then
+	swap ! ;
+
+400 lit alloc ibuf !  80 lit alloc ikey !  80 lit alloc ich !
+20 lit 0 lit do 0 lit ich @ i 2 lit lshift + ! loop
+"bin/" ikey @ 4 lit scopy
+"init" 4 lit ibuf @ 3FF lit sget dup 0< if drop "init: no 'init' key in the store: nothing to run\n" puts texit then ilen !
+0 lit ibuf @ ilen @ + c!
+0 lit inn !
+ibuf @ begin dup c@ while
+	dup c@ 20 lit = if 1 lit + else
+		inn @ 8 lit u< if
+			dup inn @ irec 4 lit + !
+			begin dup c@ dup 0= 0= swap 20 lit <> and while 1 lit + repeat
+			dup inn @ irec 4 lit + @ - inn @ irec 8 lit + !
+			dup c@ if 0 lit over c! 1 lit + then
+			inn @ 1 lit + inn !
+		else drop ibuf @ ilen @ + then
+	then
+repeat drop
+inn @ ?dup if 0 lit do i istart loop then
+begin
+	64 lit msleep
+	0 lit inn @ ?dup if 0 lit do
+		i irec @ if
+			i irec @ tstate 0= if
+				i irec @ texcode if
+					i irec C lit + @ 3 lit u< if
+						"init: " puts i irec 4 lit + @ puts " was killed: restarting it\n" puts
+						i irec C lit + dup @ 1 lit + swap !  i istart
+					else "init: " puts i irec 4 lit + @ puts " keeps getting killed: giving up on it\n" puts 0 lit i irec ! then
+				else "init: " puts i irec 4 lit + @ puts " exited\n" puts 0 lit i irec ! then
+			then
+		then
+		i irec @ if 1 lit + then
+	loop then
+0= until
+"init: nothing left to run\n" puts

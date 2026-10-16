@@ -1,5 +1,6 @@
 \ ──────────────────────────────────────────────────────────────────────────────
-\ src/udpsrv.fam — the node's UDP endpoint: a socket on the node's port that
+\ prog/udpsrv.fam — (the kernel-side echo the node used before prog/udpecho.fam took port 3737; kept for its tests and benches)
+\ the node's UDP endpoint: a socket on the node's port that
 \ answers every datagram with the same bytes back to its sender.  This is the
 \ path nodes will talk to each other on, so it is the one to measure: the
 \ bench below gives its cost per datagram without a network, scripts/perf.sh
@@ -9,7 +10,7 @@
 \   usturn ( -- )            once per loop turn: every queued datagram answered
 \   usin / usout             datagrams received / answered (variables)
 \ With src/tcp.fam's tlog set, a line per second on the UART when the counts
-\ changed.  Needs src/udp.fam and src/http.fam (hcmp in the test) before it.
+\ changed.  Needs src/udp.fam and prog/http.fam (hcmp in the test) before it.
 \ ──────────────────────────────────────────────────────────────────────────────
 
 : ussk variable ;  : usb variable ;  : usin variable ;  : usout variable ;

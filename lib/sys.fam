@@ -1,0 +1,129 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ lib/sys.fam — a program's view of the kernel (src/proc.fam): the syscalls.
+\ ./tools/fam --prog puts this after the stdlib, so a program is built like any
+\ fam program but calls the kernel it is exec'd under (src/exec.fam) instead
+\ of compiling one in.  A program is one thread in a region of its own: its
+\ image, 4 KiB of RID stack and 16 KiB of variables after it, its heap growing
+\ up from there, and the data and loop stacks at the region's top (the stdlib's
+\ init lays that out from the a5/a6/a7 handoff).  --prog ends it with texit;
+\ its `puts` and friends write the UART directly, as everything does in M-mode.
+\
+\   yield texit spawn getpid sleep msleep wait post spawnin region release
+\   tstate myregion            as in src/proc.fam's API
+\   join    ( tid -- )         yield until thread tid is gone
+\   thread{ ... }thread  code{ ... }code   as in src/proc.fam
+\ ──────────────────────────────────────────────────────────────────────────────
+
+:M syscall    \ ( n -- )  a7 = n; ecall
+83280100 ,   \ lw a7,0(sp)
+13014100 ,   \ addi sp,sp,4
+73000000 ,   \ ecall
+;
+: yield   ( -- )               0 lit syscall ;
+: texit   ( -- )               1 lit syscall ;
+: spawn   ( addr tickets -- tid ) 2 lit syscall ;
+: getpid  ( -- tid )           3 lit syscall ;
+: sleep   ( ticks -- )         4 lit syscall ;
+: msleep  ( ms -- )            2710 lit * sleep ;     \ 10000 ticks per ms
+: wait    ( mask ticks -- events ) 5 lit syscall ;
+: post    ( mask tid -- )      6 lit syscall ;
+: spawnin ( addr tickets base size -- tid ) 7 lit syscall ;
+: region  ( size -- addr )     8 lit syscall ;
+: release ( addr -- )          9 lit syscall ;
+: tstate  ( tid -- state )     A lit syscall ;
+: myregion ( -- base size )    B lit syscall ;
+: join    ( tid -- )           begin dup tstate 0= dup 0= if yield then until drop ;
+
+\ ── thread bodies (the same words as src/proc.fam) ─────────────────────────────
+\ ,addr  ( C: cursor -- )  emit a runtime push of the address of an output cursor
+\ taken with `here`, as auipc + addi from where it is emitted: position
+\ independent, since the image is not always loaded at 0x80000000 (tabernacle
+\ puts the node after itself).  (`lit` would push the raw compiler-heap cursor.)
+:M ,addr
+83220200 ,   \ lw t0,0(tp) # 0 <.text>
+13024200 ,   \ addi tp,tp,4 # 4 <.text+0x4>
+B3823240 ,   \ sub t0,t0,gp
+B71F0000 ,   \ lui t6,0x1
+938F0F80 ,   \ addi t6,t6,-2048 # 800 <.text+0x800>
+3383F201 ,   \ add t1,t0,t6
+1353C300 ,   \ srli t1,t1,0xc
+9313C300 ,   \ slli t2,t1,0xc
+B3837240 ,   \ sub t2,t0,t2
+371E0000 ,   \ lui t3,0x1
+130EFEFF ,   \ addi t3,t3,-1 # fff <.text+0xfff>
+B3F3C301 ,   \ and t2,t2,t3
+931EC300 ,   \ slli t4,t1,0xc
+93EE7E31 ,   \ ori t4,t4,791
+23A0D101 ,   \ sw t4,0(gp)
+93814100 ,   \ addi gp,gp,4
+939E4301 ,   \ slli t4,t2,0x14
+370F0300 ,   \ lui t5,0x30
+130F3F31 ,   \ addi t5,t5,787 # 30313 <.text+0x30313>
+B3EEEE01 ,   \ or t4,t4,t5
+23A0D101 ,   \ sw t4,0(gp)
+93814100 ,   \ addi gp,gp,4
+B70EC1FF ,   \ lui t4,0xffc10
+938E3E11 ,   \ addi t4,t4,275 # ffc10113 <.text+0xffc10113>
+23A0D101 ,   \ sw t4,0(gp)
+93814100 ,   \ addi gp,gp,4
+B72E6100 ,   \ lui t4,0x612
+938E3E02 ,   \ addi t4,t4,35 # 612023 <.text+0x612023>
+23A0D101 ,   \ sw t4,0(gp)
+93814100 ,   \ addi gp,gp,4
+;
+
+\ code{ ... }code  — jump over a block; afterwards push the block's address.
+\ cstack while open: [bodyaddr patchaddr].
+:I code{  here ,j0 here cswap ;
+:I }code  jpat! ,addr ;
+
+\ ,texit  ( C: -- )  emit `li a7,1 ; ecall` — the exit syscall, inline.
+:M ,texit
+B7121000 ,   \ lui t0,0x101
+93823289 ,   \ addi t0,t0,-1901 # 100893 <.text+0x100893>
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+93023007 ,   \ li t0,115
+23A05100 ,   \ sw t0,0(gp)
+93814100 ,   \ addi gp,gp,4
+;
+
+\ thread{ ... }thread — the same, with the exit syscall appended to the body.
+:I thread{  here ,j0 here cswap ;
+:I }thread  ,texit jpat! ,addr ;
+
+\ ── requests to the kernel's loop thread (src/ksrv.fam) ──────────────────────
+\ Each is one transaction of its own; -2 means a pointer outside the program.
+\   sget  ( key klen buf cap -- vlen | -1 )    sput ( key klen data n -- 0 )
+\   sadd  ( key klen data n -- 0 )             sdel ( key klen -- flag )
+\   sexec ( key klen size tickets -- tid | 0 )
+\   sscan ( prefix plen buf cap -- n )   the keys under a prefix, as records
+\         of klen, vlen, key, the value's first 64 bytes (src/ksrv.fam)
+\   say   ( s -- )   a NUL-terminated string to handle 0 (the console, or
+\                    whatever "1" binds it to)
+\   texcode ( tid -- code )   how that thread ended: 0 exited, cause+1 killed
+\   scopy ( src dst n -- )    n bytes
+: kreq ( op a b c d -- r )  D lit syscall drop E lit syscall ;
+: sa variable ;  : sb variable ;  : sc variable ;  : sd variable ;
+: sget  ( key klen buf cap -- vlen )     sd ! sc ! sb ! sa !  1 lit sa @ sb @ sc @ sd @ kreq ;
+: sput  ( key klen data n -- r )         sd ! sc ! sb ! sa !  2 lit sa @ sb @ sc @ sd @ kreq ;
+: sadd  ( key klen data n -- r )         sd ! sc ! sb ! sa !  3 lit sa @ sb @ sc @ sd @ kreq ;
+: sdel  ( key klen -- flag )             sb ! sa !  4 lit sa @ sb @ 0 lit 0 lit kreq ;
+: sexec ( key klen size tickets -- tid ) sd ! sc ! sb ! sa !  5 lit sa @ sb @ sc @ sd @ kreq ;
+: sscan ( prefix plen buf cap -- n )     sd ! sc ! sb ! sa !  A lit sa @ sb @ sc @ sd @ kreq ;
+: slen  ( s -- n )  dup begin dup c@ while 1 lit + repeat swap - ;
+: scopy ( src dst n -- )  ?dup if 0 lit do over i + c@ over i + c! loop then 2drop ;   \ bytes (src/fence.fam's mcopy is not a program's)
+: say   ( s -- )  dup slen sd ! sc !  "0" 1 lit sc @ sd @ sput drop ;
+: texcode ( tid -- code )  F lit syscall ;
+
+\ mtime@ ( -- lo hi )  the CLINT's counter (src/proc.fam's): read-only for a program
+:M mtime@     \ ( -- lo hi )  consistent 64-bit read
+B7C20002 ,   \ lui t0,0x200c
+03A3C2FF ,   \ lw t1,-4(t0) # 200bffc <.L1^B1+0x200bff8>
+83A382FF ,   \ lw t2,-8(t0)
+03AEC2FF ,   \ lw t3,-4(t0)
+E31AC3FF ,   \ bne t1,t3,4 <.L1^B1>
+130181FF ,   \ addi sp,sp,-8
+23227100 ,   \ sw t2,4(sp)
+23206100 ,   \ sw t1,0(sp)
+;

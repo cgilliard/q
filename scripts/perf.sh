@@ -4,7 +4,7 @@
 # a running dev node is not disturbed; its UDP endpoint on host port 3747), run scripts/load.py's matrix, stop it.
 # Needs scripts/build.sh and scripts/makenode.sh first.  The in-guest cost of
 # the same operations without a network is in `./scripts/bench.sh` (httpreq,
-# httpconn, wsconn, wsecho, wsbcast in src/http.fam).
+# httpconn, wsconn, wsecho, wsbcast in prog/http.fam).
 set -e
 HTTP=${HTTP:-8090}
 UDP=${UDP:-3747}

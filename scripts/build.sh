@@ -4,7 +4,7 @@ set -e
 CPU="rv32,zicsr=true,m=false,a=false,f=false,d=false,c=false,\
 zawrs=false,zfa=false,zfh=false,zfhmin=false,zcb=false,\
 zcd=false,zcf=false,zcmp=false,zcmt=false,zifencei=false"
-MEM="128M"
+MEM="128M"    # the virt default; lib/stdlib.fam's init lays the stacks out for exactly this
 
 serial_qemu() {  # serial_qemu INFILE OUTFILE [extra qemu args...]
 	sin=$1; sout=$2; shift 2
@@ -109,10 +109,23 @@ run bin/fampack bin/fam.uncompressed lib/stdlib.fam lib/asm.fam src/fampack.fam
 pack bin/fam.uncompressed bin/fam
 run bin/gen_hash bin/fam lib/stdlib.fam lib/asm.fam src/gen_hash.fam
 run bin/tabernacle.uncompressed bin/fam0 src/tabernacle.fam0
-run bin/full_node.bin bin/fam lib/stdlib.fam lib/build.fam `cat scripts/files.txt`
+run bin/kernel.bin bin/fam lib/stdlib.fam lib/build.fam `cat scripts/files.txt`
 
-# bypass rid stack
-head -c 20480 /dev/zero >> bin/full_node.bin
-cat resources/akjv.txt.gz >> bin/full_node.bin
-patch_config bin/tabernacle.uncompressed bin/full_node.bin
+# the programs the node installs in its store at boot (src/exec.fam)
+./tools/fam --prog -o bin/hello.bin prog/hello.fam
+./tools/fam --prog -o bin/crash.bin prog/crash.fam
+./tools/fam --prog -o bin/init.bin prog/init.fam
+./tools/fam --prog -o bin/udpecho.bin lib/pnet.fam src/eth.fam src/ip.fam src/udp.fam src/tcp.fam lib/pstack.fam prog/udpecho.fam
+./tools/fam --prog -o bin/wm.bin lib/pnet.fam src/eth.fam src/ip.fam src/udp.fam src/tcp.fam lib/pstack.fam lib/pkv.fam prog/http.fam prog/wm.fam
+./scripts/progs.sh bin/progs.blob hello=bin/hello.bin crash=bin/crash.bin init=bin/init.bin udpecho=bin/udpecho.bin wm=bin/wm.bin
+
+# the image padded to a page (the stdlib's init starts the data on one), 20 KiB
+# of zeros over the node's RID stack and variables (the image is not loaded
+# into zeroed memory), then the programs blob (the first thing the node's heap
+# holds: src/kernel.fam keeps it), then the text
+truncate -s $(( ( $(fsize bin/kernel.bin) + 4095 ) / 4096 * 4096 )) bin/kernel.bin
+head -c 20480 /dev/zero >> bin/kernel.bin
+cat bin/progs.blob >> bin/kernel.bin
+cat resources/akjv.txt.gz >> bin/kernel.bin
+patch_config bin/tabernacle.uncompressed bin/kernel.bin
 pack bin/tabernacle.uncompressed bin/tabernacle

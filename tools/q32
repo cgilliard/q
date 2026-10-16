@@ -9,7 +9,11 @@
 #                 writing it)
 #                 (with --disk or --net, an entropy device too: src/rng.fam)
 #   --load=FILE@ADDR  Load FILE's raw bytes into memory at ADDR (repeatable):
-#                 test fixtures, e.g. --load=tests/fixtures/main.pack@0x87000000
+#                 test fixtures.  A fam program's heap and stacks span all of
+#                 RAM above its image (lib/stdlib.fam init: the data stack ends
+#                 at 0x88000000, the top of the virt machine's default 128 MiB),
+#                 so pick an address the program will not allocate over, or
+#                 use tools/fam --append, which places the file after the image.
 #   --in=FILE     serial input from FILE  ┐ file-backed serial instead of stdio:
 #   --out=FILE    serial output to FILE   ┘ byte-exact on every platform (QEMU's
 #                 win32 stdio chardev loses bytes on piped stdin); used by

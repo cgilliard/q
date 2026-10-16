@@ -35,7 +35,7 @@
 \   +00 dev   +04 rxq   +08 txq   +0C rxbufs   +10 txbufs   +1C rx used cursor
 \   +20 tx submitted   +28 head of the frame netrx last returned
 \ Needs src/fence.fam (mcopy, bus words) and src/proc.fam compiled before it.  The rings must come
-\ from the main thread's heap (a spawned thread's arena is only 108 KiB).
+\ from the main thread's heap (a thread spawned with `spawn` has only 108 KiB of heap).
 \ ──────────────────────────────────────────────────────────────────────────────
 
 : net variable ;

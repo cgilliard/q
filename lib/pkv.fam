@@ -1,14 +1,16 @@
 \ ──────────────────────────────────────────────────────────────────────────────
-\ src/kv.fam — the store's commands as text: what the page's store box sends
-\ over its WebSocket (src/http.fam hands every message starting "kv " here).
+\ lib/pkv.fam — prog/kv.fam for a program: the same commands and answers, the
+\ store reached through requests (lib/sys.fam) instead of called.  A list is a
+\ scan request: at most 20 keys, values cut at 64 bytes.
 \
-\   kvinit ( open? -- )              once, after stinit (0: there is no store)
+\   kvinit ( open? -- )              once (the flag is kept for the interface)
 \   kvcmd  ( in n out cap -- n' )    one command; its answer at out, at most
 \                                    cap bytes; n' is the answer's length
 \
 \ Commands (tokens are separated by one space; a set's value is the rest of
 \ the line, spaces and all):
 \   set KEY VALUE     kv: KEY = VALUE
+\   add KEY VALUE     kv: KEY += N bytes      (appended to the value)
 \   get KEY           kv: KEY = VALUE  |  kv: KEY: not found
 \   del KEY           kv: KEY: deleted  |  kv: KEY: not found
 \   list [PREFIX]     kv: list PREFIX, a line per key in order (at most 20,
@@ -25,6 +27,7 @@
 : kvk variable ;  : kvkl variable ;  : kvvl variable ;  \ the key, the value's length
 : kvb variable ;  : kvt variable ;  : kvu variable ;  : kvm variable ;   \ scratch, transaction, cursor, count
 
+: umin ( a b -- min )  2dup u> if swap then drop ;
 : kvinit ( open? -- )  kvok !  kvb @ 0= if 810 lit alloc kvb ! then ;
 
 \ ── the answer ────────────────────────────────────────────────────────────────
@@ -57,43 +60,40 @@
 
 : kvset
 	kvkey if
-		-1 lit txbeg dup kvk @ kvkl @ kva @ kvl @ put txcommit
+		kvk @ kvkl @ kva @ kvl @ sput drop
 		"kv: " kv+ kvk @ kvkl @ kvn+ " = " kv+ kva @ kvl @ kvn+
+	then ;
+: kvadd
+	kvkey if
+		kvk @ kvkl @ kva @ kvl @ sadd drop
+		"kv: " kv+ kvk @ kvkl @ kvn+ " += " kv+ kvl @ kvd+ " bytes" kv+
 	then ;
 : kvget
 	kvkey if
-		0 lit txbeg dup kvk @ kvkl @ kvb @ 800 lit get kvvl ! txcommit
+		kvk @ kvkl @ kvb @ 800 lit sget kvvl !
 		"kv: " kv+ kvk @ kvkl @ kvn+
 		kvvl @ 0< if ": not found" kv+ else " = " kv+ kvb @ kvvl @ 800 lit umin kvn+ then
 	then ;
 : kvdel
 	kvkey if
-		-1 lit txbeg dup kvk @ kvkl @ del dup if swap txcommit else swap txabort then
+		kvk @ kvkl @ sdel
 		"kv: " kv+ kvk @ kvkl @ kvn+ if ": deleted" kv+ else ": not found" kv+ then
 	then ;
 
-\ kvpre? ( -- flag )  does the cursor's key start with the prefix
-: kvpre?
-	kvu @ kvb @ 200 lit curkey kvkl @ u< if 0 lit else
-		-1 lit kvkl @ ?dup if 0 lit do kvb @ i + c@ kvk @ i + c@ <> if drop 0 lit then loop then then ;
-\ kvent ( -- )  the cursor's key and value as a line
-: kvent
+\ kvrec+ ( rec -- rec' )  one scan record as a line
+: kvrec+
 	"\n" kv+
-	kvu @ kvb @ 200 lit curkey kvb @ swap kvn+  " = " kv+
-	kvu @ kvb @ 200 lit + 40 lit curval dup 40 lit umin kvb @ 200 lit + swap kvn+  40 lit u> if "..." kv+ then ;
+	dup 8 lit + over @ kvn+  " = " kv+
+	dup 8 lit + over @ 3 lit + FFFFFFFC lit and + over 4 lit + @ 40 lit umin kvn+
+	dup 4 lit + @ 40 lit u> if "..." kv+ then
+	dup @ 3 lit + FFFFFFFC lit and over 4 lit + @ 40 lit umin 3 lit + FFFFFFFC lit and + 8 lit + + ;
 : kvlist
 	kvtok kvkl ! kvk !
 	kvkl @ 1FF lit u> if "kv: the prefix is over 511 bytes" kv+ else
-		0 lit txbeg kvt !  kvt @ curopen kvu !
-		kvkl @ if kvu @ kvk @ kvkl @ curseek drop else kvu @ curfirst drop then
 		"kv: list " kv+ kvk @ kvkl @ kvn+
-		0 lit kvm !
-		begin kvu @ 4 lit + @ if kvm @ 14 lit u< kvpre? and else 0 lit then while
-			kvent  kvm @ 1 lit + kvm !  kvu @ curnext drop
-		repeat
-		"\n" kv+ kvm @ kvd+ " key(s)" kv+
-		kvm @ 14 lit = kvu @ 4 lit + @ and if kvpre? if ", more follow" kv+ then then
-		kvu @ curclose  kvt @ txcommit
+		kvk @ kvkl @ kvb @ 800 lit sscan dup kvm !
+		kvb @ swap ?dup if 0 lit do kvrec+ loop then drop
+		"\n" kv+ kvm @ kvd+ " key(s)" kv+  kvm @ 14 lit = if ", more may follow" kv+ then
 	then ;
 
 : kvcmd ( in n out cap -- n' )
@@ -101,45 +101,11 @@
 	kvtok
 	kvok @ 0= if 2drop "kv: no store (the node has no disk)" kv+ else
 	2dup "set" kveq if 2drop kvset else
+	2dup "add" kveq if 2drop kvadd else
 	2dup "get" kveq if 2drop kvget else
 	2dup "del" kveq if 2drop kvdel else
 	2dup "list" kveq if 2drop kvlist else
-	2drop "kv: usage: set KEY VALUE | get KEY | del KEY | list [PREFIX]" kv+
-	then then then then then
+	2drop "kv: usage: set KEY VALUE | add KEY VALUE | get KEY | del KEY | list [PREFIX]" kv+
+	then then then then then then
 	kvp @ kvo @ - ;
 
-\ ──────────────────────────────────────────────────────────────────────────────
-\ Test: every command against the store src/store.fam's tests opened (sds);
-\ skipped without a disk.
-\ ──────────────────────────────────────────────────────────────────────────────
-
-Test {
-	kvcmds {
-		: kvr variable ;  : kvrn variable ;
-		: kvdo ( s -- )  dup begin dup c@ while 1 lit + repeat over -  kvr @ 400 lit kvcmd kvrn ! ;
-		: kvis ( s -- flag )
-			dup begin dup c@ while 1 lit + repeat over -  dup kvrn @ <> if 2drop 0 lit else
-			-1 lit swap 0 lit do over i + c@ kvr @ i + c@ <> if drop 0 lit then loop nip then ;
-		sds @ if
-			400 lit alloc kvr !
-			-1 lit kvinit
-			"set kvt/a hello world" kvdo  "kv: kvt/a = hello world" kvis assert
-			"get kvt/a" kvdo  "kv: kvt/a = hello world" kvis assert
-			"get kvt/b" kvdo  "kv: kvt/b: not found" kvis assert
-			"set kvt/b 2" kvdo  "set kvt/c" kvdo  "kv: kvt/c = " kvis assert                   \ an empty value
-			"list kvt/" kvdo  "kv: list kvt/\nkvt/a = hello world\nkvt/b = 2\nkvt/c = \n3 key(s)" kvis assert
-			"list kvt/b" kvdo  "kv: list kvt/b\nkvt/b = 2\n1 key(s)" kvis assert
-			"list" kvdo  "kv: list \nkvt/a = hello world\nkvt/b = 2\nkvt/c = \n3 key(s)" kvis assert
-			"del kvt/b" kvdo  "kv: kvt/b: deleted" kvis assert
-			"del kvt/b" kvdo  "kv: kvt/b: not found" kvis assert
-			"get kvt/b" kvdo  "kv: kvt/b: not found" kvis assert
-			"nope" kvdo  "kv: usage: set KEY VALUE | get KEY | del KEY | list [PREFIX]" kvis assert
-			"set" kvdo  "kv: a key is needed" kvis assert
-			"get kvt/a" 9 lit kvr @ 8 lit kvcmd 8 lit asrt_eq                                       \ cut at the cap
-			"del kvt/a" kvdo  "del kvt/c" kvdo
-			"list kvt/" kvdo  "kv: list kvt/\n0 key(s)" kvis assert
-			0 lit kvinit  "get x" kvdo  "kv: no store (the node has no disk)" kvis assert
-			-1 lit kvinit
-		then
-	}
-}

@@ -1,0 +1,7 @@
+\ prog/crash.fam — a program that misbehaves: it writes into the kernel's memory
+\ (the start of RAM, where tabernacle and the node live).  In user mode behind
+\ PMP that is a store access fault: the kernel kills this thread with a line on
+\ the UART and goes on serving.  The second line is never printed.
+"crash: a program about to write to 80000000\n" puts
+0 lit 80000000 lit !
+"crash: still alive, which means the fence is not up\n" puts

@@ -25,7 +25,10 @@ B7021000 ,   \ lui  t0, 0x100
 \ Wire protocol:
 \ stdin: [4 bytes LE: N] [N bytes data]
 \ stdout: [16 B header (NOP magic + jal + PAYLOAD + UNCOMP)]
-\ [192 B fixed stub body]
+\ [200 B fixed stub body]
+\ The stub copies the payload to 0x84800000, unpacks it to 0x80001000 (a page
+\ boundary, so what is packed runs page-aligned: tabernacle's end marker, and
+\ with it the node it loads there, lands on a page) and jumps to it.
 \ [LZ77 payload]
 \
 \ LZ77 stream:
@@ -370,11 +373,13 @@ wr4
 \ uncomp_size = N (s7)
 s7>tos wr4
 
-\ 192-byte fixed body — 48 instructions, each as 4 LE bytes.
-800002B7 lit wr4 82A303 lit wr4 D028393 lit wr4 84800E37 lit wr4
+\ 200-byte fixed body — 50 instructions, each as 4 LE bytes: the payload
+\ starts at 16 + 200 = 216, the unpacked image at 0x80001000, the last two
+\ words jump there.
+800002B7 lit wr4 82A303 lit wr4 D828393 lit wr4 84800E37 lit wr4
 638EB3 lit wr4 1D38C63 lit wr4 3C503 lit wr4 AE0023 lit wr4
 138393 lit wr4 1E0E13 lit wr4 FEDFF06F lit wr4 C2A303 lit wr4
-848003B7 lit wr4 D028E13 lit wr4 6E0EB3 lit wr4 F13 lit wr4
+848003B7 lit wr4 80001E37 lit wr4 6E0EB3 lit wr4 F13 lit wr4
 F93 lit wr4 7DE0E63 lit wr4 F9863 lit wr4 3CF03 lit wr4
 138393 lit wr4 800F93 lit wr4 80F7513 lit wr4 1F1F13 lit wr4
 FFFF8F93 lit wr4 50C63 lit wr4 3C503 lit wr4 AE0023 lit wr4
@@ -383,6 +388,7 @@ FFFF8F93 lit wr4 50C63 lit wr4 3C503 lit wr4 AE0023 lit wr4
 D5E5B3 lit wr4 158593 lit wr4 465693 lit wr4 368693 lit wr4
 40BE0733 lit wr4 FA0680E3 lit wr4 74783 lit wr4 FE0023 lit wr4
 170713 lit wr4 1E0E13 lit wr4 FFF68693 lit wr4 FE9FF06F lit wr4
+800012B7 lit wr4 28067 lit wr4
 
 
 \ ── Phase 5: emit payload bytes ──
