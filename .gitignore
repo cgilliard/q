@@ -1,3 +1,5 @@
 bin/**
 data/**
 tmp/**
+tools/__pycache__/
+**/*.swp

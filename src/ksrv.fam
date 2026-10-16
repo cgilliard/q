@@ -20,7 +20,7 @@
 \   6 bind   ( proto port ring size -- 0 | -1 taken | -3 full )   src/ports.fam
 \   7 unbind ( proto port -- 0 )
 \   8 txring ( ring size -- 0 )   the thread's transmit ring: frames put in it
-\            go out when the loop thread next turns (post it bit 16)
+\            go out when the loop thread next turns (post it bit 19)
 \   9 netinfo ( buf -- 0 )   24 bytes into buf: ip, mask, gateway, its MAC, ours
 \   A scan   ( prefix plen buf cap -- n )   the keys from prefix on that start
 \            with it, at most 20 and as many as fit cap: records of klen, vlen

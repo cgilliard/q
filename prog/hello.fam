@@ -1,5 +1,0 @@
-\ prog/hello.fam — the first program: built on its own (./tools/fam --prog),
-\ installed in the store from the node's image at boot, exec'd by the node.
-\ It says where it runs and exits (the texit --prog appends).
-"hello: a program, thread " puts getpid u. ", in the region at " puts myregion swap u.x " of " puts u. " bytes\n" puts
-"hello: and this line went through handle 0\n" say

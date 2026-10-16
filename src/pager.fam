@@ -60,7 +60,7 @@
 \ +48 pages on the disk  +4C,+50 next/nfree at txn begin (for abort)  +54 writes
 \ +58 ndirty +5C dirty (the slots made dirty this transaction, so a commit
 \ or abort walks those rather than all 512)
-\ Needs src/fence.fam src/proc.fam src/disk.fam before it.
+\ Needs src/fence.fam src/proc.fam src/disk.fam src/idle.fam before it.
 \ ──────────────────────────────────────────────────────────────────────────────
 
 : pg variable ;
@@ -174,7 +174,7 @@ E3EAC5FE ,   \ bltu a1,a2,next
 	pg @ 34 lit + dup @ 1 lit + dup rot ! over C lit + ! ;
 
 : pgload ( pgno slot -- )
-	pgds 2 lit pick 3 lit lshift pgbase @ + 2 lit pick 8 lit + @ 8 lit vreadn dwait
+	pgds 2 lit pick 3 lit lshift pgbase @ + 2 lit pick 8 lit + @ 8 lit vreadn dserve
 	1 lit <> if "pager: read failed" pgdie then drop
 	tuck !  0 lit over 4 lit + !  drop ;
 
@@ -248,11 +248,11 @@ E3EAC5FE ,   \ bltu a1,a2,next
 
 : pgflush ( -- )
 	pgds vflush dup FFFFFFFF lit <> if
-		dwait 1 lit <> if "pager: flush failed" pgdie then
+		dserve 1 lit <> if "pager: flush failed" pgdie then
 	else drop then drop ;
 
 : pgwmeta ( -- )        \ the buffer to the slot for txnid+1, then flush
-	pgds pgtx 1 lit + 1 lit and 3 lit lshift pgbase @ + pgmeta 8 lit vwriten dwait
+	pgds pgtx 1 lit + 1 lit and 3 lit lshift pgbase @ + pgmeta 8 lit vwriten dserve
 	1 lit <> if "pager: meta write failed" pgdie then drop
 	pgflush ;
 
@@ -333,7 +333,7 @@ E3EAC5FE ,   \ bltu a1,a2,next
 	0 lit pg @ C lit + !  0 lit pg @ 10 lit + !  2 lit pg @ 14 lit + !
 	0 lit pg @ 18 lit + !  0 lit pg @ 20 lit + !
 	2 lit 0 lit do                                               \ the newer valid meta wins
-		pgds i 3 lit lshift pgbase @ + pgmeta 8 lit vreadn dwait
+		pgds i 3 lit lshift pgbase @ + pgmeta 8 lit vreadn dserve
 		1 lit <> if "pager: meta read failed" pgdie then drop
 		pgmetaok if pgmeta 4 lit + @ pgtx u> if pgmeta@ then then
 	loop
@@ -344,8 +344,8 @@ E3EAC5FE ,   \ bltu a1,a2,next
 
 : pgwipe ( -- )
 	pgmeta 400 lit pgzero
-	pgds pgbase @ pgmeta 8 lit vwriten dwait 1 lit <> if "pager: wipe failed" pgdie then drop
-	pgds pgbase @ 8 lit + pgmeta 8 lit vwriten dwait 1 lit <> if "pager: wipe failed" pgdie then drop
+	pgds pgbase @ pgmeta 8 lit vwriten dserve 1 lit <> if "pager: wipe failed" pgdie then drop
+	pgds pgbase @ 8 lit + pgmeta 8 lit vwriten dserve 1 lit <> if "pager: wipe failed" pgdie then drop
 	pgflush ;
 
 \ ──────────────────────────────────────────────────────────────────────────────

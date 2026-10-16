@@ -91,7 +91,7 @@ B362B500 ,   \ or t0,a0,a1
 \ is then not lost on the ring)
 : ptxfull
 	0 lit begin ptxr @ 8 lit + @ ptxr @ 4 lit + @ - ptxr @ @ u< 0=  over 40 lit u<  and while
-		10000 lit 0 lit post yield 1 lit +
+		80000 lit 0 lit post yield 1 lit +
 	repeat drop
 	ptxr @ 8 lit + @ ptxr @ 4 lit + @ - ptxr @ @ u< 0= ;
 : nettx   ( buf len -- ok )
@@ -100,5 +100,5 @@ B362B500 ,   \ or t0,a0,a1
 		2 lit pick over 4 lit + 3 lit pick mcopy  ! drop
 		ptxr @ 8 lit + @ ptxr @ 4 lit + @ =                              \ was it empty? then the loop thread is not yet told
 		ptxr @ 8 lit + dup @ 1 lit + swap !
-		if 10000 lit 0 lit post then -1 lit
+		if 80000 lit 0 lit post then -1 lit
 	then ;

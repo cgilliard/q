@@ -1,0 +1,56 @@
+\ ──────────────────────────────────────────────────────────────────────────────
+\ src/idle.fam — waiting for the disk without stopping the NIC.  The node is one
+\ event loop, and a store commit waits for the disk in the middle of a turn:
+\ dserve is that wait.  With dsnet off it is src/disk.fam's dwait.  With it on
+\ (the node sets it once the port table is up) the wait is on the disk, the
+\ NIC and the transmit doorbell together: a frame that lands meanwhile is
+\ delivered, the program gets a turn to answer, and the answers go out, so a
+\ thread waiting for the disk holds up only itself.  Control flow stays
+\ static, as everywhere in fam: no callback, the pager calls dserve because
+\ this module sits after the network's in the chain and before the pager.
+\
+\   dsnet  ( -- addr )         variable: serve the NIC while waiting (0 = no NIC)
+\   dserve ( ds id -- ds st )  dwait, serving the NIC meanwhile when dsnet is set
+\ Needs src/disk.fam, src/net.fam, src/netin.fam, src/ports.fam before it.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+: dsnet variable ;
+: dserve ( ds id -- ds st )
+	dsnet @ 0= if dwait else
+		begin
+			over darm drop  over vpoll drop                     \ arm, then look (src/disk.fam's protocol)
+			2dup vstat nip ?dup if -1 lit else
+				narm  begin netrx while netin netrel repeat     \ the NIC: arm, drain, deliver
+				pdlv @ if 0 lit pdlv ! yield then  ptxall       \ the program's turn to answer, and the answers out
+				over dbit nbit or 80000 lit or 0 lit wait drop 0 lit
+			then
+		until
+		nip
+	then ;
+
+\ ──────────────────────────────────────────────────────────────────────────────
+\ Tests: dsnet off is dwait (the done slot of a fake device, as src/disk.fam's
+\ wait_done); dsnet on reads a sector through the serving wait when a disk and
+\ a NIC are both attached.
+\ ──────────────────────────────────────────────────────────────────────────────
+
+Test {
+	dserve0 {
+		0 lit dsnet !
+		4C lit alloc tqset
+		10001000 lit over !               \ fake dev = empty slot 1
+		1 lit over 40 lit + @ 8 lit + !   \ done[2] = 1
+		2 lit dserve 1 lit asrt_eq
+		drop
+	}
+	dserve1 {
+		: ids variable ;
+		dsinit ids !
+		ids @ if netinit if
+			-1 lit dsnet !
+			200 lit alloc ids @ 7 lit 2 lit pick vread dserve 1 lit asrt_eq   \ ( buf ds )
+			0 lit dsnet !
+			2drop
+		then then
+	}
+}
