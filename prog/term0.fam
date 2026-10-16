@@ -1,0 +1,4 @@
+\ prog/term0.fam — no terminals: what prog/http.fam calls when it is built without
+\ lib/pterm.fam (the kernel's test chain).
+: termcmd ( s in n out cap -- n' )  2drop 2drop drop 0 lit ;
+: termclos ( s -- )  drop ;

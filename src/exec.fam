@@ -3,13 +3,15 @@
 \
 \   exinit   ( -- )                      once, after stinit
 \   exec     ( key klen size tickets -- tid )   the image stored under key,
+\            (tickets | 0x100: one read + write + execute span: src/proc.fam uspawn)
 \            into a fresh region of at least size bytes (the image may take
 \            half of it), started as a thread with that many tickets; 0 when
 \            there is no such key, no region, or it does not fit.  Thread 0
 \            only: the read may wait on the disk.
 \   proginst ( blob -- n )               install the programs packed by
 \            scripts/progs.sh ("QPRG", count, then a 16-byte name and a size
-\            per program, then the images, each 4-byte aligned) under bin/NAME;
+\            per program, then the images, each 4-byte aligned) under bin/NAME,
+\            or under NAME itself when it starts with "/" (a library's source);
 \            n programs, 0 when blob does not start with the magic
 \   progsize ( blob -- bytes )           how long such a blob is (0 without
 \            the magic): what src/kernel.fam allocs past to keep it
@@ -62,8 +64,9 @@
 		dup 4 lit + @ ?dup if 0 lit do
 			dup i pgent                                                     \ blob entry
 			dup pgnlen pgn !
-			"bin/" pgk @ 4 lit mcopy  dup pgk @ 4 lit + pgn @ mcopy
-			-1 lit txbeg dup pgk @ pgn @ 4 lit + 4 lit pick 10 lit + @ pgi @ swap put txcommit
+			dup c@ '/' lit = if dup 1 lit + pgk @ pgn @ 1 lit - mcopy  pgn @ 1 lit - pgn !                    \ "/lib/x": the key itself
+			else "bin/" pgk @ 4 lit mcopy  dup pgk @ 4 lit + pgn @ mcopy  pgn @ 4 lit + pgn ! then
+			-1 lit txbeg dup pgk @ pgn @ 4 lit pick 10 lit + @ pgi @ swap put txcommit
 			10 lit + @ pgalign pgi @ + pgi !
 		loop then
 		4 lit + @

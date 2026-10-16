@@ -1,0 +1,48 @@
+\ prog/fam.fam — fam -o OUT SRC...: the compiler in the OS.  The stream the host's
+\ tools/fam --prog would feed the compiler is built in the key proc/fam/stream:
+\ /lib/stdlib.fam, /lib/build.fam, /lib/sys.fam, the sources, then "texit".
+\ Then bin/famc, the compiler itself (bin/fam.uncompressed, the same core the
+\ host runs; the kernel emulates the UART it reads and writes, src/proc.fam
+\ kuart; its region is mapped read + write + execute since it compiles immediate
+\ words and runs them), is exec'd with its input bound to the stream (rewound, a file) and
+\ its output to OUT, and waited for.  OUT is then a program: exec'd by its
+\ name when it is under bin.  A compile error is what the compiler wrote
+\ instead of an image ("? src HHHHHHHH out HHHHHHHH": the stream and output
+\ offsets), repeated here; OUT is deleted then.
+: fb variable ;  : fo variable ;  : fol variable ;  : fn variable ;  : fst variable ;  : fsl variable ;  : fab variable ;  : fok variable ;
+: fb1 variable ;  : fl1 variable ;  : fl2 variable ;
+: fsame ( a b n -- flag )  -1 lit swap 0 lit do 2 lit pick i + c@ 2 lit pick i + c@ <> if drop 0 lit then loop nip nip ;
+\ fadd ( key klen -- )  the key's value onto the stream; fok is cleared when there is no such key
+: fadd
+	2dup fb @ 40000 lit sget dup 0< if drop "fam: no such key: " say ssay "\n" say  0 lit fok ! else
+		40000 lit dup 2 lit pick u< if swap then drop  fst @ fsl @ rot fb @ swap sadd drop  2drop then ;
+
+40000 lit alloc fb !  100 lit alloc fab !  80 lit alloc fb1 !  0 lit fo !  0 lit fn !  -1 lit fok !
+"/proc/fam/stream" fst !  10 lit fsl !
+fab @ 100 lit sargs dup 0< if drop 0 lit then  fab @ swap stok 2drop
+fst @ fsl @ sdel drop
+"/lib/stdlib.fam" F lit fadd  "/lib/build.fam" E lit fadd  "/lib/sys.fam" C lit fadd
+begin dup while
+	stok dup 2 lit = if over "-o" 2 lit fsame else 0 lit then if 2drop stok fol ! fo ! else fadd  fn @ 1 lit + fn ! then
+repeat 2drop
+fo @ 0= if "fam: usage: fam -o OUT SRC...\n" say texit then
+fn @ 0= if "fam: a source is needed\n" say texit then
+fok @ 0= if texit then
+fst @ fsl @ "\ntexit\n" 7 lit sadd drop
+fst @ fsl @ srewind drop
+fo @ fol @ sdel drop
+'/' lit fb1 @ c!  "1" 1 lit fb1 @ 1 lit + 3F lit sget dup 0< if drop -1 lit then 1 lit + fl1 !        \ our bindings, to put back
+'/' lit fb1 @ 40 lit + c!  "2" 1 lit fb1 @ 41 lit + 3F lit sget dup 0< if drop -1 lit then 1 lit + fl2 !
+"2" 1 lit fst @ fsl @ sput drop  "1" 1 lit fo @ fol @ sput drop
+"famc" 4 lit 800000 lit 105 lit sexec                                      \ 0x100: it writes code it runs (immediate words, its jump trampoline)
+"1" 1 lit fb1 @ fl1 @ sput drop  "2" 1 lit fb1 @ 40 lit + fl2 @ sput drop
+?dup 0= if "fam: cannot run bin/famc\n" say texit then
+begin 14 lit msleep dup tstate 0= until texcode                          ( code )
+fo @ fol @ fb @ 400 lit sget dup 0< if drop 0 lit then                 ( code n )
+over 0= over 3 lit u> and fb @ @ 13 lit = and if 2drop else                     \ a program begins with the word 0x13 (q32's magic: a nop)
+	dup if "fam: " say fb @ swap 64 lit dup 2 lit pick u< if swap then drop ssay "\n" say
+	else drop "fam: the compiler wrote nothing\n" say then
+	dup 1 lit u> if "fam: the compiler ended with code " say u. "\n" say else drop then
+	fo @ fol @ sdel drop
+then
+fst @ fsl @ sdel drop

@@ -1,0 +1,13 @@
+\ prog/cat.fam — the values of the keys named after it, in order, as they are:
+\ "cat a b" says a's value then b's.  A key with no value is said so.
+: cb variable ;  : cv variable ;
+100 lit alloc cb !  1000 lit alloc cv !
+cb @ 100 lit sargs dup 0< if drop 0 lit then
+cb @ swap stok 2drop
+dup 0= if 2drop "cat: a key is needed\n" say else
+	begin dup while
+		stok 2dup cv @ 1000 lit sget dup 0< if drop "cat: " say ssay ": no such key\n" say else
+			cv @ swap 1000 lit dup 2 lit pick u< if swap then drop ssay 2drop
+		then
+	repeat 2drop
+then

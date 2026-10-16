@@ -1,0 +1,70 @@
+\ prog/edit.fam — edit KEY: a screen editor for the value of KEY (a new one if
+\ there is none).  The arrows, Home, End, Page Up and Down move; typing
+\ inserts; Backspace and Delete delete; Enter breaks the line; Ctrl-S saves
+\ the value back; Ctrl-Q leaves.  The last screen row is the status: the key,
+\ the line and column, and whether there are unsaved changes.  Lines longer
+\ than the screen scroll sideways.  Up to 256 KiB of text and 16384 lines.
+: etx variable ;  : eln variable ;  : els variable ;  : enl variable ;      \ the text, its length, line starts, lines
+: ecy variable ;  : ecx variable ;  : etop variable ;  : ehs variable ;    \ the cursor's line and column, the first row shown, the sideways scroll
+: emod variable ;  : ekey variable ;  : ekl variable ;  : eab variable ;  : ego variable ;
+: eumin ( a b -- min )  2dup u> if swap then drop ;
+: elines ( -- )                                        \ the line starts from the text
+	0 lit enl !  0 lit els @ !  1 lit enl !
+	eln @ ?dup if 0 lit do etx @ i + c@ A lit = enl @ 4000 lit u< and if i 1 lit + els @ enl @ 2 lit lshift + !  enl @ 1 lit + enl ! then loop then ;
+: elstart ( l -- off )  2 lit lshift els @ + @ ;
+: ellen ( l -- n )  dup 1 lit + enl @ u< if dup 1 lit + elstart 1 lit - swap elstart - else eln @ swap elstart - then ;
+: eoff ( -- off )  ecy @ elstart ecx @ ecy @ ellen eumin + ;
+: eclamp ( -- )  ecy @ enl @ 1 lit - eumin ecy ! ;
+: eins ( c -- )                                        \ at the cursor
+	eln @ 3FFFF lit u< if
+		eoff  eln @ begin dup 2 lit pick u> while 1 lit - dup etx @ + c@ over etx @ + 1 lit + c! repeat drop
+		etx @ + c!  eln @ 1 lit + eln !  -1 lit emod !  elines
+	else drop then ;
+: edel ( off -- )                                      \ the byte there
+	dup eln @ u< if
+		begin dup eln @ 1 lit - u< while dup etx @ + 1 lit + c@ over etx @ + c!  1 lit + repeat drop
+		eln @ 1 lit - eln !  -1 lit emod !  elines
+	else drop then ;
+: eback ( -- )  eoff ?dup if 1 lit - dup etx @ + c@ A lit = if ecy @ 1 lit - ecy !  ecy @ ellen ecx ! else ecx @ ecy @ ellen eumin 1 lit - ecx ! then edel then ;
+: edraw ( -- )
+	ecx @ ecy @ ellen eumin dup ehs @ u< if dup ehs ! then  dup ehs @ vcols @ + u< 0= if dup vcols @ - 1 lit + ehs ! then drop
+	ecy @ etop @ u< if ecy @ etop ! then  ecy @ etop @ vrows @ 1 lit - + u< 0= if ecy @ vrows @ - 2 lit + etop ! then
+	vhide
+	vrows @ 1 lit - ?dup if 0 lit do
+		i 0 lit vat
+		etop @ i + enl @ u< if
+			etop @ i + dup elstart swap ellen                                           ( start len )
+			dup ehs @ u> if ehs @ - swap ehs @ + swap vcols @ eumin etx @ rot + swap vsay else 2drop then
+		then
+		vcl
+	loop then
+	vrows @ 1 lit - 0 lit vat  ekey @ ekl @ vsay  "  " vs  ecy @ 1 lit + vdec ':' lit vemit ecx @ ecy @ ellen eumin 1 lit + vdec
+	emod @ if "  [changed]" vs then  "  ^S save  ^Q quit" vs  vcl
+	ecy @ etop @ - ecx @ ecy @ ellen eumin ehs @ - vat  vshow  vflush ;
+
+40000 lit alloc etx !  10000 lit alloc els !  100 lit alloc eab !
+eab @ 100 lit sargs dup 0< if drop 0 lit then  eab @ swap stok 2drop stok ekl ! ekey ! 2drop
+ekl @ 0= if "edit: a key is needed\n" say texit then
+ekey @ ekl @ etx @ 40000 lit sget dup 0< if drop 0 lit then 40000 lit eumin eln !
+elines  0 lit ecy !  0 lit ecx !  0 lit etop !  0 lit ehs !  0 lit emod !  -1 lit ego !
+vinit  vclr
+begin
+	edraw
+	vkey
+	dup 11 lit = if drop 0 lit ego ! else
+	dup 13 lit = if drop ekey @ ekl @ etx @ eln @ sput drop  0 lit emod ! else
+	dup 101 lit = if drop ecy @ if ecy @ 1 lit - ecy ! then else
+	dup 102 lit = if drop ecy @ 1 lit + ecy ! eclamp else
+	dup 103 lit = if drop ecx @ ecy @ ellen u< if ecx @ 1 lit + ecx ! else ecy @ 1 lit + enl @ u< if ecy @ 1 lit + ecy ! 0 lit ecx ! then then else
+	dup 104 lit = if drop ecx @ ecy @ ellen eumin ?dup if 1 lit - ecx ! else ecy @ if ecy @ 1 lit - ecy ! ecy @ ellen ecx ! then then else
+	dup 105 lit = if drop 0 lit ecx ! else
+	dup 106 lit = if drop ecy @ ellen ecx ! else
+	dup 107 lit = if drop ecy @ vrows @ 2 lit - dup 2 lit pick u> if drop 0 lit else - then ecy ! else
+	dup 108 lit = if drop ecy @ vrows @ 2 lit - + ecy ! eclamp else
+	dup 109 lit = if drop eoff edel else
+	dup 7F lit = over 8 lit = or if drop eback else
+	dup D lit = over A lit = or if drop A lit eins  ecy @ 1 lit + ecy !  0 lit ecx ! else
+	dup 20 lit u< 0= over 7F lit u< and if dup eins  ecx @ ecy @ ellen eumin 1 lit + ecx ! else drop
+	then then then then then then then then then then then then then then
+ego @ 0= until
+vclr vflush

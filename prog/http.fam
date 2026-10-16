@@ -12,10 +12,13 @@
 \                              tlog does the same one layer down)
 \
 \ What it serves, for now: GET / is the page (built at init from the pieces in
-\ hpage: a hello, a WebSocket log and a store box, the socket closed cleanly on
+\ hpage: a desktop (its style), /wm.js (hjs) the windows and the terminal
+\ emulator in each, a button for another; the socket closed cleanly on
 \ unload so Firefox does not count a reload as a failed socket), a GET carrying a Sec-WebSocket-Key is
 \ upgraded, anything else is a 404.  On a socket a text or binary message
-\ starting "kv " is a store command (prog/kv.fam kvcmd answers it), any other
+\ starting "kv " is a store command (prog/kv.fam kvcmd answers it), one starting
+\ "term " is for the terminal (lib/pterm.fam termcmd, or prog/term0.fam's
+\ nothing; a closing socket is told to termclos too), any other
 \ is answered with "you said: " and the message, a ping with a pong, a close with
 \ a close; every second every socket gets a tick with the uptime.  Connections
 \ are kept alive; a request over 2 KiB without its end, or a frame over 2 KiB,
@@ -31,6 +34,7 @@
 
 : hsl variable ;  : hsn variable ;  : hlsn variable ;
 : hbody variable ;  : hbn variable ;  : hresp variable ;  : hrlen variable ;  : h404 variable ;  : h4len variable ;
+: hjsb variable ;  : hjsn variable ;  : hjsr variable ;  : hjrl variable ;     \ /wm.js: the script, its length, its response, that length
 : hnreq variable ;  : hnws variable ;  : hnmsg variable ;  : hncls variable ;     \ counters: requests, upgrades, messages, closes
 : htick variable ;  : hsec variable ;  : htb variable ;
 : hp variable ;  : hdt variable ;  : hdn variable ;  : hkb variable ;  : hdg variable ;
@@ -112,31 +116,79 @@
 \ hpage ( -- )  the page, into hbody
 : hpage
 	hbody @ hp !
-	"<!doctype html><html><head><meta charset='utf-8'><title>q</title>" h+
-	"<style>body{font-family:monospace;margin:2em;max-width:60em}#log,#kv{white-space:pre-wrap;border:1px solid #888;padding:1em;height:14em;overflow:auto}</style></head><body>" h+
-	"<h1>hello from q</h1><p>Served by the fam node on QEMU riscv32 over its own TCP. The box is a WebSocket: the node sends a tick every second and echoes what you send.</p>" h+
-	"<p><input id='in' size='40' placeholder='type and press enter'> <button id='go'>send</button> <span id='st'>connecting...</span></p><div id='log'></div>" h+
-	"<script>var log=document.getElementById('log'),st=document.getElementById('st'),inp=document.getElementById('in');" h+
-	"function add(s){log.textContent+=s+'\\n';log.scrollTop=log.scrollHeight}" h+
-	"var ws=new WebSocket('ws://'+location.host+'/ws');ws.onopen=function(){st.textContent='connected'};ws.onclose=function(){st.textContent='closed'};" h+
-	"ws.onmessage=function(e){if(e.data.slice(0,4)==='kv: ')kadd(e.data);else add(e.data)};function send(){if(inp.value){ws.send(inp.value);inp.value=''}}" h+
-	"document.getElementById('go').onclick=send;inp.onkeydown=function(e){if(e.key==='Enter')send()};" h+
-	"</script><h2>store</h2><p>Keys and values go into the node's B+tree on its disk: set one, get it back, list by prefix. They outlive a reboot.</p>" h+
-	"<p><input id='k' size='16' placeholder='key'> <input id='v' size='32' placeholder='value'> <button id='set'>set</button> <button id='get'>get</button> <button id='del'>del</button> <button id='ls'>list</button></p><div id='kv'></div>" h+
-	"<script>var kv=document.getElementById('kv'),k=document.getElementById('k'),v=document.getElementById('v');" h+
-	"function kadd(s){kv.textContent+=s+'\\n';kv.scrollTop=kv.scrollHeight}function cmd(c){ws.send('kv '+c)}" h+
-	"document.getElementById('set').onclick=function(){cmd('set '+k.value+' '+v.value)};document.getElementById('get').onclick=function(){cmd('get '+k.value)};" h+
-	"document.getElementById('del').onclick=function(){cmd('del '+k.value)};document.getElementById('ls').onclick=function(){cmd('list '+k.value)};" h+
-	"v.onkeydown=function(e){if(e.key==='Enter')cmd('set '+k.value+' '+v.value)};k.onkeydown=function(e){if(e.key==='Enter')cmd('get '+k.value)};" h+
-	"window.addEventListener('pagehide',function(){ws.close()});window.addEventListener('beforeunload',function(){ws.close()});</script></body></html>\n" h+
+	"<!doctype html><html><head><meta charset='utf-8'><title>q</title><style>" h+
+	"body{margin:0;font-family:monospace;background:#223;color:#ddd;height:100vh;overflow:hidden}" h+
+	"#desk{position:absolute;left:0;top:0;right:0;bottom:2.2em;overflow:hidden}" h+
+	"#bar{position:absolute;left:0;right:0;bottom:0;height:2.2em;background:#112;border-top:1px solid #556;padding:0 .5em;line-height:2.2em}" h+
+	"#bar button,.task{font-family:monospace;font-size:1em;margin-right:.5em;background:#334;color:#ddd;border:1px solid #667;padding:0 .6em;line-height:1.7em;cursor:pointer}" h+
+	".win{position:absolute;width:42em;height:26em;min-width:12em;min-height:6em;background:#111;border:1px solid #778;box-shadow:0 0 12px #000;resize:both;overflow:hidden;display:flex;flex-direction:column}" h+
+	".bar{background:#334;padding:.2em .5em;cursor:move;user-select:none;flex:none}.bar .btn{float:right;margin-left:.6em;cursor:pointer;padding:0 .3em}" h+
+	".body{flex:1;overflow:hidden;position:relative}.term{position:absolute;inset:0;padding:.4em;white-space:pre;overflow:hidden;outline:none;line-height:1.2em}" h+
+	".cur{display:inline-block;min-width:.6em;background:#ddd;color:#111;animation:bl 1s steps(2) infinite}@keyframes bl{to{background:transparent;color:#ddd}}" h+
+	"</style></head><body><div id='desk'></div><div id='bar'><button id='new'>new terminal</button></div><script src='/wm.js'></script></body></html>\n" h+
 	hp @ hbody @ - hbn ! ;
 
-\ hbuild ( -- )  the 200 (with the page) and the 404, ready to send
+\ hjs ( -- )  /wm.js, into hjsb: the windows (a title bar with minimize, maximize
+\ and close, dragged by the bar, resized at its corner, raised when clicked,
+\ minimized to the taskbar: win(title, function(api)) with api.body the element,
+\ api.close(), api.onclose called first), a terminal emulator (VT: a screen of
+\ rows x cols with a cursor, scrollback, and the escape sequences a program
+\ draws with: cursor to row;col, up/down/right/left, clear line/screen, hide
+\ and show the cursor), and the terminal window: a WebSocket of its own, "term
+\ open", its size as "term size R C" on open and resize, keys as "term in"
+\ with the usual sequences for the arrows and the rest, and every "term:"
+\ message fed to the emulator.
+: hjs
+	hjsb @ hp !
+	"var desk=document.getElementById('desk'),bar=document.getElementById('bar'),nz=10,nw=0;" h+
+	"function el(t,c,p){var e=document.createElement(t);if(c)e.className=c;if(p)p.appendChild(e);return e}" h+
+	"function win(title,fill){var w=el('div','win',desk),b=el('div','bar',w),t=el('span','title',b),cl=el('span','btn',b),mx=el('span','btn',b),mn=el('span','btn',b),body=el('div','body',w),tb=el('button','task',bar);" h+
+	"t.textContent=title;mn.textContent='_';mx.textContent='\\u25a1';cl.textContent='\\u00d7';tb.textContent=title;tb.style.display='none';" h+
+	"nw++;w.style.left=(40+nw*24%300)+'px';w.style.top=(30+nw*24%200)+'px';function top(){w.style.zIndex=++nz}w.onmousedown=top;top();" h+
+	"var drag=null;b.onmousedown=function(e){if(e.target.className==='btn')return;drag=[e.clientX-w.offsetLeft,e.clientY-w.offsetTop];e.preventDefault()};" h+
+	"document.addEventListener('mousemove',function(e){if(drag){w.style.left=(e.clientX-drag[0])+'px';w.style.top=(e.clientY-drag[1])+'px'}});document.addEventListener('mouseup',function(){drag=null});" h+
+	"var big=null;mx.onclick=function(){if(big){w.style.left=big[0];w.style.top=big[1];w.style.width=big[2];w.style.height=big[3];big=null}" h+
+	"else{big=[w.style.left,w.style.top,w.style.width,w.style.height];w.style.left='0';w.style.top='0';w.style.width=desk.clientWidth+'px';w.style.height=desk.clientHeight+'px'}};" h+
+	"mn.onclick=function(){w.style.display='none';tb.style.display='inline-block'};tb.onclick=function(){w.style.display='';tb.style.display='none';top()};" h+
+	"var api={body:body,close:function(){w.remove();tb.remove()},title:function(s){t.textContent=s;tb.textContent=s}};cl.onclick=function(){if(api.onclose)api.onclose();api.close()};" h+
+	"fill(api);return api}\n" h+
+	"function VT(c,r){var o={cols:c,rows:r,lines:[],cx:0,cy:0,scroll:[],hide:false},esc='';for(var i=0;i<r;i++)o.lines.push('');" h+
+	"function lf(){o.cy++;if(o.cy>=o.rows){o.scroll.push(o.lines.shift());o.lines.push('');o.cy=o.rows-1;if(o.scroll.length>2000)o.scroll.shift()}}" h+
+	"function put(ch){var l=o.lines[o.cy];while(l.length<o.cx)l+=' ';o.lines[o.cy]=l.slice(0,o.cx)+ch+l.slice(o.cx+1);o.cx++;if(o.cx>=o.cols){o.cx=0;lf()}}" h+
+	"function csi(p,f){var a=p.replace('?','').split(';').map(function(x){return parseInt(x)||0}),n=a[0]||1,i;" h+
+	"if(f==='H'||f==='f'){o.cy=Math.min(o.rows-1,(a[0]||1)-1);o.cx=Math.min(o.cols-1,(a[1]||1)-1)}" h+
+	"else if(f==='A')o.cy=Math.max(0,o.cy-n);else if(f==='B')o.cy=Math.min(o.rows-1,o.cy+n);else if(f==='C')o.cx=Math.min(o.cols-1,o.cx+n);else if(f==='D')o.cx=Math.max(0,o.cx-n);else if(f==='G')o.cx=Math.min(o.cols-1,n-1);" h+
+	"else if(f==='J'){if(a[0]===2){for(i=0;i<o.rows;i++)o.lines[i]=''}else{o.lines[o.cy]=o.lines[o.cy].slice(0,o.cx);for(i=o.cy+1;i<o.rows;i++)o.lines[i]=''}}" h+
+	"else if(f==='K'){o.lines[o.cy]=a[0]===2?'':o.lines[o.cy].slice(0,o.cx)}else if(p==='?25')o.hide=f==='l'}" h+
+	"o.resize=function(c2,r2){o.cols=c2;while(o.lines.length<r2)o.lines.push('');while(o.lines.length>r2){o.scroll.push(o.lines.shift());if(o.cy>0)o.cy--}o.rows=r2;if(o.cy>=r2)o.cy=r2-1;if(o.cx>=c2)o.cx=c2-1};" h+
+	"o.feed=function(s){for(var i=0;i<s.length;i++){var ch=s[i];" h+
+	"if(esc){esc+=ch;if(esc.length===2){if(ch!=='[')esc=''}else if(/[A-Za-z~]/.test(ch)){csi(esc.slice(2,-1),ch);esc=''}continue}" h+
+	"if(ch==='\\x1b')esc=ch;else if(ch==='\\n'){lf();o.cx=0}else if(ch==='\\r')o.cx=0;else if(ch==='\\b'){if(o.cx>0)o.cx--}else if(ch==='\\t')o.cx=Math.min(o.cols-1,(o.cx+8)&~7);else if(ch>=' ')put(ch)}};return o}\n" h+
+	"function terminal(){win('terminal',function(a){var t=el('div','term',a.body),ta=document.createTextNode(''),cur=el('span','cur'),tb=document.createTextNode('');t.appendChild(ta);t.appendChild(cur);t.appendChild(tb);t.tabIndex=0;" h+
+	"var m=el('span','',t);m.textContent='X';m.style.visibility='hidden';var cw=m.getBoundingClientRect().width||8,chh=m.getBoundingClientRect().height||16;m.remove();" h+
+	"function size(){return[Math.max(2,Math.floor((t.clientWidth-8)/cw)),Math.max(2,Math.floor((t.clientHeight-8)/chh))]}var sz=size(),vt=VT(sz[0],sz[1]),ws=new WebSocket('ws://'+location.host+'/ws');" h+
+	"function render(){var A=vt.scroll.concat(vt.lines.slice(0,vt.cy)).join('\\n'),l=vt.lines[vt.cy];while(l.length<=vt.cx)l+=' ';A+=(A?'\\n':'')+l.slice(0,vt.cx);" h+
+	"ta.data=A;cur.textContent=l[vt.cx];cur.style.visibility=vt.hide?'hidden':'';tb.data=l.slice(vt.cx+1)+(vt.cy<vt.rows-1?'\\n'+vt.lines.slice(vt.cy+1).join('\\n'):'');t.scrollTop=t.scrollHeight}" h+
+	"function sized(){var s=size();if(s[0]!==vt.cols||s[1]!==vt.rows){vt.resize(s[0],s[1]);render()}if(ws.readyState===1)ws.send('term size '+vt.rows+' '+vt.cols)}" h+
+	"new ResizeObserver(sized).observe(t);" h+
+	"ws.onopen=function(){ws.send('term open');sized();t.focus()};ws.onclose=function(){vt.feed('\\n[the connection closed]\\n');vt.hide=true;render()};" h+
+	"ws.onmessage=function(e){if(e.data.slice(0,5)==='term:'){vt.feed(e.data.slice(5));render()}};" h+
+	"var M={Enter:'\\r',Backspace:'\\x7f',Tab:'\\t',Escape:'\\x1b',ArrowUp:'\\x1b[A',ArrowDown:'\\x1b[B',ArrowRight:'\\x1b[C',ArrowLeft:'\\x1b[D',Home:'\\x1b[H',End:'\\x1b[F',PageUp:'\\x1b[5~',PageDown:'\\x1b[6~',Delete:'\\x1b[3~'};" h+
+	"t.onkeydown=function(e){var k=e.key,s='';if(M[k])s=M[k];else if(k.length===1){if(e.ctrlKey){var c=k.toUpperCase().charCodeAt(0);if(c>=64&&c<96)s=String.fromCharCode(c&31)}else if(!e.metaKey&&!e.altKey)s=k}" h+
+	"if(s){ws.send('term in '+s);e.preventDefault()}};t.onmousedown=function(){setTimeout(function(){t.focus()},0)};a.onclose=function(){ws.close()};render()})}" h+
+	"document.getElementById('new').onclick=terminal;terminal();\n" h+
+	hp @ hjsb @ - hjsn ! ;
+
+\ hbuild ( -- )  the 200 (with the page), the script and the 404, ready to send
 : hbuild
 	hresp @ hp !
 	"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: keep-alive\r\nContent-Length: " h+
 	hbn @ hp @ hdec hp !  "\r\n\r\n" h+
 	hbody @ hp @ hbn @ mcopy  hp @ hbn @ + hresp @ - hrlen !
+	hjsr @ hp !
+	"HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nConnection: keep-alive\r\nContent-Length: " h+
+	hjsn @ hp @ hdec hp !  "\r\n\r\n" h+
+	hjsb @ hp @ hjsn @ mcopy  hp @ hjsn @ + hjsr @ - hjrl !
 	h404 @ hp !
 	"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nConnection: keep-alive\r\nContent-Length: 10\r\n\r\nnot found\n" h+
 	hp @ h404 @ - h4len ! ;
@@ -144,10 +196,10 @@
 : httpinit ( port n -- )
 	dup hsn !  5 lit lshift dup alloc dup hsl ! swap 2 lit rshift nzero
 	hsn @ 0 lit do 800 lit alloc i hslot 14 lit + !  100 lit alloc i hslot 18 lit + ! loop
-	1000 lit alloc hbody !  1200 lit alloc hresp !  100 lit alloc h404 !  800 lit alloc htb !
+	1000 lit alloc hbody !  1200 lit alloc hresp !  100 lit alloc h404 !  800 lit alloc htb !  3000 lit alloc hjsb !  3200 lit alloc hjsr !
 	10 lit alloc hdt !  80 lit alloc hkb !  14 lit alloc hdg !
 	14 lit alloc shh !  140 lit alloc shw !  200 lit alloc shm !
-	hpage hbuild
+	hpage hjs hbuild
 	tcplsn hlsn !
 	0 lit hnreq !  0 lit hnws !  0 lit hnmsg !  0 lit hncls !  tnow htick !  0 lit hsec ! ;
 
@@ -158,7 +210,7 @@
 : hout  2dup hc @ -rot tcpsend  tuck - hs @ 10 lit + !  + hs @ C lit + ! ;
 : hflush ( -- )  hs @ 10 lit + @ ?dup if hs @ C lit + @ swap hout then ;
 
-: hclose ( -- )  hc @ tcpclose  0 lit hs @ !  0 lit hs @ 4 lit + !  0 lit hs @ 10 lit + !  0 lit hf ! ;
+: hclose ( -- )  hs @ hsl @ - 5 lit rshift termclos  hc @ tcpclose  0 lit hs @ !  0 lit hs @ 4 lit + !  0 lit hs @ 10 lit + !  0 lit hf ! ;
 
 \ hshift ( n -- )  drop the first n bytes of the request buffer
 : hshift
@@ -210,7 +262,8 @@
 	hrb @ be32@ 47455420 lit = if
 		"sec-websocket-key:" 12 lit hfind dup 0< if drop
 			hrb @ 4 lit + be16@ 2F20 lit = if hresp @ hrlen @ hout  hlog @ if " -> 200, " puts hrlen @ u. " bytes" puts tln then
-			else h404 @ h4len @ hout  hlog @ if " -> 404" puts tln then then
+			else hrb @ 4 lit + be32@ 2F776D2E lit = hrb @ 8 lit + be32@ 6A732048 lit = and if hjsr @ hjrl @ hout  hlog @ if " -> 200, the script" puts tln then     \ "/wm.js "
+			else h404 @ h4len @ hout  hlog @ if " -> 404" puts tln then then then
 		else hupgr  hlog @ if " -> 101, socket" puts tln then then
 	else h404 @ h4len @ hout  hlog @ if " -> 404" puts tln then then ;
 
@@ -252,10 +305,12 @@
 		hnmsg @ 1 lit + hnmsg !
 		hwl @ 3 lit u< 0=  hrb @ hwh @ + be16@ 6B76 lit = and  hrb @ hwh @ + 2 lit + c@ 20 lit = and if   \ "kv ": the store
 			hrb @ hwh @ + 3 lit + hwl @ 3 lit - htb @ 4 lit + 7F0 lit kvcmd  htb @ 4 lit + swap rot wsend
+		else hwl @ 5 lit u< 0=  hrb @ hwh @ + be32@ 7465726D lit = and  hrb @ hwh @ + 4 lit + c@ 20 lit = and if   \ "term ": the terminal
+			hs @ hsl @ - 5 lit rshift hrb @ hwh @ + 5 lit + hwl @ 5 lit - htb @ 4 lit + 7F0 lit termcmd ?dup if htb @ 4 lit + swap rot wsend else drop then
 		else
 			htb @ 4 lit + hp !  "you said: " h+  hrb @ hwh @ + hp @ hwl @ mcopy
 			htb @ 4 lit + hwl @ A lit + rot wsend
-		then
+		then then
 	else dup 8 lit = if
 		hncls @ 1 lit + hncls !  htb @ 0 lit 8 lit wsend  hclose  drop
 	else dup 9 lit = if hrb @ hwh @ + hwl @ A lit wsend drop
@@ -350,17 +405,24 @@ Test {
 		18 lit 3E9 lit tcc @ 14 lit + @ "GET / HTTP/1.1\r\nHost: q\r\n\r\n" 1B lit hin
 		tntx 1 lit asrt_eq
 		httpturn
-		hnreq @ 1 lit asrt_eq  tntx 3 lit asrt_eq  hrlen @ 800 lit u> hrlen @ AAA lit u< and assert   \ two segments
-		1 lit tfr dup D lit + c@ 10 lit asrt_eq  14 lit + "HTTP/1.1 200 OK\r\n" 11 lit hcmp assert
+		hnreq @ 1 lit asrt_eq  hrlen @ 0 lit u> hrlen @ C00 lit u< and assert           \ a response fits the send ring (and four take three turns below)
+		: htsg variable ;  : htk variable ;
+		hrlen @ 5B3 lit + 5B4 lit / htsg !  tntx htsg @ 1 lit + asrt_eq                  \ the SYN-ACK, then its segments
+		1 lit tfr dup D lit + c@ htsg @ 1 lit u> if 10 lit else 18 lit then asrt_eq  14 lit + "HTTP/1.1 200 OK\r\n" 11 lit hcmp assert
 		tlast D lit + c@ 18 lit asrt_eq  tend "</html>\n" 8 lit hcmp assert
 		0 lit hslot 8 lit + @ 0 lit asrt_eq                                             \ consumed
 		10 lit 404 lit tcc @ 14 lit + @ 0 lit tin                                      \ all acked
-		\ four requests in one segment: one answer and part of the next fit the ring, the rest wait for ACKs
+		\ four requests in one segment: what fits the 0x1000-byte ring goes now, the rest waits for ACKs;
+		\ a response is started as soon as the ring has any room, so the one cut by the ring's end is pending
 		4 lit 0 lit do "GET / HTTP/1.1\r\nHost: q\r\n\r\n" tbf @ i 1B lit * + 1B lit mcopy loop
 		18 lit 404 lit tcc @ 14 lit + @ tbf @ 6C lit hin
-		httpturn  hnreq @ 3 lit asrt_eq  0 lit hslot 10 lit + @ hrlen @ 2 lit * 1000 lit - asrt_eq
+		httpturn
+		FFF lit hrlen @ + hrlen @ / htk !                                                 \ responses started in 0x1000 bytes
+		hnreq @ htk @ 1 lit + asrt_eq  0 lit hslot 10 lit + @ htk @ hrlen @ * 1000 lit - asrt_eq
 		10 lit 470 lit tcc @ 14 lit + @ 0 lit tin
-		httpturn  hnreq @ 5 lit asrt_eq  0 lit hslot 10 lit + @ hrlen @ 4 lit * 2000 lit - asrt_eq
+		httpturn
+		1FFF lit hrlen @ + hrlen @ / dup 4 lit u> if drop 4 lit then htk !                 \ started in 0x2000: all four at most
+		hnreq @ htk @ 1 lit + asrt_eq  0 lit hslot 10 lit + @ htk @ hrlen @ * 2000 lit - dup 0< if drop 0 lit then asrt_eq
 		10 lit 470 lit tcc @ 14 lit + @ 0 lit tin
 		httpturn  0 lit hslot 10 lit + @ 0 lit asrt_eq  tend "</html>\n" 8 lit hcmp assert
 		10 lit 470 lit tcc @ 14 lit + @ 0 lit tin

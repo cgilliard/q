@@ -91,10 +91,8 @@ RESTORE = asm("""
     lw      t1, 0(t0)               # TCB to resume
     lw      t2, 128(t1)
     csrw    mepc, t2
-    lw      t2, 140(t1)             # the thread's record: K+0x34 + pid*0x300
-    slli    t3, t2, 9
-    slli    t2, t2, 8
-    add     t2, t2, t3
+    lw      t2, 140(t1)             # the thread's record: K+0x34 + pid*0x400
+    slli    t2, t2, 10
     lw      t3, 52(t0)
     add     t2, t2, t3
     lw      t3, 8(t2)               # mode: 0 machine, 1 user
@@ -106,12 +104,6 @@ RESTORE = asm("""
 1:  lw      t3, 12(t2)              # e0: the process image's base (a boundary only)
     srli    t3, t3, 2
     csrw    pmpaddr0, t3
-    lw      t3, 16(t2)              # e1: up to the image's end, read + execute
-    srli    t3, t3, 2
-    csrw    pmpaddr1, t3
-    lw      t3, 20(t2)              # e2: up to the process region's end, read + write
-    srli    t3, t3, 2
-    csrw    pmpaddr2, t3
     lw      t3, 0(t2)               # e3: the thread's own region, read + write (NAPOT)
     lw      t4, 4(t2)
     srli    t4, t4, 1
@@ -119,13 +111,22 @@ RESTORE = asm("""
     or      t3, t3, t4
     srli    t3, t3, 2
     csrw    pmpaddr3, t3
-    li      t3, 0x040001FF          # e4: the UART page, read + write (NAPOT 4 KiB at 0x10000000)
-    csrw    pmpaddr4, t3
-    li      t3, 0x00802FFE          # e5: mtime, read only (NAPOT 8 bytes at 0x0200BFF8)
+    lw      t3, 8(t2)               # mode 2: a binary that writes code it runs (the compiler):
+    li      t4, 2                   # one span to the region's end, read + write + execute
+    beq     t3, t4, 3f
+    lw      t3, 16(t2)              # e1: up to the image's end, read + execute
+    srli    t3, t3, 2
+    csrw    pmpaddr1, t3
+    lw      t3, 20(t2)              # e2: up to the process region's end, read + write
+    srli    t3, t3, 2
+    csrw    pmpaddr2, t3
+    li      t5, 0x1B0B0D00          # e3 NAPOT RW | e2 TOR RW | e1 TOR RX | e0 off
+    j       4f
+3:  li      t5, 0x1F000000          # e3 NAPOT RWX (the thread's region, all of it) | e2, e1, e0 off
+4:  li      t3, 0x00802FFE          # e5: mtime, read only (NAPOT 8 bytes at 0x0200BFF8)
     csrw    pmpaddr5, t3
-    li      t3, 0x1B0B0D00          # e3 NAPOT RW | e2 TOR RW | e1 TOR RX | e0 off
-    csrw    pmpcfg0, t3
-    li      t3, 0x191B              # e5 NAPOT R | e4 NAPOT RW
+    csrw    pmpcfg0, t5
+    li      t3, 0x1900              # e5 NAPOT R; e4 off: the UART is not a user thread's, its accesses trap and are emulated (kuart)
     csrw    pmpcfg1, t3
 2:  li      t2, 0x80                # MPIE = 1: interrupts on after mret
     csrs    mstatus, t2
@@ -511,7 +512,7 @@ out = f"""\
 \\ image (to a page boundary: QEMU stops caching a page a PMP boundary cuts
 \\ through) is read + execute, the rest of the process region read + write, its
 \\ own region (for a spawned thread; the same region for the main thread) read
-\\ + write, the UART page read + write, the mtime register read only; nothing
+\\ + write, the mtime register read only (the UART is emulated: kuart); nothing
 \\ else, so the kernel, other programs and the devices are out of reach, the
 \\ RID stack cannot grow down into the code, and no stack can leave the region.
 \\ Any other trap from a user thread (an access, alignment or illegal-
@@ -548,13 +549,15 @@ out = f"""\
 \\   14 ksp   18 ks8   1C ks11   20 kgp   24 quantum   28 ticks   2C IRQ events
 \\   that no thread was subscribed to (claimed by the next wait that asks)
 \\   30 region classes (3 x 0x18: size, base, count, free head, nfree, end)
-\\   34 thread records (16 x 0x300: 0 region base, 4 size, 8 mode (1 = user),
+\\   34 thread records (16 x 0x400: 0 region base, 4 size, 8 mode (1 = user),
 \\   C process image base, 10 its code's end, 14 the process region's end,
 \\   18 the binding of handle 0 (its length; 0 = the console), 1C the exit
 \\   code (0 exited, cause+1 killed), 20..5F the binding's key, 64 a pending
 \\   request (op, 68..74 four arguments, 78 the reply, 7C 1 pending 2 answered;
-\\   src/ksrv.fam serves them); base 0 = no region)   38 the kernel's s10
-\\   3C the slot last handed out (kfind goes round)   40 the thread the last
+\\   src/ksrv.fam serves them), 80 the working directory (its length, 84.. the
+\\   bytes), 284 the input binding (its length, 288.. the key), 2FC the
+\\   arguments (their length, 300.. the bytes); base 0 = no region)   38 the kernel's s10
+\\   3C the slot last handed out (kfind goes round)   44 the console buffers (src/ksrv.fam, for kuart)   40 the thread the last
 \\   post woke: sched runs it next, once, instead of drawing a ticket (a posted
 \\   thread answers at once instead of waiting out the poster's turn)
 \\   (its variable base: the trap switches to it, since a program exec'd in a
@@ -676,10 +679,10 @@ out = f"""\
 
 \\ a waiting thread whose pending events meet its mask gets them and runs
 : twake ( tcb -- )
-    dup 84 lit + @ 3 lit = if
+    dup 84 lit + @ dup 3 lit = swap 4 lit = or if
         dup 9C lit + @ over 90 lit + @ and ?dup if      \\ tcb hit
             2dup swap 9C lit + dup @ rot xor swap !      \\ events ^= hit
-            over tpush
+            over 84 lit + @ 3 lit = if over tpush else drop then   \\ state 4 waits without the events pushed (a trap's wait: kreqt)
             1 lit over 84 lit + !
             dup K 40 lit + !                             \\ run it next
         then
@@ -761,7 +764,7 @@ out = f"""\
 \\ threads use the syscalls region and release.
 
 : rcls ( c -- rec )  18 lit * K 30 lit + @ + ;
-: rrec ( tid -- rec )  300 lit * K 34 lit + @ + ;
+: rrec ( tid -- rec )  A lit lshift K 34 lit + @ + ;
 : rfree ( c -- n )  rcls 10 lit + @ ;
 : rpush ( addr c -- )  rcls  dup C lit + @ 2 lit pick !  swap over C lit + !  10 lit + dup @ 1 lit + swap ! ;
 : rpop ( c -- addr|0 )
@@ -784,7 +787,7 @@ out = f"""\
 \\ 8 MiB, the largest class first so every region is aligned to its size
 : rpinit
     48 lit alloc K 30 lit + !
-    3000 lit alloc K 34 lit + !  K 34 lit + @ C00 lit 0 lit do 0 lit over i 2 lit lshift + ! loop drop
+    4000 lit alloc K 34 lit + !  K 34 lit + @ 1000 lit 0 lit do 0 lit over i 2 lit lshift + ! loop drop
     1 lit 0 lit rrec 80 lit + !  2F lit 0 lit rrec 84 lit + c!                       \\ thread 0 works at "/"
     800000 lit 2 lit rcls !  2 lit rcls 8 lit + !
     100000 lit 1 lit rcls !  1 lit rcls 8 lit + !
@@ -808,6 +811,8 @@ out = f"""\
 \\ 7 spawnin ( addr tickets base size -- tid )   8 region ( size -- addr )
 \\ 9 release ( addr -- )   A tstate ( tid -- state )   B myregion ( -- base size )
 \\ C uspawn ( base size imgend tickets -- tid )   D request ( op a b c d -- events )
+\\   (tickets | 0x100: the thread's whole region is read + write + execute,
+\\   for a binary that writes code it runs, the compiler; else its image is read-only)
 \\ E reply ( -- r )   F texcode ( tid -- code )
 
 \\ kfind ( -- tcb|0 )  a free slot, round robin from the last one handed out
@@ -847,7 +852,7 @@ out = f"""\
         dup 8C lit + @ rrec rgr !
         -rot rgr @ 4 lit + ! rgr @ !    \\ tickets addr tcb
         cur 8C lit + @ rrec 8 lit + rgr @ 8 lit + 58 lit mcopy   \\ the spawner's mode, process and binding
-        cur 8C lit + @ rrec 80 lit + rgr @ 80 lit + 204 lit mcopy  \\ and its working directory
+        cur 8C lit + @ rrec 80 lit + rgr @ 80 lit + 380 lit mcopy  \\ its working directory, input binding and arguments
         0 lit rgr @ 1C lit + !  0 lit rgr @ 7C lit + !
         dup 8C lit + @ spid !
         tinit spid @
@@ -861,23 +866,27 @@ out = f"""\
     upop rgt ! upop rgb ! upop upop     \\ tickets addr
     rgb @ rgt @ tspawn upush ;
 
-\\ tgone ( code -- )  the thread ends: its exit code kept, the region back, the
+\\ tend ( code tcb -- )  a thread ends: its exit code kept, the region back, the
 \\ slot free; when handle 0 was bound to a key the loop thread (0) is posted
 \\ bit 16 so it flushes what the thread had buffered (src/ksrv.fam).  The
 \\ binding stays for that flush.
-: tgone
-    cur 8C lit + @ rrec dup 1C lit + rot swap !
-    0 lit cur 84 lit + !
+: tet variable ;
+: tfinish ( code tcb -- )
+    dup tet !  K 40 lit + @ over = if 0 lit K 40 lit + ! then
+    8C lit + @ rrec dup 1C lit + rot swap !
+    0 lit tet @ 84 lit + !
     dup @ ?dup if krelease then
     6 lit 0 lit do 0 lit over i 2 lit lshift + ! loop
     dup 0 lit swap 7C lit + !
-    18 lit + @ 0= 0=  cur 0 lit tcb <>  and if 10000 lit 0 lit tcb tpost then ;
+    18 lit + @ 0= 0=  tet @ 0 lit tcb <>  and if 10000 lit 0 lit tcb tpost then ;
+: tgone ( code -- )  cur tfinish ;
+: kkill ( tid -- )  int_off F lit and tcb 9 lit swap tfinish int_on ;     \\ the kernel ends another thread: code 9
 : sysexit ( -- )  0 lit tgone ;
 \\ a user-mode thread for the image at base: its process is that region
 : sysuspwn ( -- )
     upop ust ! upop usi ! upop rgt ! upop rgb !
-    ust @ rgb @ rgb @ rgt @ tspawn
-    dup if dup rrec 1 lit over 8 lit + !  rgb @ over C lit + !  usi @ over 10 lit + !  rgb @ rgt @ + swap 14 lit + ! then
+    ust @ FF lit and rgb @ rgb @ rgt @ tspawn
+    dup if dup rrec ust @ 100 lit and if 2 lit else 1 lit then over 8 lit + !  rgb @ over C lit + !  usi @ over 10 lit + !  rgb @ rgt @ + swap 14 lit + ! then
     upush ;
 : sysregn ( -- )  upop kregion upush ;
 : sysrels ( -- )  upop krelease ;
@@ -954,11 +963,54 @@ out = f"""\
 
 \\ the trap entry: everything between the two asm pieces is ordinary fam running
 \\ on the kernel's stacks with interrupts masked.
+: kreg@ ( n -- v )  2 lit lshift cur + @ ;
 \\ tkill ( cause -- )  a user thread faulted: say so and end it
 : tkill
     "proc: thread " puts cur 8C lit + @ u. " killed: cause " puts dup u. " at " puts cur 80 lit + @ u.x
-    ", address " puts mtval@ u.x '\\n' lit putc
+    ", address " puts mtval@ u.x
+    " (ra " puts 1 lit kreg@ u.x " sp " puts 2 lit kreg@ u.x " gp " puts 3 lit kreg@ u.x " tp " puts 4 lit kreg@ u.x " s0 " puts 8 lit kreg@ u.x " a2 " puts C lit kreg@ u.x " s7 " puts 17 lit kreg@ u.x " s10 " puts 1A lit kreg@ u.x ")" puts '\\n' lit putc
     1 lit + tgone ;
+
+\\ A user thread's access to the UART (its PMP has no entry for it) or to the
+\\ test finisher traps here and is emulated against the thread's console, so a
+\\ binary written for the bare machine (bin/fam, the compiler) runs unchanged
+\\ with its input and output bound like any program's.  The console buffers
+\\ are src/ksrv.fam's (K+44 their base, 0x820 a thread: +0 output, +400 its
+\\ fill, +408 input fill, +410 input position, +414 input at its end, +418 the
+\\ input bytes): a byte to the data register goes into the output buffer, a
+\\ load of it takes the next input byte, the status register always says ready
+\\ to send and (so the thread blocks on the data register, not in a poll)
+\\ ready to read; with the output buffer full or the input empty, the thread
+\\ waits in state 4 for the loop thread to flush or fill (ops 11 and 10 in
+\\ its request record), then runs the same instruction again.  A store to the
+\\ finisher ends the thread with its code (0x5555 is 0, else the high half).
+: kins ( -- insn )  cur 80 lit + @ @ ;
+: krd ( -- n )  kins 7 lit rshift 1F lit and ;
+: krs2 ( -- n )  kins 14 lit rshift 1F lit and ;
+: kreg! ( v n -- )  2 lit lshift cur + ! ;
+: kpc+ ( -- )  cur 80 lit + dup @ 4 lit + swap ! ;
+: kcb ( -- rec|0 )  K 44 lit + @ ?dup if cur 8C lit + @ 820 lit * + then ;
+: kreqt ( op -- )                                   \\ ask the loop thread, then wait (state 4) and redo the instruction
+    cur 8C lit + @ rrec tuck 64 lit + !  1 lit swap 7C lit + !
+    10000 lit 0 lit tcb tpost
+    20000 lit cur 90 lit + !  -1 lit cur 94 lit + !  -1 lit cur 98 lit + !  4 lit cur 84 lit + !
+    cur twake ;
+: kuthr ( -- )                                     \\ a byte to the data register
+    krs2 kreg@ FF lit and
+    kcb 400 lit + @ 400 lit u< if kcb kcb 400 lit + @ + c!  kcb 400 lit + dup @ 1 lit + swap !  kpc+ else drop 11 lit kreqt then ;
+: kurbr ( -- )                                     \\ a byte from it
+    kcb 410 lit + @ kcb 408 lit + @ u< if
+        kcb 418 lit + kcb 410 lit + @ + c@ krd kreg!  kcb 410 lit + dup @ 1 lit + swap !  kpc+
+    else kcb 414 lit + @ if 4 lit krd kreg!  kpc+ else 10 lit kreqt then then ;
+: kuart ( cause -- )
+    kcb 0= if tkill else
+        mtval@ 10000000 lit -  swap 7 lit = if
+            0= if kuthr else kpc+ then
+        else
+            dup 5 lit = if drop 61 lit krd kreg!  kpc+ else 0= if kurbr else 0 lit krd kreg!  kpc+ then then
+        then
+    then ;
+: kfin ( cause -- )  drop krs2 kreg@ dup 5555 lit = if drop 0 lit else 10 lit rshift then tgone ;
 
 : ktrap ( -- )
     mcause@ {DBG0}
@@ -966,7 +1018,9 @@ out = f"""\
     dup 8000000B lit = if drop irq! else
     dup B lit = if drop syscall! else
     dup 8 lit = if drop syscall! else
-    cur 8C lit + @ rrec 8 lit + @ if tkill else
+    cur 8C lit + @ rrec 8 lit + @ if
+        mtval@ dup 10000000 lit - 8 lit u< if drop kuart else 100000 lit = if kfin else tkill then then
+    else
         "proc: unexpected trap " puts u.x '\\n' lit putc khalt
     then then then then then
     sched arm ;
@@ -1218,6 +1272,18 @@ Test {{
 		11082023 lit umb @ !  00100893 lit umb @ 4 lit + !  00000073 lit umb @ 8 lit + !       \\ sw a6,256(a6); li a7,1; ecall
 		0 lit umb @ 100 lit + !
 		umb @ 20000 lit umb @ C lit + 5 lit uspawn dup 0 lit <> assert join
+		umb @ 100 lit + @ umb @ asrt_eq  0 lit rfree xr0 @ asrt_eq
+		\\ the same in a fresh region with the image said to end at base + 0x1000: the write lands inside it and is refused
+		20000 lit region umb !
+		11082023 lit umb @ !  00100893 lit umb @ 4 lit + !  00000073 lit umb @ 8 lit + !
+		0 lit umb @ 100 lit + !
+		umb @ 20000 lit umb @ 1000 lit + 5 lit uspawn dup 0 lit <> assert dup join texcode 8 lit asrt_eq
+		umb @ 100 lit + @ 0 lit asrt_eq
+		\\ tickets | 0x100: the region is read + write + execute throughout, so it is not
+		20000 lit region umb !
+		11082023 lit umb @ !  00100893 lit umb @ 4 lit + !  00000073 lit umb @ 8 lit + !
+		0 lit umb @ 100 lit + !
+		umb @ 20000 lit umb @ 1000 lit + 105 lit uspawn dup 0 lit <> assert dup join texcode 0 lit asrt_eq
 		umb @ 100 lit + @ umb @ asrt_eq  0 lit rfree xr0 @ asrt_eq
 		20000 lit region umb !  12345678 lit umv !
 		umv 800 lit + FFFFF000 lit and 2B7 lit or umb @ !                                    \\ lui t0,%hi(umv)

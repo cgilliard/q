@@ -1,0 +1,59 @@
+\ lib/pvt.fam — a program's screen: the terminal it was started on, drawn with
+\ the escape sequences a terminal takes (the page's emulator, or the real one
+\ on the UART), and its keys read one code at a time.  Output is gathered and
+\ sent with vflush, so a redraw is one write.
+\
+\   vinit  ( -- )        once: the size from /proc/term/S/size when the output
+\                        is a terminal's pipe (24 x 80 otherwise); vrows vcols
+\   vsize  ( -- )        read the size again (after a watch on the size key fires)
+\   vat    ( row col -- )  the cursor there (0-based)
+\   vclr   ( -- )        clear the screen, cursor home;  vcl ( -- )  clear to the line's end
+\   vhide vshow ( -- )   the cursor
+\   vsay   ( a n -- )  vs ( s -- )  vemit ( c -- )  vdec ( n -- )   text
+\   vflush ( -- )        send what was gathered
+\   vkey   ( -- code )   the next key: a byte, or 101 up 102 down 103 right
+\                        104 left 105 home 106 end 107 page up 108 page down
+\                        109 delete (an escape sequence decoded)
+: vrows variable ;  : vcols variable ;  : vob variable ;  : vop variable ;
+: vib variable ;  : vin variable ;  : vip variable ;  : vsk variable ;  : vskl variable ;  : vn variable ;
+: vflush ( -- )  vop @ vob @ - ?dup if vob @ swap ssay then  vob @ vop ! ;
+: vemit ( c -- )  vop @ vob @ - FF0 lit u< 0= if vflush then  vop @ c!  vop @ 1 lit + vop ! ;
+: vsay ( a n -- )  ?dup if 0 lit do dup i + c@ vemit loop then drop ;
+: vs ( s -- )  dup slen vsay ;
+: vdec ( n -- )  dup A lit u< 0= if dup A lit / vdec then  A lit % '0' lit + vemit ;
+: vesc ( -- )  1B lit vemit '[' lit vemit ;
+: vat ( row col -- )  vesc swap 1 lit + vdec ';' lit vemit 1 lit + vdec 'H' lit vemit ;
+: vclr ( -- )  vesc '2' lit vemit 'J' lit vemit  vesc 'H' lit vemit ;
+: vcl ( -- )  vesc 'K' lit vemit ;
+: vhide ( -- )  vesc '?' lit vemit '2' lit vemit '5' lit vemit 'l' lit vemit ;
+: vshow ( -- )  vesc '?' lit vemit '2' lit vemit '5' lit vemit 'h' lit vemit ;
+\ vnum ( a n -- a' n' v )  a decimal from the front, the rest after it
+: vnum  0 lit vn !  begin dup if over c@ '0' lit - A lit u< else 0 lit then while over c@ '0' lit - vn @ A lit * + vn !  1 lit - swap 1 lit + swap repeat
+	begin dup if over c@ 20 lit = else 0 lit then while 1 lit - swap 1 lit + swap repeat  vn @ ;
+: vsize ( -- )
+	vskl @ if
+		vsk @ vskl @ vib @ 40 lit sget dup 0< 0= if
+			vib @ swap vnum ?dup if vrows ! then vnum ?dup if vcols ! then 2drop
+		else drop then
+	then ;
+: vinit ( -- )
+	1000 lit alloc vob !  vob @ vop !  100 lit alloc vib !  0 lit vin !  0 lit vip !  80 lit alloc vsk !  0 lit vskl !
+	18 lit vrows !  50 lit vcols !
+	'/' lit vsk @ c!  "1" 1 lit vsk @ 1 lit + 70 lit sget dup 4 lit u> if                 \ ".../out" -> ".../size"
+		3 lit - 1 lit + dup vsk @ + "size" swap 4 lit mcopy  4 lit + vskl !  vsize
+	else drop then ;
+\ vgetb ( -- b )  the next byte from the console
+: vgetb
+	begin vip @ vin @ u< 0= while "0" 1 lit vib @ 80 lit sget dup 0< if drop 0 lit then vin !  0 lit vip ! repeat
+	vib @ vip @ + c@  vip @ 1 lit + vip ! ;
+: vkey ( -- code )
+	vgetb dup 1B lit = if
+		vgetb dup '[' lit = if drop
+			vgetb
+			dup 'A' lit = if drop 101 lit else dup 'B' lit = if drop 102 lit else dup 'C' lit = if drop 103 lit else
+			dup 'D' lit = if drop 104 lit else dup 'H' lit = if drop 105 lit else dup 'F' lit = if drop 106 lit else
+			dup '5' lit = if drop vgetb drop 107 lit else dup '6' lit = if drop vgetb drop 108 lit else
+			dup '3' lit = if drop vgetb drop 109 lit else
+			then then then then then then then then then
+		else vip @ 1 lit - vip ! drop then                                               \ a lone escape: the byte after it stays
+	then ;

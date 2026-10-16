@@ -1,0 +1,20 @@
+\ prog/mv.fam — mv SRC DST: DST gets SRC's value and SRC is deleted; cp SRC DST:
+\ DST gets a copy.  One program, installed under both names: it looks at the
+\ name it was run as.  The value is copied in 64 KiB pieces (sread), so its
+\ size does not matter.  DST is the key itself, not a directory to put SRC in.
+: mb variable ;  : mblk variable ;  : mab variable ;  : ms variable ;  : msl variable ;  : md variable ;  : mdl variable ;  : moff variable ;  : mmv variable ;
+10000 lit alloc mb !  10 lit alloc mblk !  100 lit alloc mab !
+mab @ 100 lit sargs dup 0< if drop 0 lit then  mab @ swap stok
+dup 2 lit = if over c@ 'm' lit = else 0 lit then mmv !  2drop
+stok msl ! ms !  stok mdl ! md !  2drop
+msl @ 0= mdl @ 0= or if mmv @ if "usage: mv SRC DST\n" say else "usage: cp SRC DST\n" say then texit then
+0 lit moff !
+begin
+	mb @ mblk @ !  10000 lit mblk @ 4 lit + !  moff @ mblk @ 8 lit + !
+	ms @ msl @ mblk @ sread
+	dup 0< if drop "no such key: " say ms @ msl @ ssay "\n" say texit then
+	moff @ 0= if md @ mdl @ mb @ 3 lit pick sput drop else dup if md @ mdl @ mb @ 3 lit pick sadd drop then then
+	dup moff @ + moff !
+	10000 lit <>
+until
+mmv @ if ms @ msl @ sdel drop then

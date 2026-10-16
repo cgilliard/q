@@ -111,6 +111,12 @@ B7121000 ,   \ lui t0,0x101
 : sdel  ( key klen -- flag )             sb ! sa !  4 lit sa @ sb @ 0 lit 0 lit kreq ;
 : sexec ( key klen size tickets -- tid ) sd ! sc ! sb ! sa !  5 lit sa @ sb @ sc @ sd @ kreq ;
 : sscan ( prefix plen buf cap -- n )     sd ! sc ! sb ! sa !  A lit sa @ sb @ sc @ sd @ kreq ;
+: sread  ( key klen blk -- n )          sc ! sb ! sa !  B lit sa @ sb @ sc @ 0 lit kreq ;    \ blk: buf, cap, offset
+: swatch ( key klen -- r )               sb ! sa !  C lit sa @ sb @ 0 lit 0 lit kreq ;
+: sunwatch ( key klen -- r )             sb ! sa !  D lit sa @ sb @ 0 lit 0 lit kreq ;
+: srewind ( key klen -- r )              sb ! sa !  F lit sa @ sb @ 0 lit 0 lit kreq ;    \ read from its start, as a file (its end is 0)
+: skill  ( tid -- r )                    sa !  E lit sa @ 0 lit 0 lit 0 lit kreq ;
+: wbit   ( -- mask )  100000 lit ;                                                       \ bit 20: a watched key was written
 : slen  ( s -- n )  dup begin dup c@ while 1 lit + repeat swap - ;
 : scopy ( src dst n -- )  ?dup if 0 lit do over i + c@ over i + c! loop then 2drop ;   \ bytes, the slow way
 \ mcopy ( src dst n -- )  copy n bytes.  When both addresses are word-aligned
@@ -161,6 +167,25 @@ B362B500 ,   \ or t0,a0,a1
 : spwd  ( buf cap -- n )  sd ! sc !  "." 1 lit sc @ sd @ sget ;                        \ the working directory, "/..."
 : scd   ( path n -- r )   sd ! sc !  "." 1 lit sc @ sd @ sput ;                        \ set it (absolute, at most 511 bytes; -1 refused)
 : say   ( s -- )  dup slen sd ! sc !  "0" 1 lit sc @ sd @ sput drop ;
+: ssay  ( a n -- )  sd ! sc !  "0" 1 lit sc @ sd @ sput drop ;                              \ n bytes to the console
+: sargs ( buf cap -- n )  sd ! sc !  "/proc/self/args" F lit sc @ sd @ sget ;                \ the arguments (the command line)
+: sargs! ( a n -- r )     sd ! sc !  "/proc/self/args" F lit sc @ sd @ sput ;                \ set them (for a child to inherit)
+: sra variable ;  : srn variable ;  : srb variable ;
+: sres  ( a n buf -- a' n' )                                                                 \ the tree key of a path, at buf+1 (buf+0 is free for a "/")
+	srb ! srn ! sra !
+	srn @ if sra @ c@ '/' lit = else 0 lit then if
+		sra @ 1 lit + srb @ 1 lit + srn @ 1 lit - mcopy  srb @ 1 lit + srn @ 1 lit -
+	else
+		srb @ 200 lit spwd 1 lit - dup 0< if drop 0 lit then
+		dup if '/' lit over srb @ 1 lit + + c!  1 lit + then
+		sra @ over srb @ 1 lit + + srn @ mcopy  srn @ +  srb @ 1 lit + swap
+	then ;
+: sta variable ;  : stn variable ;  : sti variable ;
+: stok  ( a n -- a' n' t tl )                                                                \ the first token (to a space) and the rest
+	stn ! sta !  0 lit sti !
+	begin sti @ stn @ u< if sta @ sti @ + c@ 20 lit <> else 0 lit then while sti @ 1 lit + sti ! repeat
+	sti @ stn @ u< if sta @ sti @ + 1 lit + stn @ sti @ - 1 lit - else sta @ stn @ + 0 lit then
+	sta @ sti @ ;
 : texcode ( tid -- code )  F lit syscall ;
 
 \ mtime@ ( -- lo hi )  the CLINT's counter (src/proc.fam's): read-only for a program

@@ -1,1 +1,1 @@
-prog/kv.fam prog/http.fam prog/udpsrv.fam
+prog/kv.fam prog/term0.fam prog/http.fam prog/udpsrv.fam

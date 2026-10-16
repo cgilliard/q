@@ -1,50 +1,53 @@
-\ prog/init.fam — the first program the node runs.  It execs the programs named
-\ in the store's "init" value (names separated by spaces; each is the key
-\ bin/NAME, run in 8 MiB with 5 tickets), then watches them: one the kernel
-\ killed is restarted, up to three times; one that exited stays down; when none
-\ is left init exits too.  Its own lines go to the UART directly, as every
-\ program's puts does for now.
-: ibuf variable ;  : ikey variable ;  : ich variable ;  : ilen variable ;  : inn variable ;
-: irec ( i -- rec )  4 lit lshift ich @ + ;        \ +0 tid  +4 name  +8 name length  +C restarts
+\ prog/init.fam — the first program the node runs.  It execs what the keys under
+\ /init.d/ name: each one's value is the path of a program (a link, as
+\ /init.d/wm = /bin/wm), run in 8 MiB with 5 tickets.  Then it watches them:
+\ one the kernel killed is restarted, up to three times; one that exited stays
+\ down; when none is left init exits too.  Up to 8 entries.
+: ibuf variable ;  : ich variable ;  : inn variable ;  : isb variable ;  : isn variable ;  : igo variable ;
+: ik variable ;  : ikl variable ;  : iv variable ;  : ivl variable ;
+: irec ( i -- rec )  7 lit lshift ich @ + ;        \ +0 tid  +4 restarts  +8 name length  +C name (0-ended)  +40 path length  +44 path
+: iumin ( a b -- min )  2dup u> if swap then drop ;
+: isame ( a b n -- flag )  -1 lit swap 0 lit do 2 lit pick i + c@ 2 lit pick i + c@ <> if drop 0 lit then loop nip nip ;
 
 : istart ( i -- )
-	irec dup 4 lit + @ ikey @ 4 lit + 2 lit pick 8 lit + @ scopy
-	ikey @ over 8 lit + @ 4 lit + 800000 lit 5 lit sexec
-	dup 0= if "init: could not start " puts over 4 lit + @ puts '\n' lit putc then
+	irec dup 44 lit + over 40 lit + @ 800000 lit 5 lit sexec
+	dup 0= if "init: could not start " say over C lit + say "\n" say then
 	swap ! ;
 
-400 lit alloc ibuf !  80 lit alloc ikey !  80 lit alloc ich !
-20 lit 0 lit do 0 lit ich @ i 2 lit lshift + ! loop
-"bin/" ikey @ 4 lit scopy
-"init" 4 lit ibuf @ 3FF lit sget dup 0< if drop "init: no 'init' key in the store: nothing to run\n" puts texit then ilen !
-0 lit ibuf @ ilen @ + c!
-0 lit inn !
-ibuf @ begin dup c@ while
-	dup c@ 20 lit = if 1 lit + else
-		inn @ 8 lit u< if
-			dup inn @ irec 4 lit + !
-			begin dup c@ dup 0= 0= swap 20 lit <> and while 1 lit + repeat
-			dup inn @ irec 4 lit + @ - inn @ irec 8 lit + !
-			dup c@ if 0 lit over c! 1 lit + then
-			inn @ 1 lit + inn !
-		else drop ibuf @ ilen @ + then
-	then
-repeat drop
-inn @ ?dup if 0 lit do i istart loop then
+\ iscan ( -- )  the entries under /init.d/, in order, into the records
+: iscan
+	"/init.d/" isb @ 8 lit mcopy  8 lit isn !  0 lit inn !  -1 lit igo !
+	begin igo @ inn @ 8 lit u< and while
+		isb @ isn @ ibuf @ 400 lit sscan 0 lit u> 0= if 0 lit igo ! else
+			ibuf @ @ ikl !  ibuf @ 8 lit + ik !  ibuf @ 4 lit + @ ivl !  ik @ ikl @ 3 lit + FFFFFFFC lit and + iv !
+			ikl @ 7 lit u> if ik @ "init.d/" 7 lit isame else 0 lit then 0= if 0 lit igo ! else
+				ikl @ 7 lit - 2F lit iumin dup inn @ irec 8 lit + !  ik @ 7 lit + inn @ irec C lit + 2 lit pick mcopy  0 lit inn @ irec C lit + rot + c!
+				ivl @ 3B lit iumin dup inn @ irec 40 lit + !  iv @ inn @ irec 44 lit + rot mcopy
+				0 lit inn @ irec !  0 lit inn @ irec 4 lit + !
+				inn @ 1 lit + inn !
+				'/' lit isb @ c!  ik @ isb @ 1 lit + ikl @ mcopy  0 lit isb @ ikl @ 1 lit + + c!  ikl @ 2 lit + isn !     \ on from this key
+			then
+		then
+	repeat ;
+
+400 lit alloc ibuf !  400 lit alloc ich !  220 lit alloc isb !
+iscan
+inn @ 0= if "init: nothing under /init.d/: nothing to run\n" say texit then
+inn @ 0 lit do i istart loop
 begin
 	64 lit msleep
-	0 lit inn @ ?dup if 0 lit do
+	0 lit inn @ 0 lit do
 		i irec @ if
 			i irec @ tstate 0= if
 				i irec @ texcode if
-					i irec C lit + @ 3 lit u< if
-						"init: " puts i irec 4 lit + @ puts " was killed: restarting it\n" puts
-						i irec C lit + dup @ 1 lit + swap !  i istart
-					else "init: " puts i irec 4 lit + @ puts " keeps getting killed: giving up on it\n" puts 0 lit i irec ! then
-				else "init: " puts i irec 4 lit + @ puts " exited\n" puts 0 lit i irec ! then
+					i irec 4 lit + @ 3 lit u< if
+						"init: " say i irec C lit + say " was killed: restarting it\n" say
+						i irec 4 lit + dup @ 1 lit + swap !  i istart
+					else "init: " say i irec C lit + say " keeps getting killed: giving up on it\n" say 0 lit i irec ! then
+				else "init: " say i irec C lit + say " exited\n" say 0 lit i irec ! then
 			then
 		then
 		i irec @ if 1 lit + then
-	loop then
+	loop
 0= until
-"init: nothing left to run\n" puts
+"init: nothing left to run\n" say

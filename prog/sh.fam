@@ -1,10 +1,13 @@
 \ prog/sh.fam — a shell on the console.  A line at a time from handle "0",
-\ echoed as it is typed (backspace works): pwd, cd [DIR], ls [DIR], the store's
+\ echoed as it is typed (backspace works): pwd, cd [DIR], ls [DIR], exit, the store's
 \ commands (set, get, add, del, list: lib/pkv.fam), or a program's name, which
-\ is exec'd (bin/NAME) and waited for.  The working directory is the kernel's
+\ is exec'd (bin/NAME, or the path itself when the name has a slash: ./t.bin,
+\ ../bin/x, /bin/x) with the line as its arguments and waited for; "> KEY"
+\ sends its output to KEY, ">> KEY" adds to it, "< KEY" is its input.  The working directory is the kernel's
 \ "." (lib/sys.fam spwd/scd): the shell resolves ".", ".." and relative names
 \ against it, the kernel only joins.  ls lists one level: a name with "/" after
-\ it has more beneath, and the walk skips what is beneath by seeking past it.
+\ it has more beneath, and the walk skips what is beneath by seeking past it;
+\ a directory's marker (mkdir's DIR/) is not an entry.
 \ Its output goes through handle 0, so it can be redirected like a program's.
 : lbuf variable ;  : llen variable ;  : ldone variable ;          \ the line
 : rbuf variable ;  : rpos variable ;  : rlen variable ;           \ what the console gave
@@ -14,7 +17,6 @@
 : ca variable ;  : ce variable ;  : cs variable ;                 \ a path's cursor, end, component
 : lsl variable ;  : lsk variable ;  : lskl variable ;  : lsi variable ;  : lsgo variable ;
 
-: ssay ( a n -- )  sd ! sc !  "0" 1 lit sc @ sd @ sput drop ;
 : emit1 ( c -- )  cbuf @ c!  cbuf @ 1 lit ssay ;
 
 \ ── the line ──────────────────────────────────────────────────────────────────
@@ -65,19 +67,57 @@
 			obuf @ @ lskl !  obuf @ 8 lit + lsk !
 			lspre? 0= if 0 lit lsgo ! else
 				lsl @ begin dup lskl @ u< if dup lsk @ + c@ '/' lit <> else 0 lit then while 1 lit + repeat lsi !
-				lsk @ lsl @ + lsi @ lsl @ - ssay
 				lsi @ lskl @ u< if
-					"/\n" say  lsk @ sbuf @ 1 lit + lsi @ mcopy  '0' lit sbuf @ 1 lit + lsi @ + c!  lsi @ 2 lit + sln !     \ past everything beneath
+					lsk @ lsl @ + lsi @ lsl @ - ssay  "/\n" say
+					lsk @ sbuf @ 1 lit + lsi @ mcopy  '0' lit sbuf @ 1 lit + lsi @ + c!  lsi @ 2 lit + sln !     \ past everything beneath
 				else
-					"\n" say  lsk @ sbuf @ 1 lit + lskl @ mcopy  0 lit sbuf @ 1 lit + lskl @ + c!  lskl @ 2 lit + sln !     \ the next key
+					lsi @ lsl @ u> if lsk @ lsl @ + lsi @ lsl @ - ssay  "\n" say then                           \ (the directory's own marker is not an entry)
+					lsk @ sbuf @ 1 lit + lskl @ mcopy  0 lit sbuf @ 1 lit + lskl @ + c!  lskl @ 2 lit + sln !     \ the next key
 				then
 			then
 		then
 	repeat ;
 
 \ ── commands ──────────────────────────────────────────────────────────────────
-: run ( name n -- )
-	800000 lit 5 lit sexec ?dup 0= if "sh: no such program\n" say else
+: rgk variable ;  : rgl variable ;  : rapp variable ;  : rbl variable ;
+: rik variable ;  : ril variable ;  : rin variable ;  : rkend variable ;  : rcut variable ;  : ril2 variable ;
+\ run ( name n -- )  exec the program (bin/NAME) with the line as its arguments and
+\ wait for it.  "> KEY" sends its output to KEY (emptied first), ">> KEY" adds to
+\ it, "< KEY" gives it KEY as its input, read from the start as a file: the
+\ shell's bindings are set for the child to inherit and put back after.
+: rdir ( i -- )                                   \ the redirection at i: its key
+	dup lbuf @ + c@ '<' lit = rin !
+	dup lbuf @ + 1 lit + c@ '>' lit = dup rapp ! if 2 lit + else 1 lit + then
+	begin dup llen @ u< if dup lbuf @ + c@ 20 lit = else 0 lit then while 1 lit + repeat
+	dup begin dup llen @ u< if dup lbuf @ + c@ 20 lit <> else 0 lit then while 1 lit + repeat
+	dup rkend !  over -  swap lbuf @ + swap  dup 0= if 2drop else rin @ if ril ! rik ! else rgl ! rgk ! then then ;
+: redir? ( -- )                                   \ rgk/rgl the output key (0 none), rik/ril the input; the line cut before the first
+	0 lit rgk !  0 lit rik !  0 lit rkend !  llen @ rcut !
+	llen @ 3 lit u> if llen @ 2 lit - 1 lit do
+		i rkend @ u< 0=  lbuf @ i + c@ dup '>' lit = swap '<' lit = or and  lbuf @ i 1 lit - + c@ 20 lit = and if
+			rcut @ llen @ = if i 1 lit - rcut ! then  i rdir
+		then
+	loop then
+	rcut @ llen ! ;
+: rsl variable ;
+: hasl? ( a n -- flag )  0 lit rsl !  ?dup if 0 lit do dup i + c@ '/' lit = if -1 lit rsl ! then loop then drop  rsl @ ;
+: run
+	redir?
+	lbuf @ llen @ sargs! drop
+	'/' lit obuf @ 40 lit + c!  "1" 1 lit obuf @ 41 lit + 3F lit sget dup 0< if drop -1 lit then 1 lit + rbl !   \ the bindings as they are (made absolute),
+	"1" 1 lit obuf @ 40 lit + rbl @ sput drop                                        \ the output put back now: that flushes the echo before the program's output
+	'/' lit obuf @ 80 lit + c!  "2" 1 lit obuf @ 81 lit + 3F lit sget dup 0< if drop -1 lit then 1 lit + ril2 !
+	rgk @ if
+		rapp @ 0= if rgk @ rgl @ sdel drop then
+		"1" 1 lit rgk @ rgl @ sput drop
+	then
+	rik @ if rik @ ril @ srewind drop  "2" 1 lit rik @ ril @ sput drop then
+	2dup hasl? if pnorm pbuf @ plen @ then                                          \ a path (./t.bin, ../bin/x, /bin/x) resolved as cd does; a bare name is bin's
+	800000 lit 5 lit sexec
+	rgk @ if "1" 1 lit obuf @ 40 lit + rbl @ sput drop then                        \ and back
+	rik @ if "2" 1 lit obuf @ 80 lit + ril2 @ sput drop then
+	lbuf @ 0 lit sargs! drop
+	?dup 0= if "sh: no such program\n" say else
 		begin 14 lit msleep dup tstate 0= until
 		texcode if "sh: it was killed\n" say then
 	then ;
@@ -86,14 +126,14 @@
 	2dup "pwd" kveq if 2drop pbuf @ 200 lit spwd dup 0< if drop 0 lit then pbuf @ swap ssay "\n" say else
 	2dup "cd" kveq if 2drop kva @ kvl @ dup 0= if 2drop "/" 1 lit then pnorm  pbuf @ plen @ scd if "sh: cd: refused\n" say then else
 	2dup "ls" kveq if 2drop kva @ kvl @ ls else
+	2dup "exit" kveq if 2drop texit else
 	2dup "set" kveq 2 lit pick 2 lit pick "get" kveq or 2 lit pick 2 lit pick "add" kveq or 2 lit pick 2 lit pick "del" kveq or 2 lit pick 2 lit pick "list" kveq or if
 		2drop lbuf @ llen @ obuf @ 800 lit kvcmd obuf @ swap ssay "\n" say else
-	run then then then then ;
+	run then then then then then ;
 
 400 lit alloc lbuf !  80 lit alloc rbuf !  0 lit rpos !  0 lit rlen !  800 lit alloc obuf !  4 lit alloc cbuf !
 400 lit alloc pbuf !  400 lit alloc sbuf !
 -1 lit kvinit
-"sh: a shell on the console: pwd, cd, ls, set, get, add, del, list, or a program's name\n" say
 begin
 	pbuf @ 200 lit spwd dup 0< if drop 0 lit then pbuf @ swap ssay  "$ " say
 	getline  llen @ if cmd then

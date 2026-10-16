@@ -99,7 +99,7 @@ def http_probe_once():
         if not head.startswith(b"HTTP/1.1 200 "):
             return
         n = [int(l.split(b":")[1]) for l in head.split(b"\r\n") if l.lower().startswith(b"content-length:")][0]
-        if b"hello" not in r.exact(n):
+        if b"id='desk'" not in r.exact(n):
             return
         key = base64.b64encode(os.urandom(16))
         c.sendall(b"GET /ws HTTP/1.1\r\nHost: q\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"

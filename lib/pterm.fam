@@ -1,0 +1,51 @@
+\ lib/pterm.fam — terminals for the window manager: a shell per WebSocket.
+\ "term open" from a socket execs bin/sh with its output bound to the key
+\ proc/term/S/out and its input to proc/term/S/in (S the socket's slot), watches the out
+\ key.  "term size R C" puts the rows and columns in proc/term/S/size (a
+\ program reads it, or watches it: lib/pvt.fam).  "term in BYTES" appends the bytes to the in
+\ key, which wakes the shell's read.  The kernel posts wbit whenever the out
+\ key is written; prog/wm.fam then reads what is new (tmturn, after the server
+\ is built, since it sends frames) and relays it as "term:" messages.  A socket
+\ closing kills its shell, drops the watch and deletes both keys.
+\
+\   terminit ( -- )                      once
+\   termcmd  ( s in n out cap -- n' )    "open" or "in BYTES" (after "term "): the answer's length, 0 none
+\   termclos ( s -- )                    the socket closed
+\   tment    ( s -- e )                  the terminal's record: +0 shell tid (0 none) +4 out cursor +8 dirty
+\   tmkey    ( s c -- a n )              the key: c 0 "/proc/term/S/in", 1 "/proc/term/S/out", 2 "/proc/term/S/size"
+\ prog/term0.fam stands in for this module where prog/http.fam is built without it.
+: tmt variable ;  : tmk variable ;  : tmc variable ;  : tma variable ;  : tmn variable ;  : tro variable ;  : troc variable ;
+: tment ( s -- e )  4 lit lshift tmt @ + ;
+: tmkey ( s c -- a n )
+	tmc !  "/proc/term/" tmk @ B lit mcopy
+	dup A lit u< if '0' lit + tmk @ B lit + c!  C lit else dup A lit / '0' lit + tmk @ B lit + c!  A lit % '0' lit + tmk @ C lit + c!  D lit then
+	tmc @ 2 lit = if "/size" tmk @ 2 lit pick + 5 lit mcopy 5 lit + else
+	tmc @ if "/out" tmk @ 2 lit pick + 4 lit mcopy 4 lit + else "/in" tmk @ 2 lit pick + 3 lit mcopy 3 lit + then then
+	tmk @ swap ;
+: tmopen ( s -- )
+	dup tment @ if drop else
+		dup 0 lit tmkey sdel drop  dup 1 lit tmkey sdel drop
+		dup 1 lit tmkey swatch drop                               \ watched before the shell can write it
+		"1" 1 lit 2 lit pick 1 lit tmkey sput drop                \ our output to its out key, our input from its in key:
+		"2" 1 lit 2 lit pick 0 lit tmkey sput drop                \ the child inherits both
+		"sh" 2 lit 800000 lit 5 lit sexec
+		"1" 1 lit tmk @ 0 lit sput drop  "2" 1 lit tmk @ 0 lit sput drop
+		over tment !  0 lit over tment 4 lit + !  0 lit over tment 8 lit + !  drop
+	then ;
+: tmin ( s a n -- )  tmn ! tma !  0 lit tmkey tma @ tmn @ sadd drop ;
+: tmclose ( s -- )
+	dup tment @ ?dup if
+		skill drop
+		dup 1 lit tmkey sunwatch drop
+		dup 0 lit tmkey sdel drop  dup 1 lit tmkey sdel drop  dup 2 lit tmkey sdel drop
+		0 lit over tment !
+	then drop ;
+: termcmd ( s in n out cap -- n' )
+	troc ! tro !
+	dup 0= if 2drop drop 0 lit else
+	over c@ 'o' lit = if 2drop tmopen  0 lit else
+	over c@ 'i' lit = 2 lit pick 3 lit u> and if 3 lit - swap 3 lit + swap tmin  0 lit else
+	over c@ 's' lit = 2 lit pick 5 lit u> and if 5 lit - swap 5 lit + swap tmn ! tma !  2 lit tmkey tma @ tmn @ sput drop  0 lit else
+	2drop drop 0 lit then then then then ;
+: termclos ( s -- )  tmclose ;
+: terminit ( -- )  200 lit alloc dup tmt !  80 lit 0 lit do 0 lit over i 2 lit lshift + ! loop drop  80 lit alloc tmk ! ;

@@ -1,0 +1,27 @@
+\ prog/rm.fam — rm KEY...: the keys are deleted; rm -r DIR...: everything under
+\ DIR/ (the marker mkdir left too), one key at a time, then DIR itself if it is a key.
+: rb variable ;  : rk variable ;  : rs variable ;  : rrr variable ;  : rpl variable ;  : rbuf variable ;
+: isame ( a b n -- flag )  -1 lit swap 0 lit do 2 lit pick i + c@ 2 lit pick i + c@ <> if drop 0 lit then loop nip nip ;
+100 lit alloc rb !  400 lit alloc rk !  400 lit alloc rs !  800 lit alloc rbuf !  0 lit rrr !
+rb @ 100 lit sargs dup 0< if drop 0 lit then
+rb @ swap stok 2drop
+dup 0= if 2drop "rm: a key is needed\n" say else
+	begin dup while
+		stok
+		dup 2 lit = 2 lit pick c@ '-' lit = and 2 lit pick 1 lit + c@ 'r' lit = and if 2drop -1 lit rrr ! else
+		dup 0= if 2drop else
+			rrr @ if
+				2dup rk @ sres  '/' lit 2 lit pick 2 lit pick + c!  1 lit + rpl ! drop  '/' lit rk @ c!       \ "/DIR/", the tree's prefix after the slash
+				begin
+					rk @ rpl @ 1 lit + rbuf @ 800 lit sscan 0 lit u> if
+						rbuf @ @ rpl @ u< 0= if rbuf @ 8 lit + rk @ 1 lit + rpl @ isame else 0 lit then
+						if '/' lit rs @ c!  rbuf @ 8 lit + rs @ 1 lit + rbuf @ @ mcopy  rs @ rbuf @ @ 1 lit + sdel drop  -1 lit else 0 lit then
+					else 0 lit then
+				0= until
+				2dup sdel drop  2drop
+			else
+				2dup sdel 0= if "rm: " say 2dup ssay ": no such key\n" say then 2drop
+			then
+		then then
+	repeat 2drop
+then

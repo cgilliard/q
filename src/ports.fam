@@ -90,6 +90,9 @@
 	20 lit 0 lit do i pent dup 8 lit + @ ?dup if ktstate 0= if 0 lit over 8 lit + ! then then drop loop
 	10 lit 1 lit do i ptx @ if i ktstate 0= if 0 lit i ptx ! then then loop ;
 
+\ pgone ( tid -- )  what psweep does for one thread, now
+: pgone  20 lit 0 lit do i pent dup 8 lit + @ 2 lit pick = if 0 lit over 8 lit + ! then drop loop  0 lit swap ptx ! ;
+
 : ptxset ( tid ring size -- r )
 	ps ! pr !
 	dup pr @ ps @ tin? 0= if drop -2 lit else

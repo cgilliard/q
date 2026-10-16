@@ -1,0 +1,5 @@
+\ prog/echo.fam — its arguments after its name, and a newline: "echo a b" says "a b".
+: eb variable ;
+100 lit alloc eb !
+eb @ 100 lit sargs dup 0< if drop 0 lit then
+eb @ swap stok 2drop ssay  "\n" say

@@ -22,6 +22,19 @@
 \   8 txring ( ring size -- 0 )   the thread's transmit ring: frames put in it
 \            go out when the loop thread next turns (post it bit 19)
 \   9 netinfo ( buf -- 0 )   24 bytes into buf: ip, mask, gateway, its MAC, ours
+\   B read   ( key klen blk -- n | -1 none )   bytes of the value from an
+\            offset: blk is three words in the program, buf, cap, offset; n
+\            is what was copied, 0 at the end
+\   C watch  ( key klen -- 0 | -1 full )   be posted bit 20 whenever that key
+\            is written (put, append, or a console flush into it); 32 watches
+\   D unwatch ( key klen -- 0 )
+\   E kill   ( tid -- 0 | -1 gone | -2 )   end that thread (exit code 9); not
+\            thread 0 or oneself
+\   F rewind ( key klen -- 0 )   the key's input cursor to its start, and the
+\            key read as a file: a reader at its end gets 0 (a shell's "<");
+\            otherwise a key is a pipe and a reader at its end waits
+\   10, 11   the loop thread's side of the UART emulation (src/proc.fam kuart):
+\            fill a thread's input buffer from its input, flush its output
 \   A scan   ( start slen buf cap -- n )   the keys from start on, in order, as
 \            many as fit cap: records of klen, vlen (words), the key and the
 \            value's first 64 bytes, each padded to 4.  An iterator: the
@@ -30,6 +43,9 @@
 \ Any pointer outside the requester's own region and its process's: -2.  Each
 \ store request is a transaction of its own.
 \
+\ The key proc/self/args is the thread's arguments (a line, at most 255 bytes):
+\ put sets them, get reads them, a child starts with its parent's.  A shell
+\ sets them to the command line before the exec and clears them after.
 \ Keys are paths.  A thread has a working directory (the key ".": get reads
 \ it, put sets it, "/" to start with, a child's is its parent's at exec), and
 \ a key is resolved before the store sees it: one starting with "/" is taken
@@ -40,30 +56,63 @@
 \ resolves them before asking.  exec of a name without a slash runs bin/NAME.
 \
 \ Handles.  The key "0" is the program's console.  put and append write the
-\ bytes to the UART or, when 0 is bound, add them to a value in the store; get
-\ reads what has arrived on the UART (the request stays pending until something
-\ has) or the next bytes of the bound value, 0 at its end.  The key "1" is the
-\ binding: put a key (up to 63 bytes) to bind 0 to it, an empty value to bind
-\ it back to the console; get gives it.  A program starts with its parent's
-\ binding (it is handed to the child as it is spawned).  Bytes for a bound key are buffered, 1 KiB per
-\ thread, and appended when the buffer is full, 100 ms old, 0 is rebound, 0 is
-\ read, or the thread is gone, so the value lags by at most that.
+\ bytes to the UART or, when its output is bound, add them to a value in the
+\ store; get reads what has arrived on the UART, or the next bytes of the value
+\ its input is bound to, from a cursor the key's readers share (so a child
+\ reading the pipe its parent reads goes on from where the parent was, and the
+\ parent from where the child left off; a put or del of the key starts it
+\ over).  Either way a get with nothing to read
+\ stays pending and is served when there is: a UART byte (its interrupt is
+\ armed while a program waits for one), or a write to the bound key.  The key
+\ "1" is the output binding, "2" the input binding: put a key (up to 63 bytes)
+\ to bind, an empty value to bind back to the console; get gives it.  A program
+\ starts with its parent's bindings (handed to the child as it is spawned).
+\ Bytes for a bound output are buffered, 1 KiB per thread, and appended when
+\ the buffer is full, 100 ms old, 0 is rebound, 0 is read, or the thread is
+\ gone, so the value lags by at most that.  Two programs joined by a key, one
+\ writing it as its output and one reading it as its input, are a pipe; a
+\ program that watches a key is told of every write to it, which is how the
+\ window manager relays a shell's output as it appears (lib/pterm.fam).
 \ Needs src/exec.fam, src/ports.fam (and what they need) and src/tcp.fam's tms.
 \ ──────────────────────────────────────────────────────────────────────────────
 
-: ksbt variable ;                                 \ 16 x 0x410: +0 buffer (0x400) +400 fill +404 stamp (ms) +408 read cursor
+: ksbt variable ;                                 \ 16 x 0x820: +0 output buffer (0x400) +400 fill +404 stamp (ms) +408 input fill +40C waiting for input +410 input position +414 input at its end +418 input buffer (0x400)
+: kscr variable ;  : kscd variable ;               \ the input cursors (32 x 0x50: +0 klen, 0 free; +4 cursor; +8 key; +48 a file: reads end at its end): one per key, shared by its readers
+: kswt variable ;  : ksagain variable ;  : ksuw variable ;   \ the watches (32 x 0x40: +0 tid +4 klen +8 key), serve again, a UART reader waits
 : kst variable ;  : kso variable ;  : ks1 variable ;  : ks2 variable ;  : ks3 variable ;  : ks4 variable ;
 : ksp variable ;  : ksl variable ;  : ksk variable ;                  \ ksk: the resolved key (0x200)
 
-: ksbuf ( tid -- rec )  410 lit * ksbt @ + ;
-: ksinit ( -- )  4100 lit alloc dup ksbt !  1040 lit 0 lit do 0 lit over i 2 lit lshift + ! loop drop  200 lit alloc ksk ! ;
+: ksbuf ( tid -- rec )  820 lit * ksbt @ + ;
+: ksinit ( -- )  8200 lit alloc dup ksbt !  2080 lit 0 lit do 0 lit over i 2 lit lshift + ! loop drop  ksbt @ K 44 lit + !  200 lit alloc ksk !
+	800 lit alloc dup kswt !  200 lit 0 lit do 0 lit over i 2 lit lshift + ! loop drop  0 lit ksuw !
+	A00 lit alloc dup kscr !  280 lit 0 lit do 0 lit over i 2 lit lshift + ! loop drop  50 lit alloc dup kscd !  14 lit 0 lit do 0 lit over i 2 lit lshift + ! loop drop ;
+: kcent ( i -- e )  50 lit * kscr @ + ;
+: kwent ( i -- e )  6 lit lshift kswt @ + ;
 
 \ ── checks ────────────────────────────────────────────────────────────────────
 \ kok? ( ptr len -- flag )  inside the requester's own region or its process's
 : kok?  kst @ -rot tin? ;
 : kh? ( ch -- flag )  ks2 @ 1 lit = ks1 @ c@ rot = and ;             \ is the key that one handle character
-: kbnd ( -- key klen )  kst @ rrec dup 20 lit + swap 18 lit + @ ;     \ the binding
+: kbnd ( -- key klen )  kst @ rrec dup 20 lit + swap 18 lit + @ ;     \ the output binding
+: kibnd ( -- key klen )  kst @ rrec dup 288 lit + swap 284 lit + @ ;   \ the input binding
+: kqb variable ;  : kqm variable ;
+: kkeq ( a n b m -- flag )  kqm ! kqb !  dup kqm @ <> if 2drop 0 lit else -1 lit swap ?dup if 0 lit do over i + c@ kqb @ i + c@ <> if drop 0 lit then loop then nip then ;
 : kcwd ( tid -- addr )  rrec 80 lit + ;                                \ the working directory: +0 length, +4 the bytes
+\ kcur ( key klen -- addr )  the key's input cursor (made at 0 when there is none; a
+\ scratch cell when the table is full), shared by every thread reading the key
+: kcur
+	0 lit 20 lit 0 lit do
+		dup 0= if
+			i kcent dup @ if dup 8 lit + over @ 5 lit pick 5 lit pick kkeq if nip else drop then else drop then
+		then
+	loop
+	dup 0= if drop                                                   \ none: make one
+		0 lit 20 lit 0 lit do dup 0= if i kcent @ 0= if drop i kcent then then loop
+		?dup if rot over 8 lit + 3 lit pick mcopy  tuck !  0 lit over 4 lit + !  0 lit over 48 lit + ! else 2drop kscd @ then
+	else nip nip then
+	4 lit + ;
+: kcurf ( key klen -- )  kcur 0 lit over !  -1 lit swap 44 lit + ! ;     \ rewound, and a file: its readers see its end
+: kcurdel ( key klen -- )  20 lit 0 lit do i kcent dup @ if dup 8 lit + over @ 4 lit pick 4 lit pick kkeq if 0 lit over ! then then drop loop 2drop ;
 
 \ ── paths ─────────────────────────────────────────────────────────────────────
 \ kresv ( a n -- a' n' -1 | 0 )  the key as the tree sees it, in ksk: from the
@@ -81,14 +130,39 @@
 		2dup ksp @ swap mcopy  ksp @ + ksk @ - nip  ksk @ swap -1 lit then ;
 : kres ( -- flag )  ks1 @ ks2 @ kresv if ks2 ! ks1 ! -1 lit else 0 lit then ;
 
+\ ── events ────────────────────────────────────────────────────────────────────
+\ kwake ( key klen -- )  a key was written: a thread whose input is bound to it
+\ and waits for it is served again this turn; a thread watching it is posted
+: kwk variable ;  : kwl variable ;
+: kwake
+	kwl ! kwk !
+	10 lit 1 lit do
+		i rrec 7C lit + @ 1 lit =  i ksbuf 40C lit + @ and if
+			i rrec 288 lit + i rrec 284 lit + @ kwk @ kwl @ kkeq if -1 lit ksagain ! then
+		then
+	loop
+	20 lit 0 lit do
+		i kwent dup @ if dup 8 lit + over 4 lit + @ kwk @ kwl @ kkeq if 100000 lit over @ kpostd then then drop
+	loop ;
+: kwclear ( tid -- )  20 lit 0 lit do i kwent dup @ 2 lit pick = if 0 lit over ! then drop loop drop ;
+: kwsweep ( -- )  20 lit 0 lit do i kwent dup @ ?dup if ktstate 0= if 0 lit over ! then then drop loop ;
+
 \ ── the console ───────────────────────────────────────────────────────────────
-: kflush ( tid -- )
-	dup ksbuf 400 lit + @ ?dup if                                      \ tid fill
-		over rrec 18 lit + @ if
-			-1 lit txbeg dup 3 lit pick rrec dup 20 lit + swap 18 lit + @ 5 lit pick ksbuf 5 lit pick append txcommit
-		then drop
-		0 lit over ksbuf 400 lit + !
-	then drop ;
+: kfn variable ;
+: kflush ( tid -- )                               \ what is buffered to the bound key, or the UART; bytes a trap adds meanwhile (kuart) stay
+	dup ksbuf 400 lit + @ dup 0= if 2drop else kfn !
+		dup rrec 18 lit + @ if
+			-1 lit txbeg dup 2 lit pick rrec dup 20 lit + swap 18 lit + @ 4 lit pick ksbuf kfn @ append txcommit
+			dup rrec dup 20 lit + swap 18 lit + @ kwake
+		else
+			kfn @ ?dup if 0 lit do dup ksbuf i + c@ putc loop then                       \ unbound: the console is the UART
+		then
+		int_off
+		dup ksbuf 400 lit + @ kfn @ - ?dup if
+			over ksbuf kfn @ + 2 lit pick ksbuf 2 lit pick mcopy  over ksbuf 400 lit + !
+		else 0 lit over ksbuf 400 lit + ! then
+		int_on drop
+	then ;
 
 : kcput ( -- r )                                  \ bytes to the console or the bound key
 	kst @ rrec 18 lit + @ 0= if
@@ -96,7 +170,7 @@
 	else
 		ks4 @ 400 lit kst @ ksbuf 400 lit + @ - u> if kst @ kflush then
 		ks4 @ 400 lit u> if
-			-1 lit txbeg dup kbnd ks3 @ ks4 @ append txcommit
+			-1 lit txbeg dup kbnd ks3 @ ks4 @ append txcommit  kbnd kwake
 		else
 			kst @ ksbuf 400 lit + @ 0= if tms kst @ ksbuf 404 lit + ! then
 			ks3 @ kst @ ksbuf dup 400 lit + @ + ks4 @ mcopy
@@ -104,28 +178,34 @@
 		then 0 lit
 	then ;
 
-: kcget ( -- r )                                  \ -3: nothing to read yet, the request stays pending
-	kst @ rrec 18 lit + @ if
+: kcget ( -- r )                                  \ -3: nothing to read yet; the request stays pending and is served when there is
+	kst @ rrec 284 lit + @ if
 		kst @ kflush
-		0 lit txbeg dup kbnd kst @ ksbuf 408 lit + @ ks3 @ ks4 @ getat swap txcommit
-		dup 0< if drop 0 lit else
-			kst @ ksbuf 408 lit + @ - dup 0< if drop 0 lit then ks4 @ umin
-			dup kst @ ksbuf 408 lit + dup @ rot + swap !
-		then
+		kibnd kcur ksp !
+		0 lit txbeg dup kibnd ksp @ @ ks3 @ ks4 @ getat swap txcommit
+		dup 0< if drop 0 lit else ksp @ @ - dup 0< if drop 0 lit then ks4 @ umin then
+		?dup 0= if ksp @ 44 lit + @ if 0 lit else -1 lit kst @ ksbuf 40C lit + !  -3 lit then else dup ksp @ dup @ rot + swap ! then
 	else
-		10000005 lit c@ 1 lit and 0= if -3 lit else
+		10000005 lit c@ 1 lit and 0= if -1 lit kst @ ksbuf 40C lit + !  -1 lit ksuw !  -3 lit else
 			0 lit begin dup ks4 @ u<  10000005 lit c@ 1 lit and  and while
 				10000000 lit c@ over ks3 @ + c!  1 lit +
 			repeat
 		then
 	then ;
 
-: kbind ( -- r )                                  \ put on "1": what 0 goes to, a key resolved like any other
-	ks4 @ 0= if kst @ kflush  0 lit kst @ rrec 18 lit + !  0 lit kst @ ksbuf 408 lit + !  0 lit else
+: kbind ( -- r )                                  \ put on "1": where 0's output goes, a key resolved like any other
+	ks4 @ 0= if kst @ kflush  0 lit kst @ rrec 18 lit + !  0 lit else
 	ks3 @ ks4 @ kresv 0= if -1 lit else
 		dup 3F lit u> if 2drop -2 lit else
 			kst @ kflush
-			2dup kst @ rrec 20 lit + swap mcopy  kst @ rrec 18 lit + ! drop  0 lit kst @ ksbuf 408 lit + !  0 lit
+			2dup kst @ rrec 20 lit + swap mcopy  kst @ rrec 18 lit + ! drop  0 lit
+		then
+	then then ;
+: kibind ( -- r )                                 \ put on "2": where 0's input comes from
+	ks4 @ 0= if 0 lit kst @ rrec 284 lit + !  0 lit else
+	ks3 @ ks4 @ kresv 0= if -1 lit else
+		dup 3F lit u> if 2drop -2 lit else
+			2dup kst @ rrec 288 lit + swap mcopy  kst @ rrec 284 lit + ! drop  0 lit
 		then
 	then then ;
 : kcd ( -- r )                                    \ put on ".": the working directory, "/..." without a trailing slash
@@ -138,28 +218,34 @@
 	ks1 @ ks2 @ kok? ks3 @ ks4 @ kok? and 0= if -2 lit else
 		'0' lit kh? if kcget else
 		'1' lit kh? if kbnd swap ks3 @ 2 lit pick ks4 @ umin mcopy else
+		'2' lit kh? if kibnd swap ks3 @ 2 lit pick ks4 @ umin mcopy else
 		'.' lit kh? if kst @ kcwd 4 lit + ks3 @ kst @ kcwd @ ks4 @ umin mcopy  kst @ kcwd @ else
-		kres 0= if -1 lit else 0 lit txbeg dup ks1 @ ks2 @ ks3 @ ks4 @ get swap txcommit then then then then
+		kres 0= if -1 lit else
+		ks1 @ ks2 @ "proc/self/args" E lit kkeq if kst @ rrec 300 lit + ks3 @ kst @ rrec 2FC lit + @ ks4 @ umin mcopy  kst @ rrec 2FC lit + @ else
+		0 lit txbeg dup ks1 @ ks2 @ ks3 @ ks4 @ get swap txcommit then then then then then then
 	then ;
 : kput ( -- r )
 	ks1 @ ks2 @ kok? ks3 @ ks4 @ kok? and 0= if -2 lit else
 		'0' lit kh? if kcput else
 		'1' lit kh? if kbind else
+		'2' lit kh? if kibind else
 		'.' lit kh? if kcd else
-		kres 0= if -1 lit else -1 lit txbeg dup ks1 @ ks2 @ ks3 @ ks4 @ put txcommit 0 lit then then then then
+		kres 0= if -1 lit else
+		ks1 @ ks2 @ "proc/self/args" E lit kkeq if ks4 @ FF lit u> if -1 lit else ks3 @ kst @ rrec 300 lit + ks4 @ mcopy  ks4 @ kst @ rrec 2FC lit + !  0 lit then else
+		-1 lit txbeg dup ks1 @ ks2 @ ks3 @ ks4 @ put txcommit  ks1 @ ks2 @ kcurdel  ks1 @ ks2 @ kwake  0 lit then then then then then then
 	then ;
 : kadd ( -- r )
 	ks1 @ ks2 @ kok? ks3 @ ks4 @ kok? and 0= if -2 lit else
 		'0' lit kh? if kcput else
 		'1' lit kh? if kbind else
-		'.' lit kh? if -2 lit else
-		kres 0= if -1 lit else -1 lit txbeg dup ks1 @ ks2 @ ks3 @ ks4 @ append txcommit 0 lit then then then then
+		'2' lit kh? '.' lit kh? or if -2 lit else
+		kres 0= if -1 lit else -1 lit txbeg dup ks1 @ ks2 @ ks3 @ ks4 @ append txcommit  ks1 @ ks2 @ kwake  0 lit then then then then
 	then ;
 : kdel ( -- r )
 	ks1 @ ks2 @ kok? 0= if -2 lit else
-		'0' lit kh? '1' lit kh? or '.' lit kh? or if -2 lit else
+		'0' lit kh? '1' lit kh? or '2' lit kh? or '.' lit kh? or if -2 lit else
 		kres 0= if 0 lit else
-		-1 lit txbeg dup ks1 @ ks2 @ del dup if swap txcommit else swap txabort then then then
+		-1 lit txbeg dup ks1 @ ks2 @ del dup if swap txcommit ks1 @ ks2 @ kcurdel else swap txabort then then then
 	then ;
 : kexec ( -- r )
 	ks1 @ ks2 @ kok? 0= if -2 lit else
@@ -169,12 +255,51 @@
 		else kres then
 		0= if 0 lit else
 			kst @ rrec 18 lit + 0 lit rrec 18 lit + 48 lit mcopy             \ the child inherits from the spawner (thread 0): lend it the requester's binding
-			kst @ rrec 80 lit + 0 lit rrec 80 lit + 204 lit mcopy             \ and working directory
+			kst @ rrec 80 lit + 0 lit rrec 80 lit + 380 lit mcopy             \ working directory, input binding, arguments
 			ks1 @ ks2 @ ks3 @ ks4 @ exec
-			0 lit 0 lit rrec 18 lit + !  1 lit 0 lit rrec 80 lit + !  '/' lit 0 lit rrec 84 lit + c!
+			0 lit 0 lit rrec 18 lit + !  0 lit 0 lit rrec 284 lit + !  0 lit 0 lit rrec 2FC lit + !  1 lit 0 lit rrec 80 lit + !  '/' lit 0 lit rrec 84 lit + c!
 		then
 	then ;
 
+: kread ( -- r )
+	ks1 @ ks2 @ kok? ks3 @ C lit kok? and 0= if -2 lit else
+		ks3 @ @ ks3 @ 4 lit + @ kok? 0= if -2 lit else
+		kres 0= if -1 lit else
+			0 lit txbeg dup ks1 @ ks2 @ ks3 @ 8 lit + @ ks3 @ @ ks3 @ 4 lit + @ getat swap txcommit
+			dup 0< 0= if ks3 @ 8 lit + @ - dup 0< if drop 0 lit then ks3 @ 4 lit + @ umin then
+		then then
+	then ;
+: kwatch ( -- r )
+	ks1 @ ks2 @ kok? 0= if -2 lit else kres 0= if -1 lit else ks2 @ 38 lit u> if -1 lit else
+		0 lit 20 lit 0 lit do dup 0= if i kwent @ 0= if drop i kwent then then loop
+		?dup 0= if -1 lit else kst @ over !  ks2 @ over 4 lit + !  ks1 @ over 8 lit + ks2 @ mcopy  drop 0 lit then
+	then then then ;
+: kunwtch ( -- r )
+	ks1 @ ks2 @ kok? 0= if -2 lit else kres 0= if -1 lit else
+		20 lit 0 lit do i kwent dup @ kst @ = if dup 8 lit + over 4 lit + @ ks1 @ ks2 @ kkeq if 0 lit over ! then then drop loop  0 lit
+	then then ;
+: kkillop ( -- r )
+	ks1 @ F lit and dup 0= over kst @ = or if drop -2 lit else
+		dup ktstate 0= if drop -1 lit else
+			dup kkill  dup kflush  0 lit over rrec 18 lit + !  dup pgone  kwclear  0 lit
+		then
+	then ;
+: krewind ( -- r )  ks1 @ ks2 @ kok? 0= if -2 lit else kres 0= if -1 lit else ks1 @ ks2 @ kcurf 0 lit then then ;
+: kfill ( -- r )                                  \ op 10: the input buffer from the thread's input (kuart's reads), as kcget would
+	kst @ rrec 284 lit + @ if
+		kst @ kflush
+		kibnd kcur ksp !
+		0 lit txbeg dup kibnd ksp @ @ kst @ ksbuf 418 lit + 400 lit getat swap txcommit
+		dup 0< if drop 0 lit else ksp @ @ - dup 0< if drop 0 lit then 400 lit umin then
+		?dup 0= if ksp @ 44 lit + @ if -1 lit kst @ ksbuf 414 lit + !  0 lit else -1 lit kst @ ksbuf 40C lit + !  -3 lit then
+		else dup ksp @ dup @ rot + swap !  dup kst @ ksbuf 408 lit + !  0 lit kst @ ksbuf 410 lit + ! then
+	else
+		10000005 lit c@ 1 lit and 0= if -1 lit kst @ ksbuf 40C lit + !  -1 lit ksuw !  -3 lit else
+			0 lit begin dup 400 lit u<  10000005 lit c@ 1 lit and  and while 10000000 lit c@ over kst @ ksbuf 418 lit + + c!  1 lit + repeat
+			dup kst @ ksbuf 408 lit + !  0 lit kst @ ksbuf 410 lit + !
+		then
+	then ;
+: kflop ( -- r )  kst @ kflush  0 lit ;           \ op 11: the output buffer out (kuart's writes)
 : kbindp ( -- r )  kst @ ks1 @ ks2 @ ks3 @ ks4 @ pbind ;
 : kunbind ( -- r )  kst @ ks1 @ ks2 @ punbind 0 lit ;
 : ktxring ( -- r )  kst @ ks1 @ ks2 @ ptxset ;
@@ -213,25 +338,32 @@
 
 : kserve ( tid -- )
 	dup kst !  rrec dup 64 lit + @ kso !  dup 68 lit + @ ks1 !  dup 6C lit + @ ks2 !  dup 70 lit + @ ks3 !  74 lit + @ ks4 !
+	0 lit kst @ ksbuf 40C lit + !
 	kso @ 1 lit = if kget else kso @ 2 lit = if kput else kso @ 3 lit = if kadd else
 	kso @ 4 lit = if kdel else kso @ 5 lit = if kexec else kso @ 6 lit = if kbindp else
 	kso @ 7 lit = if kunbind else kso @ 8 lit = if ktxring else kso @ 9 lit = if knetinf else
-	kso @ A lit = if kscan else -2 lit
-	then then then then then then then then then then
+	kso @ A lit = if kscan else kso @ B lit = if kread else kso @ C lit = if kwatch else
+	kso @ D lit = if kunwtch else kso @ E lit = if kkillop else kso @ F lit = if krewind else
+	kso @ 10 lit = if kfill else kso @ 11 lit = if kflop else -2 lit
+	then then then then then then then then then then then then then then then then then
 	dup -3 lit = if drop else
 		kst @ rrec dup 78 lit + rot swap !  2 lit swap 7C lit + !  20000 lit kst @ kpostd
 	then ;
 
 : kssw variable ;
 : ksturn ( -- )
-	10 lit 1 lit do
-		i ptxdrain
-		i rrec 7C lit + @ 1 lit = if i kserve then
-		i ksbuf 400 lit + @ if
-			i ktstate 0=  i ksbuf 400 lit + @ 400 lit = or  tms i ksbuf 404 lit + @ - 64 lit u< 0= or  if i kflush then
-		then
-	loop
-	tms kssw @ - 3E8 lit u< 0= if tms kssw ! psweep then ;          \ the sweep once a second
+	0 lit ksuw !
+	begin
+		0 lit ksagain !
+		10 lit 1 lit do
+			i ptxdrain
+			i rrec 7C lit + @ 1 lit = if i kserve then
+			i ksbuf 400 lit + @ if
+				i ktstate 0=  i ksbuf 400 lit + @ 400 lit = or  tms i ksbuf 404 lit + @ - 64 lit u< 0= or  if i kflush then
+			then
+		loop
+	ksagain @ 0= until                                                 \ a write woke a reader: serve it now
+	tms kssw @ - 3E8 lit u< 0= if tms kssw ! psweep kwsweep then ;   \ the sweep once a second
 
 \ ──────────────────────────────────────────────────────────────────────────────
 \ Tests (the store open, sds): every op as if thread 15 had asked, with a
@@ -271,14 +403,45 @@ Test {
 			F lit kflush  F lit ksbuf 400 lit + @ 0 lit asrt_eq
 			1 lit kbuf @ 30 lit + 6 lit kbuf @ 100 lit + 40 lit kreqf 2 lit asrt_eq  kbuf @ 100 lit + "hi" 2 lit kcmp assert
 			3 lit kbuf @ 20 lit + 1 lit kbuf @ 10 lit + 1 lit kreqf 0 lit asrt_eq                      \ "h" again, buffered
-			1 lit kbuf @ 20 lit + 1 lit kbuf @ 100 lit + 3 lit kreqf 3 lit asrt_eq  kbuf @ 100 lit + "hih" 3 lit kcmp assert   \ reading 0 flushes, then reads from the cursor
-			1 lit kbuf @ 20 lit + 1 lit kbuf @ 100 lit + 40 lit kreqf 0 lit asrt_eq                    \ the end
-			2 lit kbuf @ 20 lit + 1 lit kbuf @ 10 lit + 2 lit kreqf 0 lit asrt_eq
-			2 lit kbuf @ 21 lit + 1 lit kbuf @ 0 lit kreqf 0 lit asrt_eq                               \ back to the console: flushed
+			'2' lit kbuf @ 23 lit + c!
+			2 lit kbuf @ 23 lit + 1 lit kbuf @ 30 lit + 6 lit kreqf 0 lit asrt_eq                      \ and read 0 from ks/log: a pipe to itself
+			1 lit kbuf @ 23 lit + 1 lit kbuf @ 100 lit + 40 lit kreqf 6 lit asrt_eq  kbuf @ 100 lit + "ks/log" 6 lit kcmp assert
+			1 lit kbuf @ 20 lit + 1 lit kbuf @ 100 lit + 3 lit kreqf 3 lit asrt_eq  kbuf @ 100 lit + "hih" 3 lit kcmp assert   \ reading 0 flushes the output, then reads the input from its cursor
+			1 lit kbuf @ 20 lit + 1 lit kbuf @ 100 lit + 40 lit kreqf -3 lit asrt_eq                   \ at its end: pending until it grows
+			F lit ksbuf 40C lit + @ 0 lit <> assert  0 lit F lit rrec 7C lit + !
+			2 lit kbuf @ 20 lit + 1 lit kbuf @ 10 lit + 2 lit kreqf 0 lit asrt_eq                      \ "hi" out, buffered
+			2 lit kbuf @ 21 lit + 1 lit kbuf @ 0 lit kreqf 0 lit asrt_eq                               \ output back to the console: flushed
 			F lit rrec 18 lit + @ 0 lit asrt_eq
 			1 lit kbuf @ 30 lit + 6 lit kbuf @ 100 lit + 40 lit kreqf 5 lit asrt_eq  kbuf @ 100 lit + "hihhi" 5 lit kcmp assert
+			1 lit kbuf @ 20 lit + 1 lit kbuf @ 100 lit + 40 lit kreqf 2 lit asrt_eq  kbuf @ 100 lit + "hi" 2 lit kcmp assert   \ the input grew: what is past the cursor
+			F lit kbuf @ 30 lit + 6 lit 0 lit 0 lit kreqf 0 lit asrt_eq                                \ rewind ks/log, now a file
+			1 lit kbuf @ 20 lit + 1 lit kbuf @ 100 lit + 40 lit kreqf 5 lit asrt_eq  kbuf @ 100 lit + "hihhi" 5 lit kcmp assert
+			1 lit kbuf @ 20 lit + 1 lit kbuf @ 100 lit + 40 lit kreqf 0 lit asrt_eq                    \ at its end: 0, not pending
+			F lit kbuf @ 30 lit + 6 lit 0 lit 0 lit kreqf drop
+			10 lit 0 lit 0 lit 0 lit 0 lit kreqf 5 lit asrt_eq  F lit ksbuf 418 lit + "hihhi" 5 lit kcmp assert   \ the emulated UART's input buffer
+			10 lit 0 lit 0 lit 0 lit 0 lit kreqf 0 lit asrt_eq  F lit ksbuf 414 lit + @ 0 lit <> assert          \ and its end
+			0 lit F lit ksbuf 414 lit + !  0 lit F lit ksbuf 408 lit + !
+			2 lit kbuf @ 23 lit + 1 lit kbuf @ 0 lit kreqf 0 lit asrt_eq                               \ input back to the console
+			F lit rrec 284 lit + @ 0 lit asrt_eq
 			1 lit kbuf @ 20 lit + 1 lit kbuf @ 100 lit + 40 lit kreqf -3 lit asrt_eq                   \ console input: nothing yet, pending
-			F lit rrec 7C lit + @ 1 lit asrt_eq  0 lit F lit rrec 7C lit + !
+			F lit rrec 7C lit + @ 1 lit asrt_eq  0 lit F lit rrec 7C lit + !  ksuw @ 0 lit <> assert
+			\ the arguments: a line kept in the record
+			"/proc/self/args" kbuf @ 70 lit + F lit mcopy  "cat a b" kbuf @ 80 lit + 7 lit mcopy
+			2 lit kbuf @ 70 lit + F lit kbuf @ 80 lit + 7 lit kreqf 0 lit asrt_eq
+			1 lit kbuf @ 70 lit + F lit kbuf @ 100 lit + 40 lit kreqf 7 lit asrt_eq  kbuf @ 100 lit + "cat a b" 7 lit kcmp assert
+			2 lit kbuf @ 70 lit + F lit kbuf @ 80 lit + 0 lit kreqf 0 lit asrt_eq  F lit rrec 2FC lit + @ 0 lit asrt_eq
+			\ watch, read at an offset, kill
+			C lit kbuf @ 30 lit + 6 lit 0 lit 0 lit kreqf 0 lit asrt_eq                                \ watch ks/log
+			0 lit F lit tcb 9C lit + !
+			2 lit kbuf @ 30 lit + 6 lit kbuf @ 10 lit + 2 lit kreqf 0 lit asrt_eq                      \ a put to it: posted bit 20
+			F lit tcb 9C lit + @ 100000 lit and 0 lit <> assert  0 lit F lit tcb 9C lit + !
+			D lit kbuf @ 30 lit + 6 lit 0 lit 0 lit kreqf 0 lit asrt_eq                                \ unwatch
+			2 lit kbuf @ 30 lit + 6 lit kbuf @ 10 lit + 2 lit kreqf 0 lit asrt_eq  F lit tcb 9C lit + @ 100000 lit and 0 lit asrt_eq
+			kbuf @ 100 lit + kbuf @ 300 lit + !  2 lit kbuf @ 304 lit + !  1 lit kbuf @ 308 lit + !
+			B lit kbuf @ 30 lit + 6 lit kbuf @ 300 lit + 0 lit kreqf 1 lit asrt_eq  kbuf @ 100 lit + c@ 'i' lit asrt_eq   \ "hi" from 1: "i"
+			5 lit kbuf @ 308 lit + !  B lit kbuf @ 30 lit + 6 lit kbuf @ 300 lit + 0 lit kreqf 0 lit asrt_eq             \ past the end
+			E lit 0 lit 0 lit 0 lit 0 lit kreqf -2 lit asrt_eq                                           \ kill: not thread 0
+			E lit F lit 0 lit 0 lit 0 lit kreqf -2 lit asrt_eq                                           \ nor oneself
 			\ the network: a port held through a ring in the region, the addresses, a frame out
 			4 lit kbuf @ 200 lit + !  604 lit kbuf @ 20C lit + !
 			6 lit 11 lit 1F91 lit kbuf @ 200 lit + E00 lit kreqf -2 lit asrt_eq                   \ 0x1810 does not fit 0xE00
@@ -340,7 +503,10 @@ Test {
 			begin ksturn yield kt0 @ tstate 2 lit = until                   \ served, and asleep after it
 			kt0 @ rrec @ 1000 lit + @ 0 lit asrt_eq                         \ the reply
 			0 lit txbeg dup "k" 1 lit kbuf @ 40 lit get 3 lit asrt_eq  kbuf @ "xyz" 3 lit kcmp assert  txcommit
-			kt0 @ join
+			0 lit rfree xr0 !
+			E lit kt0 @ 0 lit 0 lit 0 lit kreqf 0 lit asrt_eq                                            \ killed (by F): gone, code 9, its region back
+			kt0 @ tstate 0 lit asrt_eq  kt0 @ texcode 9 lit asrt_eq  0 lit rfree xr0 @ 1 lit + asrt_eq
+			E lit kt0 @ 0 lit 0 lit 0 lit kreqf -1 lit asrt_eq
 			-1 lit txbeg dup "k" 1 lit del drop dup "bin/r" 5 lit del drop txcommit
 		then
 	}

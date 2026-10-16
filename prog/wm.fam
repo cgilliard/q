@@ -1,16 +1,39 @@
 \ prog/wm.fam — the window manager, in embryo: the HTTP and WebSocket server
-\ (prog/http.fam) and the page's store box (lib/pkv.fam), as a program holding
+\ (prog/http.fam), the page's store box (lib/pkv.fam) and its terminals
+\ (lib/pterm.fam: a shell per socket, piped through the store), as a program holding
 \ TCP port 8080.  It is what src/kernel.fam used to serve from the kernel.
 \ Built with lib/pnet.fam, src/eth.fam, src/ip.fam, src/udp.fam, src/tcp.fam,
 \ lib/pstack.fam, lib/pkv.fam and prog/http.fam (scripts/build.sh).  Later it
 \ owns windows and binds other programs' handle 0 to them.
+\ tmturn ( -- )  every terminal whose out key was written (wbit: all are marked)
+\ gets what is new relayed to its socket as a "term:" frame; one that does not
+\ fit now stays marked for the next turn.  A shell that has ended closes its terminal.
+: tmb variable ;  : tmblk variable ;
+: tmturn
+	20 lit 0 lit do
+		i tment @ ?dup if i tment 8 lit + @ if
+			tmb @ 5 lit + tmblk @ !  600 lit tmblk @ 4 lit + !  i tment 4 lit + @ tmblk @ 8 lit + !
+			i 1 lit tmkey tmblk @ sread dup 0 lit u> if
+				i hslot hsel
+				hs @ 10 lit + @ 0=  hc @ tcproom over 9 lit + u< 0= and if                 \ room on the socket now
+					dup i tment 4 lit + dup @ rot + swap !
+					"term:" tmb @ 5 lit mcopy  tmb @ swap 5 lit + 1 lit wsend
+				else drop then
+			else drop  0 lit i tment 8 lit + !
+				tstate 0= if i hslot hsel  "term:\n[the shell has ended]\n" dup slen 1 lit wsend  i termclos then
+			then
+		else drop then then
+	loop ;
+
 40 lit pstack
 6 lit 1F90 lit pbind ?dup if "wm: cannot hold TCP port 8080: " puts u. '\n' lit putc texit then
-20 lit tcpinit  -1 lit kvinit  1F90 lit 20 lit httpinit
+20 lit tcpinit  -1 lit kvinit  terminit  1F90 lit 20 lit httpinit  620 lit alloc tmb !  10 lit alloc tmblk !
 "wm: serving http on port 8080\n" puts
 begin
-	nbit F4240 lit wait drop                      \ frames, or 100 ms for the timers
+	nbit wbit or F4240 lit wait                   \ frames, a watched key, or 100 ms for the timers
+	wbit and if 20 lit 0 lit do i tment @ if -1 lit i tment 8 lit + ! then loop then
 	begin netrx while pnetin netrel repeat
 	httpturn
+	tmturn
 	tcptick
 0 lit until

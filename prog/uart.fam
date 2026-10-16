@@ -1,0 +1,4 @@
+\ prog/uart.fam — the console the bare way: bytes read from the UART until an
+\ EOT and written back to it.  Under the node the UART is emulated against the
+\ program's bindings (src/proc.fam kuart), so "uart < KEY" says KEY's value.
+begin getc dup 4 lit <> while putc repeat drop

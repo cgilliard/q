@@ -1,0 +1,15 @@
+\ prog/mkdir.fam — a directory is a prefix, so an empty one is nothing: mkdir DIR
+\ puts the marker key DIR/ (an empty value) so DIR shows in ls before anything is
+\ under it.  ls does not list the marker itself; rm -r removes it with the rest.
+: mb variable ;  : mk variable ;
+100 lit alloc mb !  200 lit alloc mk !
+mb @ 100 lit sargs dup 0< if drop 0 lit then
+mb @ swap stok 2drop
+dup 0= if 2drop "mkdir: a name is needed\n" say else
+	begin dup while
+		stok dup 0= if 2drop else
+			2dup mk @ swap mcopy  dup 1 lit - 2 lit pick + c@ '/' lit <> if '/' lit over mk @ + c!  1 lit + then
+			nip mk @ swap mk @ 0 lit sput drop
+		then
+	repeat 2drop
+then
