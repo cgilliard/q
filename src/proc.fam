@@ -103,7 +103,7 @@
 \   14 ksp   18 ks8   1C ks11   20 kgp   24 quantum   28 ticks   2C IRQ events
 \   that no thread was subscribed to (claimed by the next wait that asks)
 \   30 region classes (3 x 0x18: size, base, count, free head, nfree, end)
-\   34 thread records (16 x 0x80: 0 region base, 4 size, 8 mode (1 = user),
+\   34 thread records (16 x 0x300: 0 region base, 4 size, 8 mode (1 = user),
 \   C process image base, 10 its code's end, 14 the process region's end,
 \   18 the binding of handle 0 (its length; 0 = the console), 1C the exit
 \   code (0 exited, cause+1 killed), 20..5F the binding's key, 64 a pending
@@ -475,7 +475,7 @@ E39202FE ,   \ bnez t0,c <.L1^B1>
 \ threads use the syscalls region and release.
 
 : rcls ( c -- rec )  18 lit * K 30 lit + @ + ;
-: rrec ( tid -- rec )  7 lit lshift K 34 lit + @ + ;
+: rrec ( tid -- rec )  300 lit * K 34 lit + @ + ;
 : rfree ( c -- n )  rcls 10 lit + @ ;
 : rpush ( addr c -- )  rcls  dup C lit + @ 2 lit pick !  swap over C lit + !  10 lit + dup @ 1 lit + swap ! ;
 : rpop ( c -- addr|0 )
@@ -498,7 +498,8 @@ E39202FE ,   \ bnez t0,c <.L1^B1>
 \ 8 MiB, the largest class first so every region is aligned to its size
 : rpinit
     48 lit alloc K 30 lit + !
-    800 lit alloc K 34 lit + !  K 34 lit + @ 200 lit 0 lit do 0 lit over i 2 lit lshift + ! loop drop
+    3000 lit alloc K 34 lit + !  K 34 lit + @ C00 lit 0 lit do 0 lit over i 2 lit lshift + ! loop drop
+    1 lit 0 lit rrec 80 lit + !  2F lit 0 lit rrec 84 lit + c!                       \ thread 0 works at "/"
     800000 lit 2 lit rcls !  2 lit rcls 8 lit + !
     100000 lit 1 lit rcls !  1 lit rcls 8 lit + !
     20000 lit 0 lit rcls !   0 lit rcls 8 lit + !
@@ -560,6 +561,7 @@ E39202FE ,   \ bnez t0,c <.L1^B1>
         dup 8C lit + @ rrec rgr !
         -rot rgr @ 4 lit + ! rgr @ !    \ tickets addr tcb
         cur 8C lit + @ rrec 8 lit + rgr @ 8 lit + 58 lit mcopy   \ the spawner's mode, process and binding
+        cur 8C lit + @ rrec 80 lit + rgr @ 80 lit + 204 lit mcopy  \ and its working directory
         0 lit rgr @ 1C lit + !  0 lit rgr @ 7C lit + !
         dup 8C lit + @ spid !
         tinit spid @
@@ -833,16 +835,18 @@ F3220034 ,   \ csrr t0,mscratch
 83230308 ,   \ lw t2,128(t1)
 73901334 ,   \ csrw mepc,t2
 8323C308 ,   \ lw t2,140(t1)
-93937300 ,   \ slli t2,t2,0x7
+139E9300 ,   \ slli t3,t2,0x9
+93938300 ,   \ slli t2,t2,0x8
+B383C301 ,   \ add t2,t2,t3
 03AE4203 ,   \ lw t3,52(t0)
 B383C301 ,   \ add t2,t2,t3
 03AE8300 ,   \ lw t3,8(t2)
 B72E0000 ,   \ lui t4,0x2
-938E0E80 ,   \ addi t4,t4,-2048 # 1800 <.L2^B1+0x1754>
+938E0E80 ,   \ addi t4,t4,-2048 # 1800 <.L2^B1+0x174c>
 73B00E30 ,   \ csrc mstatus,t4
-63160E00 ,   \ bnez t3,3c <.L1^B1>
+63160E00 ,   \ bnez t3,44 <.L1^B1>
 73A00E30 ,   \ csrs mstatus,t4
-6F004007 ,   \ j ac <.L2^B1>
+6F004007 ,   \ j b4 <.L2^B1>
 03AEC300 ,   \ lw t3,12(t2)
 135E2E00 ,   \ srli t3,t3,0x2
 73100E3B ,   \ csrw pmpaddr0,t3
@@ -860,16 +864,16 @@ B72E0000 ,   \ lui t4,0x2
 135E2E00 ,   \ srli t3,t3,0x2
 73103E3B ,   \ csrw pmpaddr3,t3
 370E0004 ,   \ lui t3,0x4000
-130EFE1F ,   \ addi t3,t3,511 # 40001ff <.L2^B1+0x4000153>
+130EFE1F ,   \ addi t3,t3,511 # 40001ff <.L2^B1+0x400014b>
 73104E3B ,   \ csrw pmpaddr4,t3
 373E8000 ,   \ lui t3,0x803
-130EEEFF ,   \ addi t3,t3,-2 # 802ffe <.L2^B1+0x802f52>
+130EEEFF ,   \ addi t3,t3,-2 # 802ffe <.L2^B1+0x802f4a>
 73105E3B ,   \ csrw pmpaddr5,t3
 371E0B1B ,   \ lui t3,0x1b0b1
-130E0ED0 ,   \ addi t3,t3,-768 # 1b0b0d00 <.L2^B1+0x1b0b0c54>
+130E0ED0 ,   \ addi t3,t3,-768 # 1b0b0d00 <.L2^B1+0x1b0b0c4c>
 73100E3A ,   \ csrw pmpcfg0,t3
 372E0000 ,   \ lui t3,0x2
-130EBE91 ,   \ addi t3,t3,-1765 # 191b <.L2^B1+0x186f>
+130EBE91 ,   \ addi t3,t3,-1765 # 191b <.L2^B1+0x1867>
 73101E3A ,   \ csrw pmpcfg1,t3
 93030008 ,   \ li t2,128
 73A00330 ,   \ csrs mstatus,t2

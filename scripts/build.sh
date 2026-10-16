@@ -113,9 +113,10 @@ run bin/kernel.bin bin/fam lib/stdlib.fam lib/build.fam `cat scripts/files.txt`
 
 # the programs the node installs in its store at boot (src/exec.fam)
 ./tools/fam --prog -o bin/init.bin prog/init.fam
+./tools/fam --prog -o bin/sh.bin lib/pkv.fam prog/sh.fam
 ./tools/fam --prog -o bin/udpecho.bin lib/pnet.fam src/eth.fam src/ip.fam src/udp.fam src/tcp.fam lib/pstack.fam prog/udpecho.fam
 ./tools/fam --prog -o bin/wm.bin lib/pnet.fam src/eth.fam src/ip.fam src/udp.fam src/tcp.fam lib/pstack.fam lib/pkv.fam prog/http.fam prog/wm.fam
-./scripts/progs.sh bin/progs.blob init=bin/init.bin udpecho=bin/udpecho.bin wm=bin/wm.bin
+./scripts/progs.sh bin/progs.blob init=bin/init.bin udpecho=bin/udpecho.bin wm=bin/wm.bin sh=bin/sh.bin
 
 # the image padded to a page (the stdlib's init starts the data on one), 20 KiB
 # of zeros over the node's RID stack and variables (the image is not loaded

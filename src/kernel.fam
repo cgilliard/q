@@ -10,14 +10,14 @@
 \ The store (src/store.fam) opens on the disk 32 MiB in, past the boot image;
 \ the programs appended to the image are installed in it (src/exec.fam) and
 \ bin/init is exec'd: it runs the programs the store's "init" value names and
-\ restarts what gets killed.  That list is the build's default (udpecho and wm:
-\ the servers, wm carrying the store box's commands) until it is edited through
+\ restarts what gets killed.  That list is the build's default (udpecho, wm and
+\ sh: the servers and the console's shell) until it is edited through
 \ the page's store box: a list the node did not write is left alone, its own is
 \ replaced when the default changes ("init.default" remembers what it wrote).
 \ ──────────────────────────────────────────────────────────────────────────────
 
 : pblob variable ;  : inl variable ;  : idl variable ;  : ibuf variable ;  : stok variable ;
-: idef ( -- s n )  "udpecho wm" A lit ;
+: idef ( -- s n )  "udpecho wm sh" D lit ;
 : isame ( a b n -- flag )  -1 lit swap 0 lit do 2 lit pick i + c@ 2 lit pick i + c@ <> if drop 0 lit then loop nip nip ;
 
 0 lit alloc dup pblob ! progsize alloc drop                \ the programs blob sits at the heap base: keep it
@@ -32,7 +32,7 @@ evnet? @ if
 		0 lit txbeg dup "init" 4 lit ibuf @ 100 lit get inl !  dup "init.default" C lit ibuf @ 100 lit + 100 lit get idl !  txcommit
 		inl @ 0<  inl @ idl @ = inl @ 0< 0= and if ibuf @ ibuf @ 100 lit + inl @ isame else 0 lit then  or if   \ no list, or the node's own
 			-1 lit txbeg dup "init" 4 lit idef put txcommit then
-		idl @ A lit = if ibuf @ 100 lit + idef isame else 0 lit then 0= if
+		idl @ D lit = if ibuf @ 100 lit + idef isame else 0 lit then 0= if
 			-1 lit txbeg dup "init.default" C lit idef put txcommit then
 	else 0 lit stok !  "q: no disk: the store is off\n" puts then
 	udpinit  pinit  8 lit tcpinit  -1 lit dsnet !              \ from here a store wait for the disk serves the NIC (src/idle.fam)
@@ -45,7 +45,7 @@ evnet? @ if
 		pdlv @ if 0 lit pdlv ! yield then                     \ a program got frames: let it answer now, the answers go out below
 		ksturn
 		tcptick
-		90000 lit F4240 lit evwait drop                       \ bit 16: a program's request or exit; 19: frames to send
+		90000 lit 30D40 lit evwait drop                       \ bit 16: a program's request or exit; 19: frames to send; 20 ms: the console is polled
 	0 lit until
 else "q: no NIC, nothing to do\n" puts then
 bye

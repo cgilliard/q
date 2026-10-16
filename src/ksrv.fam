@@ -22,11 +22,22 @@
 \   8 txring ( ring size -- 0 )   the thread's transmit ring: frames put in it
 \            go out when the loop thread next turns (post it bit 19)
 \   9 netinfo ( buf -- 0 )   24 bytes into buf: ip, mask, gateway, its MAC, ours
-\   A scan   ( prefix plen buf cap -- n )   the keys from prefix on that start
-\            with it, at most 20 and as many as fit cap: records of klen, vlen
-\            (words), the key and the value's first 64 bytes, each padded to 4
+\   A scan   ( start slen buf cap -- n )   the keys from start on, in order, as
+\            many as fit cap: records of klen, vlen (words), the key and the
+\            value's first 64 bytes, each padded to 4.  An iterator: the
+\            caller stops at the first key it does not want and continues from
+\            the last one it got followed by a 0 byte
 \ Any pointer outside the requester's own region and its process's: -2.  Each
 \ store request is a transaction of its own.
+\
+\ Keys are paths.  A thread has a working directory (the key ".": get reads
+\ it, put sets it, "/" to start with, a child's is its parent's at exec), and
+\ a key is resolved before the store sees it: one starting with "/" is taken
+\ from the root, any other is the working directory, "/" and the key.  The
+\ tree's keys have no leading slash, so "/bin/init" is the key bin/init.
+\ A resolved key over 511 bytes is refused (-1, or 0 from del and exec).  The
+\ kernel only joins: "." and ".." in a key are names like any other, a shell
+\ resolves them before asking.  exec of a name without a slash runs bin/NAME.
 \
 \ Handles.  The key "0" is the program's console.  put and append write the
 \ bytes to the UART or, when 0 is bound, add them to a value in the store; get
@@ -42,16 +53,33 @@
 
 : ksbt variable ;                                 \ 16 x 0x410: +0 buffer (0x400) +400 fill +404 stamp (ms) +408 read cursor
 : kst variable ;  : kso variable ;  : ks1 variable ;  : ks2 variable ;  : ks3 variable ;  : ks4 variable ;
-: ksp variable ;  : ksl variable ;
+: ksp variable ;  : ksl variable ;  : ksk variable ;                  \ ksk: the resolved key (0x200)
 
 : ksbuf ( tid -- rec )  410 lit * ksbt @ + ;
-: ksinit ( -- )  4100 lit alloc dup ksbt !  1040 lit 0 lit do 0 lit over i 2 lit lshift + ! loop drop ;
+: ksinit ( -- )  4100 lit alloc dup ksbt !  1040 lit 0 lit do 0 lit over i 2 lit lshift + ! loop drop  200 lit alloc ksk ! ;
 
 \ ── checks ────────────────────────────────────────────────────────────────────
 \ kok? ( ptr len -- flag )  inside the requester's own region or its process's
 : kok?  kst @ -rot tin? ;
 : kh? ( ch -- flag )  ks2 @ 1 lit = ks1 @ c@ rot = and ;             \ is the key that one handle character
 : kbnd ( -- key klen )  kst @ rrec dup 20 lit + swap 18 lit + @ ;     \ the binding
+: kcwd ( tid -- addr )  rrec 80 lit + ;                                \ the working directory: +0 length, +4 the bytes
+
+\ ── paths ─────────────────────────────────────────────────────────────────────
+\ kresv ( a n -- a' n' -1 | 0 )  the key as the tree sees it, in ksk: from the
+\ root if it starts with "/", else under the requester's working directory;
+\ 0 if that is over 511 bytes
+: kresv
+	dup if over c@ '/' lit = else 0 lit then if
+		1 lit - swap 1 lit + swap  ksk @ ksp !
+	else
+		kst @ kcwd @ 1 lit - dup 0< if drop 0 lit then ?dup if
+			kst @ kcwd 5 lit + ksk @ 2 lit pick mcopy  ksk @ + dup ksp ! '/' lit swap c!  ksp @ 1 lit + ksp !
+		else ksk @ ksp ! then
+	then
+	ksp @ ksk @ - over + 1FF lit u> if 2drop 0 lit else
+		2dup ksp @ swap mcopy  ksp @ + ksk @ - nip  ksk @ swap -1 lit then ;
+: kres ( -- flag )  ks1 @ ks2 @ kresv if ks2 ! ks1 ! -1 lit else 0 lit then ;
 
 \ ── the console ───────────────────────────────────────────────────────────────
 : kflush ( tid -- )
@@ -92,41 +120,59 @@
 		then
 	then ;
 
-: kbind ( -- r )                                  \ put on "1": what 0 goes to
-	ks4 @ 3F lit u> if -2 lit else
-		kst @ kflush
-		ks3 @ kst @ rrec 20 lit + ks4 @ mcopy  ks4 @ kst @ rrec 18 lit + !  0 lit kst @ ksbuf 408 lit + !  0 lit
-	then ;
+: kbind ( -- r )                                  \ put on "1": what 0 goes to, a key resolved like any other
+	ks4 @ 0= if kst @ kflush  0 lit kst @ rrec 18 lit + !  0 lit kst @ ksbuf 408 lit + !  0 lit else
+	ks3 @ ks4 @ kresv 0= if -1 lit else
+		dup 3F lit u> if 2drop -2 lit else
+			kst @ kflush
+			2dup kst @ rrec 20 lit + swap mcopy  kst @ rrec 18 lit + ! drop  0 lit kst @ ksbuf 408 lit + !  0 lit
+		then
+	then then ;
+: kcd ( -- r )                                    \ put on ".": the working directory, "/..." without a trailing slash
+	ks4 @ 1 lit u> if ks3 @ ks4 @ + 1 lit - c@ '/' lit = if ks4 @ 1 lit - ks4 ! then then
+	ks4 @ 0= ks4 @ 1FF lit u> or if -1 lit else ks3 @ c@ '/' lit <> if -1 lit else
+		ks3 @ kst @ kcwd 4 lit + ks4 @ mcopy  ks4 @ kst @ kcwd !  0 lit then then ;
 
 \ ── the ops ───────────────────────────────────────────────────────────────────
 : kget ( -- r )
 	ks1 @ ks2 @ kok? ks3 @ ks4 @ kok? and 0= if -2 lit else
 		'0' lit kh? if kcget else
 		'1' lit kh? if kbnd swap ks3 @ 2 lit pick ks4 @ umin mcopy else
-		0 lit txbeg dup ks1 @ ks2 @ ks3 @ ks4 @ get swap txcommit then then
+		'.' lit kh? if kst @ kcwd 4 lit + ks3 @ kst @ kcwd @ ks4 @ umin mcopy  kst @ kcwd @ else
+		kres 0= if -1 lit else 0 lit txbeg dup ks1 @ ks2 @ ks3 @ ks4 @ get swap txcommit then then then then
 	then ;
 : kput ( -- r )
 	ks1 @ ks2 @ kok? ks3 @ ks4 @ kok? and 0= if -2 lit else
 		'0' lit kh? if kcput else
 		'1' lit kh? if kbind else
-		-1 lit txbeg dup ks1 @ ks2 @ ks3 @ ks4 @ put txcommit 0 lit then then
+		'.' lit kh? if kcd else
+		kres 0= if -1 lit else -1 lit txbeg dup ks1 @ ks2 @ ks3 @ ks4 @ put txcommit 0 lit then then then then
 	then ;
 : kadd ( -- r )
 	ks1 @ ks2 @ kok? ks3 @ ks4 @ kok? and 0= if -2 lit else
 		'0' lit kh? if kcput else
 		'1' lit kh? if kbind else
-		-1 lit txbeg dup ks1 @ ks2 @ ks3 @ ks4 @ append txcommit 0 lit then then
+		'.' lit kh? if -2 lit else
+		kres 0= if -1 lit else -1 lit txbeg dup ks1 @ ks2 @ ks3 @ ks4 @ append txcommit 0 lit then then then then
 	then ;
 : kdel ( -- r )
 	ks1 @ ks2 @ kok? 0= if -2 lit else
-		'0' lit kh? '1' lit kh? or if -2 lit else
-		-1 lit txbeg dup ks1 @ ks2 @ del dup if swap txcommit else swap txabort then then
+		'0' lit kh? '1' lit kh? or '.' lit kh? or if -2 lit else
+		kres 0= if 0 lit else
+		-1 lit txbeg dup ks1 @ ks2 @ del dup if swap txcommit else swap txabort then then then
 	then ;
 : kexec ( -- r )
 	ks1 @ ks2 @ kok? 0= if -2 lit else
-		kst @ rrec 18 lit + 0 lit rrec 18 lit + 48 lit mcopy             \ the child inherits from the spawner (thread 0): lend it the requester's binding
-		ks1 @ ks2 @ ks3 @ ks4 @ exec
-		0 lit 0 lit rrec 18 lit + !
+		0 lit ks2 @ ?dup if 0 lit do ks1 @ i + c@ '/' lit = if drop -1 lit then loop then
+		0= if                                                             \ a bare name: bin/NAME
+			ks2 @ 1FB lit u> if 0 lit else "bin/" ksk @ 4 lit mcopy  ks1 @ ksk @ 4 lit + ks2 @ mcopy  ks2 @ 4 lit + ks2 !  ksk @ ks1 !  -1 lit then
+		else kres then
+		0= if 0 lit else
+			kst @ rrec 18 lit + 0 lit rrec 18 lit + 48 lit mcopy             \ the child inherits from the spawner (thread 0): lend it the requester's binding
+			kst @ rrec 80 lit + 0 lit rrec 80 lit + 204 lit mcopy             \ and working directory
+			ks1 @ ks2 @ ks3 @ ks4 @ exec
+			0 lit 0 lit rrec 18 lit + !  1 lit 0 lit rrec 80 lit + !  '/' lit 0 lit rrec 84 lit + c!
+		then
 	then ;
 
 : kbindp ( -- r )  kst @ ks1 @ ks2 @ ks3 @ ks4 @ pbind ;
@@ -140,32 +186,29 @@
 	then ;
 
 : ksu variable ;  : ksx variable ;  : ksn variable ;  : ksq variable ;
-\ ksrec? ( -- flag )  the cursor's key starts with the prefix and its record fits: written if so
+\ ksrec? ( -- flag )  the cursor's key and value as a record, if it fits: written if so
 : kskl variable ;  : ksvl variable ;  : kssz variable ;
 : ksrec?
 	ksu @ 0 lit ksbuf 200 lit curkey kskl !
-	kskl @ ks2 @ u< if 0 lit else
-		-1 lit ks2 @ ?dup if 0 lit do 0 lit ksbuf i + c@ ks1 @ i + c@ <> if drop 0 lit then loop then
-		0= if 0 lit else
-			ksu @ 0 lit ksbuf 200 lit + 40 lit curval ksvl !
-			kskl @ 3 lit + FFFFFFFC lit and  ksvl @ 40 lit umin 3 lit + FFFFFFFC lit and + 8 lit + kssz !
-			ksq @ kssz @ + ks3 @ ks4 @ + u> if 0 lit else
-				kskl @ ksq @ !  ksvl @ ksq @ 4 lit + !
-				0 lit ksbuf ksq @ 8 lit + kskl @ mcopy
-				0 lit ksbuf 200 lit + ksq @ 8 lit + kskl @ 3 lit + FFFFFFFC lit and + ksvl @ 40 lit umin mcopy
-				ksq @ kssz @ + ksq !  -1 lit
-			then
-		then
+	ksu @ 0 lit ksbuf 200 lit + 40 lit curval ksvl !
+	kskl @ 3 lit + FFFFFFFC lit and  ksvl @ 40 lit umin 3 lit + FFFFFFFC lit and + 8 lit + kssz !
+	ksq @ kssz @ + ks3 @ ks4 @ + u> if 0 lit else
+		kskl @ ksq @ !  ksvl @ ksq @ 4 lit + !
+		0 lit ksbuf ksq @ 8 lit + kskl @ mcopy
+		0 lit ksbuf 200 lit + ksq @ 8 lit + kskl @ 3 lit + FFFFFFFC lit and + ksvl @ 40 lit umin mcopy
+		ksq @ kssz @ + ksq !  -1 lit
 	then ;
 : kscan ( -- r )
 	ks1 @ ks2 @ kok? ks3 @ ks4 @ kok? and ks2 @ 1FF lit u> 0= and 0= if -2 lit else
-		0 lit txbeg ksx !  ksx @ curopen ksu !
-		ks2 @ if ksu @ ks1 @ ks2 @ curseek drop else ksu @ curfirst drop then
-		ks3 @ ksq !  0 lit ksn !
-		begin ksu @ 4 lit + @ ksn @ 14 lit u< and if ksrec? else 0 lit then while
-			ksn @ 1 lit + ksn !  ksu @ curnext drop
-		repeat
-		ksu @ curclose  ksx @ txcommit  ksn @
+		kres 0= if -1 lit else
+			0 lit txbeg ksx !  ksx @ curopen ksu !
+			ks2 @ if ksu @ ks1 @ ks2 @ curseek drop else ksu @ curfirst drop then
+			ks3 @ ksq !  0 lit ksn !
+			begin ksu @ 4 lit + @ if ksrec? else 0 lit then while
+				ksn @ 1 lit + ksn !  ksu @ curnext drop
+			repeat
+			ksu @ curclose  ksx @ txcommit  ksn @
+		then
 	then ;
 
 : kserve ( tid -- )
@@ -207,6 +250,7 @@ Test {
 		sds @ if
 			ksinit
 			1000 lit alloc kbuf !  kbuf @ F lit rrec !  1000 lit F lit rrec 4 lit + !  0 lit F lit rrec 18 lit + !
+			1 lit F lit rrec 80 lit + !  '/' lit F lit rrec 84 lit + c!                                   \ F works at the root
 			"ks/a" kbuf @ 4 lit mcopy  "hi" kbuf @ 10 lit + 2 lit mcopy  '0' lit kbuf @ 20 lit + c!  '1' lit kbuf @ 21 lit + c!
 			"ks/log" kbuf @ 30 lit + 6 lit mcopy
 			2 lit kbuf @ 4 lit kbuf @ 10 lit + 2 lit kreqf 0 lit asrt_eq                              \ put
@@ -248,17 +292,29 @@ Test {
 			8 lit kbuf @ 200 lit + E00 lit 0 lit 0 lit kreqf 0 lit asrt_eq  F lit ptx @ kbuf @ 200 lit + asrt_eq
 			8 lit sbuf @ E00 lit 0 lit 0 lit kreqf -2 lit asrt_eq
 			0 lit F lit ptx !
-			\ scan: three keys under ks/s, two records fit a small buffer, the whole set a large one
+			\ scan: three keys under ks/s, two records fit a small buffer, all three (and whatever follows) a large one
 			"ks/s/a" kbuf @ 6 lit mcopy  "ks/s/b" kbuf @ 8 lit + 6 lit mcopy  "ks/s/c" kbuf @ 10 lit + 6 lit mcopy  "ks/s" kbuf @ 18 lit + 4 lit mcopy
 			"one" kbuf @ 20 lit + 3 lit mcopy  "twotwotwo" kbuf @ 30 lit + 9 lit mcopy
 			2 lit kbuf @ 6 lit kbuf @ 20 lit + 3 lit kreqf drop  2 lit kbuf @ 8 lit + 6 lit kbuf @ 30 lit + 9 lit kreqf drop  2 lit kbuf @ 10 lit + 6 lit kbuf @ 20 lit + 0 lit kreqf drop
-			A lit kbuf @ 18 lit + 4 lit kbuf @ 100 lit + 100 lit kreqf 3 lit asrt_eq
+			A lit kbuf @ 18 lit + 4 lit kbuf @ 100 lit + 100 lit kreqf 2 lit u> assert
 			kbuf @ 100 lit + @ 6 lit asrt_eq  kbuf @ 104 lit + @ 3 lit asrt_eq  kbuf @ 108 lit + "ks/s/a" 6 lit kcmp assert  kbuf @ 110 lit + "one" 3 lit kcmp assert
 			kbuf @ 114 lit + @ 6 lit asrt_eq  kbuf @ 118 lit + @ 9 lit asrt_eq  kbuf @ 11C lit + "ks/s/b" 6 lit kcmp assert  kbuf @ 124 lit + "twotwotwo" 9 lit kcmp assert
 			kbuf @ 130 lit + @ 6 lit asrt_eq  kbuf @ 134 lit + @ 0 lit asrt_eq  kbuf @ 138 lit + "ks/s/c" 6 lit kcmp assert
 			A lit kbuf @ 18 lit + 4 lit kbuf @ 100 lit + 30 lit kreqf 2 lit asrt_eq                   \ the third does not fit 0x30
-			A lit kbuf @ 8 lit + 6 lit kbuf @ 100 lit + 100 lit kreqf 1 lit asrt_eq                   \ an exact key is a prefix of itself
-			A lit kbuf @ 30 lit + 2 lit kbuf @ 100 lit + 100 lit kreqf 0 lit asrt_eq                  \ "tw": nothing there
+			A lit kbuf @ 8 lit + 6 lit kbuf @ 100 lit + 100 lit kreqf 0 lit u> assert  kbuf @ 108 lit + "ks/s/b" 6 lit kcmp assert   \ from a key: that key first
+			A lit kbuf @ 30 lit + 2 lit kbuf @ 100 lit + 100 lit kreqf drop                           \ "tw": whatever follows it
+			\ the working directory: "." is "/" to begin with; relative keys resolve under it, absolute ones from the root
+			'.' lit kbuf @ 22 lit + c!  "/ks/s/" kbuf @ 40 lit + 6 lit mcopy  'a' lit kbuf @ 50 lit + c!  "nope" kbuf @ 58 lit + 4 lit mcopy  "/ks/s/a" kbuf @ 60 lit + 7 lit mcopy
+			1 lit kbuf @ 22 lit + 1 lit kbuf @ 100 lit + 40 lit kreqf 1 lit asrt_eq  kbuf @ 100 lit + c@ '/' lit asrt_eq
+			2 lit kbuf @ 22 lit + 1 lit kbuf @ 58 lit + 4 lit kreqf -1 lit asrt_eq                     \ no leading slash: refused
+			2 lit kbuf @ 22 lit + 1 lit kbuf @ 40 lit + 6 lit kreqf 0 lit asrt_eq                      \ cd /ks/s/ (the slash dropped)
+			1 lit kbuf @ 22 lit + 1 lit kbuf @ 100 lit + 40 lit kreqf 5 lit asrt_eq  kbuf @ 100 lit + "/ks/s" 5 lit kcmp assert
+			1 lit kbuf @ 50 lit + 1 lit kbuf @ 100 lit + 40 lit kreqf 3 lit asrt_eq  kbuf @ 100 lit + "one" 3 lit kcmp assert   \ "a" is ks/s/a here
+			1 lit kbuf @ 6 lit kbuf @ 100 lit + 40 lit kreqf -1 lit asrt_eq                            \ "ks/s/a" is ks/s/ks/s/a here: nothing
+			1 lit kbuf @ 60 lit + 7 lit kbuf @ 100 lit + 40 lit kreqf 3 lit asrt_eq                    \ "/ks/s/a" is absolute
+			A lit kbuf @ 50 lit + 0 lit kbuf @ 100 lit + 100 lit kreqf 0 lit u> assert  kbuf @ 108 lit + "ks/s/a" 6 lit kcmp assert   \ a scan from "" starts at the directory
+			2 lit kbuf @ 22 lit + 1 lit kbuf @ 40 lit + 1 lit kreqf 0 lit asrt_eq                      \ cd /
+			1 lit kbuf @ 6 lit kbuf @ 100 lit + 40 lit kreqf 3 lit asrt_eq
 			4 lit kbuf @ 6 lit 0 lit 0 lit kreqf drop  4 lit kbuf @ 8 lit + 6 lit 0 lit 0 lit kreqf drop  4 lit kbuf @ 10 lit + 6 lit 0 lit 0 lit kreqf drop
 			-1 lit txbeg dup "ks/log" 6 lit del drop txcommit
 			0 lit F lit rrec !  0 lit F lit rrec 4 lit + !

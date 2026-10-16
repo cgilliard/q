@@ -8,6 +8,7 @@
 set -e
 IMG=${DISK:-./data/disk.img}
 N=$(wc -c < bin/kernel.bin | tr -d ' \t')
+rm -f $IMG
 [ "$N" -lt 33554432 ] || { echo "bin/kernel.bin is over 32 MiB: it would overrun the chain"; exit 1; }
 [ -e "$IMG" ] || truncate -s 128G "$IMG"
 [ $(wc -c < "$IMG" | tr -d ' \t') -ge 4294967296 ] || truncate -s 4G "$IMG"

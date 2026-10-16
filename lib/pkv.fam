@@ -1,7 +1,9 @@
 \ ──────────────────────────────────────────────────────────────────────────────
 \ lib/pkv.fam — prog/kv.fam for a program: the same commands and answers, the
-\ store reached through requests (lib/sys.fam) instead of called.  A list is a
-\ scan request: at most 20 keys, values cut at 64 bytes.
+\ store reached through requests (lib/sys.fam) instead of called.  A list walks
+\ the scan request from the prefix (resolved against the working directory as
+\ the kernel resolves keys) until a key is past it or the answer is full;
+\ values are cut at 64 bytes.
 \
 \   kvinit ( open? -- )              once (the flag is kept for the interface)
 \   kvcmd  ( in n out cap -- n' )    one command; its answer at out, at most
@@ -13,8 +15,8 @@
 \   add KEY VALUE     kv: KEY += N bytes      (appended to the value)
 \   get KEY           kv: KEY = VALUE  |  kv: KEY: not found
 \   del KEY           kv: KEY: deleted  |  kv: KEY: not found
-\   list [PREFIX]     kv: list PREFIX, a line per key in order (at most 20,
-\                     each value cut at 64 bytes), then the count
+\   list [PREFIX]     kv: list PREFIX, a line per key in order (each value cut
+\                     at 64 bytes, the keys as the tree holds them), then the count
 \ Every answer starts with "kv: ", which is how the page tells them from the
 \ echoes.  A set or del is one write transaction, committed (on the disk)
 \ before the answer; a get or list is one read transaction.  Answers are cut
@@ -26,9 +28,11 @@
 : kva variable ;  : kvl variable ;                      \ the rest of the command
 : kvk variable ;  : kvkl variable ;  : kvvl variable ;  \ the key, the value's length
 : kvb variable ;  : kvt variable ;  : kvu variable ;  : kvm variable ;   \ scratch, transaction, cursor, count
+: kvrl variable ;  : kvcl variable ;  : kvgo variable ;  : kvrq variable ;   \ the resolved prefix's length, the continuation's, the walk, a cursor
 
 : umin ( a b -- min )  2dup u> if swap then drop ;
-: kvinit ( open? -- )  kvok !  kvb @ 0= if 810 lit alloc kvb ! then ;
+: kvinit ( open? -- )  kvok !  kvb @ 0= if 1010 lit alloc kvb ! then ;   \ +0 value scratch +800 digits +810 the resolved prefix +C10 the continuation
+: kvrp ( -- a )  kvb @ 810 lit + ;  : kvcs ( -- a )  kvb @ C10 lit + ;
 
 \ ── the answer ────────────────────────────────────────────────────────────────
 : kvroom ( -- n )  kvo @ kvc @ + kvp @ - ;
@@ -80,20 +84,46 @@
 		"kv: " kv+ kvk @ kvkl @ kvn+ if ": deleted" kv+ else ": not found" kv+ then
 	then ;
 
-\ kvrec+ ( rec -- rec' )  one scan record as a line
-: kvrec+
+\ kvline ( rec -- )  one scan record as a line;  kvnext ( rec -- rec' )  the one after it
+: kvline
 	"\n" kv+
 	dup 8 lit + over @ kvn+  " = " kv+
 	dup 8 lit + over @ 3 lit + FFFFFFFC lit and + over 4 lit + @ 40 lit umin kvn+
-	dup 4 lit + @ 40 lit u> if "..." kv+ then
-	dup @ 3 lit + FFFFFFFC lit and over 4 lit + @ 40 lit umin 3 lit + FFFFFFFC lit and + 8 lit + + ;
+	4 lit + @ 40 lit u> if "..." kv+ then ;
+: kvnext  dup @ 3 lit + FFFFFFFC lit and over 4 lit + @ 40 lit umin 3 lit + FFFFFFFC lit and + 8 lit + + ;
+\ kvres ( -- a n )  the prefix as the tree sees it (at kvrp+1): from the root
+\ after a "/", else the working directory's bytes after its "/", "/", the prefix
+: kvres
+	kvkl @ if kvk @ c@ '/' lit = else 0 lit then if
+		kvk @ 1 lit + kvrp 1 lit + kvkl @ 1 lit - mcopy  kvrp 1 lit + kvkl @ 1 lit -
+	else
+		kvrp 200 lit spwd 1 lit - dup 0< if drop 0 lit then
+		dup if '/' lit over kvrp 1 lit + + c!  1 lit + then
+		kvk @ over kvrp 1 lit + + kvkl @ mcopy  kvkl @ +  kvrp 1 lit + swap
+	then ;
+\ kvpre? ( rec -- flag )  the record's key starts with the resolved prefix
+: kvpre?
+	dup @ kvrl @ u< if drop 0 lit else
+		8 lit + kvrq !  -1 lit kvrl @ ?dup if 0 lit do kvrq @ i + c@ kvrp 1 lit + i + c@ <> if drop 0 lit then loop then
+	then ;
+\ kvcont ( rec -- )  continue after this key: "/", the key, then a 0 byte (absolute: the kernel resolves the start too)
+: kvcont  dup 8 lit + kvcs 1 lit + 2 lit pick @ mcopy  @ dup kvcs 1 lit + + 0 lit swap c!  2 lit + kvcl ! ;
 : kvlist
 	kvtok kvkl ! kvk !
 	kvkl @ 1FF lit u> if "kv: the prefix is over 511 bytes" kv+ else
 		"kv: list " kv+ kvk @ kvkl @ kvn+
-		kvk @ kvkl @ kvb @ 800 lit sscan dup kvm !
-		kvb @ swap ?dup if 0 lit do kvrec+ loop then drop
-		"\n" kv+ kvm @ kvd+ " key(s)" kv+  kvm @ 14 lit = if ", more may follow" kv+ then
+		kvres kvrl ! drop  '/' lit kvcs c!  kvrp 1 lit + kvcs 1 lit + kvrl @ mcopy  kvrl @ 1 lit + kvcl !
+		0 lit kvm !  -1 lit kvgo !
+		begin kvgo @ while
+			kvcs kvcl @ kvb @ 800 lit sscan dup 0 lit u> 0= if drop 0 lit kvgo ! else
+				kvb @ swap 0 lit do
+					kvgo @ if dup kvpre? if dup kvline  dup kvcont  kvm @ 1 lit + kvm ! else 0 lit kvgo ! then then
+					kvroom 0= if 0 lit kvgo ! then
+					kvnext
+				loop drop
+			then
+		repeat
+		"\n" kv+ kvm @ kvd+ " key(s)" kv+
 	then ;
 
 : kvcmd ( in n out cap -- n' )

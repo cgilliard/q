@@ -91,8 +91,10 @@ RESTORE = asm("""
     lw      t1, 0(t0)               # TCB to resume
     lw      t2, 128(t1)
     csrw    mepc, t2
-    lw      t2, 140(t1)             # the thread's record: K+0x34 + pid*0x80
-    slli    t2, t2, 7
+    lw      t2, 140(t1)             # the thread's record: K+0x34 + pid*0x300
+    slli    t3, t2, 9
+    slli    t2, t2, 8
+    add     t2, t2, t3
     lw      t3, 52(t0)
     add     t2, t2, t3
     lw      t3, 8(t2)               # mode: 0 machine, 1 user
@@ -546,7 +548,7 @@ out = f"""\
 \\   14 ksp   18 ks8   1C ks11   20 kgp   24 quantum   28 ticks   2C IRQ events
 \\   that no thread was subscribed to (claimed by the next wait that asks)
 \\   30 region classes (3 x 0x18: size, base, count, free head, nfree, end)
-\\   34 thread records (16 x 0x80: 0 region base, 4 size, 8 mode (1 = user),
+\\   34 thread records (16 x 0x300: 0 region base, 4 size, 8 mode (1 = user),
 \\   C process image base, 10 its code's end, 14 the process region's end,
 \\   18 the binding of handle 0 (its length; 0 = the console), 1C the exit
 \\   code (0 exited, cause+1 killed), 20..5F the binding's key, 64 a pending
@@ -759,7 +761,7 @@ out = f"""\
 \\ threads use the syscalls region and release.
 
 : rcls ( c -- rec )  18 lit * K 30 lit + @ + ;
-: rrec ( tid -- rec )  7 lit lshift K 34 lit + @ + ;
+: rrec ( tid -- rec )  300 lit * K 34 lit + @ + ;
 : rfree ( c -- n )  rcls 10 lit + @ ;
 : rpush ( addr c -- )  rcls  dup C lit + @ 2 lit pick !  swap over C lit + !  10 lit + dup @ 1 lit + swap ! ;
 : rpop ( c -- addr|0 )
@@ -782,7 +784,8 @@ out = f"""\
 \\ 8 MiB, the largest class first so every region is aligned to its size
 : rpinit
     48 lit alloc K 30 lit + !
-    800 lit alloc K 34 lit + !  K 34 lit + @ 200 lit 0 lit do 0 lit over i 2 lit lshift + ! loop drop
+    3000 lit alloc K 34 lit + !  K 34 lit + @ C00 lit 0 lit do 0 lit over i 2 lit lshift + ! loop drop
+    1 lit 0 lit rrec 80 lit + !  2F lit 0 lit rrec 84 lit + c!                       \\ thread 0 works at "/"
     800000 lit 2 lit rcls !  2 lit rcls 8 lit + !
     100000 lit 1 lit rcls !  1 lit rcls 8 lit + !
     20000 lit 0 lit rcls !   0 lit rcls 8 lit + !
@@ -844,6 +847,7 @@ out = f"""\
         dup 8C lit + @ rrec rgr !
         -rot rgr @ 4 lit + ! rgr @ !    \\ tickets addr tcb
         cur 8C lit + @ rrec 8 lit + rgr @ 8 lit + 58 lit mcopy   \\ the spawner's mode, process and binding
+        cur 8C lit + @ rrec 80 lit + rgr @ 80 lit + 204 lit mcopy  \\ and its working directory
         0 lit rgr @ 1C lit + !  0 lit rgr @ 7C lit + !
         dup 8C lit + @ spid !
         tinit spid @
