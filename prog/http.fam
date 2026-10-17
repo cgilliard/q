@@ -172,7 +172,7 @@
 	"function sized(){var s=size();if(s[0]!==vt.cols||s[1]!==vt.rows){vt.resize(s[0],s[1]);render()}if(ws.readyState===1)ws.send('term size '+vt.rows+' '+vt.cols)}" h+
 	"new ResizeObserver(sized).observe(t);" h+
 	"ws.onopen=function(){ws.send('term open');sized();t.focus()};ws.onclose=function(){vt.feed('\\n[the connection closed]\\n');vt.hide=true;render()};" h+
-	"ws.onmessage=function(e){if(e.data.slice(0,5)==='term:'){vt.feed(e.data.slice(5));render()}};" h+
+	"ws.onmessage=function(e){if(e.data.slice(0,5)==='term:'){vt.feed(e.data.slice(5));render()}else if(e.data==='term close'){ws.close();a.close()}};" h+
 	"var M={Enter:'\\r',Backspace:'\\x7f',Tab:'\\t',Escape:'\\x1b',ArrowUp:'\\x1b[A',ArrowDown:'\\x1b[B',ArrowRight:'\\x1b[C',ArrowLeft:'\\x1b[D',Home:'\\x1b[H',End:'\\x1b[F',PageUp:'\\x1b[5~',PageDown:'\\x1b[6~',Delete:'\\x1b[3~'};" h+
 	"t.onkeydown=function(e){var k=e.key,s='';if(M[k])s=M[k];else if(k.length===1){if(e.ctrlKey){var c=k.toUpperCase().charCodeAt(0);if(c>=64&&c<96)s=String.fromCharCode(c&31)}else if(!e.metaKey&&!e.altKey)s=k}" h+
 	"if(s){ws.send('term in '+s);e.preventDefault()}};t.onmousedown=function(){setTimeout(function(){t.focus()},0)};a.onclose=function(){ws.close()};render()})}" h+

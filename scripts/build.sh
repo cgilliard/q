@@ -122,9 +122,8 @@ run bin/kernel.bin bin/fam lib/stdlib.fam lib/build.fam `cat scripts/files.txt`
 ./tools/fam --prog -o bin/famw.bin prog/fam.fam
 ./tools/fam --prog -o bin/uart.bin prog/uart.fam
 ./tools/fam --prog -o bin/mv.bin prog/mv.fam
-./tools/fam --prog -o bin/udpecho.bin lib/pnet.fam src/eth.fam src/ip.fam src/udp.fam src/tcp.fam lib/pstack.fam prog/udpecho.fam
 ./tools/fam --prog -o bin/wm.bin lib/pnet.fam src/eth.fam src/ip.fam src/udp.fam src/tcp.fam lib/pstack.fam lib/pkv.fam lib/pterm.fam prog/http.fam prog/wm.fam
-./scripts/progs.sh bin/progs.blob init=bin/init.bin udpecho=bin/udpecho.bin wm=bin/wm.bin sh=bin/sh.bin cat=bin/cat.bin echo=bin/echo.bin mkdir=bin/mkdir.bin rm=bin/rm.bin edit=bin/edit.bin fam=bin/famw.bin uart=bin/uart.bin mv=bin/mv.bin cp=bin/mv.bin famc=bin/fam.uncompressed /lib/stdlib.fam=lib/stdlib.fam /lib/build.fam=lib/build.fam /lib/sys.fam=lib/sys.fam
+./scripts/progs.sh bin/progs.blob init=bin/init.bin wm=bin/wm.bin sh=bin/sh.bin cat=bin/cat.bin echo=bin/echo.bin mkdir=bin/mkdir.bin rm=bin/rm.bin edit=bin/edit.bin fam=bin/famw.bin uart=bin/uart.bin mv=bin/mv.bin cp=bin/mv.bin famc=bin/fam.uncompressed /lib/stdlib.fam=lib/stdlib.fam /lib/build.fam=lib/build.fam /lib/sys.fam=lib/sys.fam
 
 # the image padded to a page (the stdlib's init starts the data on one), 20 KiB
 # of zeros over the node's RID stack and variables (the image is not loaded

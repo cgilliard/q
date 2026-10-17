@@ -1,16 +1,22 @@
 \ prog/init.fam — the first program the node runs.  It execs what the keys under
-\ /init.d/ name: each one's value is the path of a program (a link, as
-\ /init.d/wm = /bin/wm), run in 8 MiB with 5 tickets.  Then it watches them:
-\ one the kernel killed is restarted, up to three times; one that exited stays
-\ down; when none is left init exits too.  Up to 8 entries.
+\ /init.d/ name, in their order (10-wm before 90-sh): each one's value is a
+\ command line, the path of a program and optionally "> KEY" for its output
+\ (a log; without it the program shares the console), run in 8 MiB with 5 tickets.  Then it watches them: one the kernel
+\ killed is restarted, up to three times; one that exited stays down; when none
+\ is left init exits too.  Its own lines go to /var/log/init.  Up to 8 entries;
+\ a log is emptied when its program is started.
 : ibuf variable ;  : ich variable ;  : inn variable ;  : isb variable ;  : isn variable ;  : igo variable ;
-: ik variable ;  : ikl variable ;  : iv variable ;  : ivl variable ;
-: irec ( i -- rec )  7 lit lshift ich @ + ;        \ +0 tid  +4 restarts  +8 name length  +C name (0-ended)  +40 path length  +44 path
+: ik variable ;  : ikl variable ;  : iv variable ;  : ivl variable ;  : ilk variable ;  : ill variable ;
+: irec ( i -- rec )  8 lit lshift ich @ + ;        \ +0 tid  +4 restarts  +8 name length  +C name (0-ended)  +40 path length  +44 path  +84 log key length (0 none)  +88 log key
 : iumin ( a b -- min )  2dup u> if swap then drop ;
 : isame ( a b n -- flag )  -1 lit swap 0 lit do 2 lit pick i + c@ 2 lit pick i + c@ <> if drop 0 lit then loop nip nip ;
+: ilog ( -- )  "1" 1 lit "/var/log/init" D lit sput drop ;
 
 : istart ( i -- )
-	irec dup 44 lit + over 40 lit + @ 800000 lit 5 lit sexec
+	irec
+	dup 84 lit + @ if dup 88 lit + ilk !  dup 84 lit + @ ill !  ilk @ ill @ sdel drop  "1" 1 lit ilk @ ill @ sput drop  else "1" 1 lit ibuf @ 0 lit sput drop then
+	dup 44 lit + over 40 lit + @ 800000 lit 5 lit sexec
+	ilog
 	dup 0= if "init: could not start " say over C lit + say "\n" say then
 	swap ! ;
 
@@ -19,10 +25,14 @@
 	"/init.d/" isb @ 8 lit mcopy  8 lit isn !  0 lit inn !  -1 lit igo !
 	begin igo @ inn @ 8 lit u< and while
 		isb @ isn @ ibuf @ 400 lit sscan 0 lit u> 0= if 0 lit igo ! else
-			ibuf @ @ ikl !  ibuf @ 8 lit + ik !  ibuf @ 4 lit + @ ivl !  ik @ ikl @ 3 lit + FFFFFFFC lit and + iv !
+			ibuf @ @ ikl !  ibuf @ 8 lit + ik !  ibuf @ 4 lit + @ 40 lit iumin ivl !  ik @ ikl @ 3 lit + FFFFFFFC lit and + iv !
 			ikl @ 7 lit u> if ik @ "init.d/" 7 lit isame else 0 lit then 0= if 0 lit igo ! else
 				ikl @ 7 lit - 2F lit iumin dup inn @ irec 8 lit + !  ik @ 7 lit + inn @ irec C lit + 2 lit pick mcopy  0 lit inn @ irec C lit + rot + c!
-				ivl @ 3B lit iumin dup inn @ irec 40 lit + !  iv @ inn @ irec 44 lit + rot mcopy
+				iv @ ivl @ stok 3B lit iumin dup inn @ irec 40 lit + !  inn @ irec 44 lit + swap mcopy            \ ( rest n ) the path
+				0 lit inn @ irec 84 lit + !
+				dup 2 lit u> if over c@ '>' lit = 2 lit pick 1 lit + c@ 20 lit = and if                                 \ "> KEY"
+					2 lit - swap 2 lit + swap  3B lit iumin dup inn @ irec 84 lit + !  inn @ irec 88 lit + swap mcopy  0 lit 0 lit
+				then then 2drop
 				0 lit inn @ irec !  0 lit inn @ irec 4 lit + !
 				inn @ 1 lit + inn !
 				'/' lit isb @ c!  ik @ isb @ 1 lit + ikl @ mcopy  0 lit isb @ ikl @ 1 lit + + c!  ikl @ 2 lit + isn !     \ on from this key
@@ -30,10 +40,11 @@
 		then
 	repeat ;
 
-400 lit alloc ibuf !  400 lit alloc ich !  220 lit alloc isb !
+400 lit alloc ibuf !  800 lit alloc ich !  220 lit alloc isb !
+"/var/log/init" D lit sdel drop  ilog
 iscan
 inn @ 0= if "init: nothing under /init.d/: nothing to run\n" say texit then
-inn @ 0 lit do i istart loop
+inn @ 0 lit do i istart 64 lit msleep loop                             \ in their order, each given 100 ms to say its line before the next
 begin
 	64 lit msleep
 	0 lit inn @ 0 lit do

@@ -1,5 +1,7 @@
 \ prog/sh.fam — a shell on the console.  A line at a time from handle "0",
-\ echoed as it is typed (backspace works): pwd, cd [DIR], ls [DIR], exit, the store's
+\ echoed as it is typed (Backspace, Ctrl-U erases the line, Ctrl-C abandons it,
+\ Up and Down recall the last 16 lines, Ctrl-D on an empty line exits): pwd, cd [DIR], ls [DIR], exit (on the
+\ console the node halts; in a terminal the shell ends and its window closes), the store's
 \ commands (set, get, add, del, list: lib/pkv.fam), or a program's name, which
 \ is exec'd (bin/NAME, or the path itself when the name has a slash: ./t.bin,
 \ ../bin/x, /bin/x) with the line as its arguments and waited for; "> KEY"
@@ -25,12 +27,38 @@
 		"0" 1 lit rbuf @ 80 lit sget dup 0< if drop 0 lit then rlen !  0 lit rpos !
 	repeat
 	rbuf @ rpos @ + c@  rpos @ 1 lit + rpos ! ;
+: hbuf variable ;  : hn variable ;  : hpos variable ;  : lesc variable ;     \ the history: 16 lines of 0x200 (+0 length, +4 the bytes), how many, the recall position; an escape sequence under way
+: hent ( i -- a )  9 lit lshift hbuf @ + ;
+: lsame ( a b n -- flag )  -1 lit swap 0 lit do 2 lit pick i + c@ 2 lit pick i + c@ <> if drop 0 lit then loop nip nip ;
+: lerase ( -- )  llen @ ?dup if 0 lit do 8 lit emit1 20 lit emit1 8 lit emit1 loop then  0 lit llen ! ;
+: lset ( a n -- )  lerase  dup llen !  lbuf @ swap mcopy  lbuf @ llen @ ssay ;
+: hrecall ( d -- )                                 \ d: -1 the older line, 1 the newer; past the newest the line is empty
+	hpos @ + dup 0< over hn @ u> or if drop else
+		dup hpos !  dup hn @ = if drop lerase else hent dup 4 lit + swap @ lset then
+	then ;
+: hpush ( -- )                                     \ the line into the history, unless it repeats the last
+	llen @ if
+		hn @ if hn @ 1 lit - hent dup @ llen @ = if 4 lit + lbuf @ llen @ lsame else drop 0 lit then else 0 lit then 0= if
+			hn @ 10 lit = if 1 lit hent 0 lit hent 1E00 lit mcopy  F lit hn ! then
+			llen @ hn @ hent !  lbuf @ hn @ hent 4 lit + llen @ mcopy  hn @ 1 lit + hn !
+		then
+	then ;
+: sexit ( -- )  "2" 1 lit obuf @ 40 lit sget 0 lit u> if texit else shalt then ;   \ in a terminal the shell ends (the window closes); on the console the node halts
 : lchar ( c -- )
+	lesc @ 1 lit = if '[' lit = if 2 lit lesc ! else 0 lit lesc ! then else
+	lesc @ 2 lit = if
+		dup '0' lit - A lit u< if drop else                                      \ a parameter: the final is still to come
+		dup 'A' lit = if -1 lit hrecall else dup 'B' lit = if 1 lit hrecall then then drop  0 lit lesc ! then
+	else
+	dup 1B lit = if drop 1 lit lesc ! else
+	dup 4 lit = if drop llen @ 0= if A lit emit1 sexit then else                 \ Ctrl-D on an empty line: exit
+	dup 15 lit = if drop lerase else                                             \ Ctrl-U: the line erased
+	dup 3 lit = if drop "^C" say A lit emit1  0 lit llen !  -1 lit ldone ! else  \ Ctrl-C: the line abandoned
 	dup D lit = over A lit = or if drop -1 lit ldone !  A lit emit1 else
 	dup 7F lit = over 8 lit = or if drop llen @ if llen @ 1 lit - llen !  8 lit emit1 20 lit emit1 8 lit emit1 then else
 	llen @ 1FF lit u< if dup lbuf @ llen @ + c!  llen @ 1 lit + llen !  emit1 else drop then
-	then then ;
-: getline ( -- )  0 lit llen !  0 lit ldone !  begin nextc lchar ldone @ until ;
+	then then then then then then then then ;
+: getline ( -- )  0 lit llen !  0 lit ldone !  0 lit lesc !  hn @ hpos !  begin nextc lchar ldone @ until ;
 
 \ ── paths ─────────────────────────────────────────────────────────────────────
 \ pnorm ( a n -- )  the path, absolute or relative to the working directory,
@@ -126,15 +154,15 @@
 	2dup "pwd" kveq if 2drop pbuf @ 200 lit spwd dup 0< if drop 0 lit then pbuf @ swap ssay "\n" say else
 	2dup "cd" kveq if 2drop kva @ kvl @ dup 0= if 2drop "/" 1 lit then pnorm  pbuf @ plen @ scd if "sh: cd: refused\n" say then else
 	2dup "ls" kveq if 2drop kva @ kvl @ ls else
-	2dup "exit" kveq if 2drop texit else
+	2dup "exit" kveq if 2drop sexit else
 	2dup "set" kveq 2 lit pick 2 lit pick "get" kveq or 2 lit pick 2 lit pick "add" kveq or 2 lit pick 2 lit pick "del" kveq or 2 lit pick 2 lit pick "list" kveq or if
 		2drop lbuf @ llen @ obuf @ 800 lit kvcmd obuf @ swap ssay "\n" say else
 	run then then then then then ;
 
 400 lit alloc lbuf !  80 lit alloc rbuf !  0 lit rpos !  0 lit rlen !  800 lit alloc obuf !  4 lit alloc cbuf !
-400 lit alloc pbuf !  400 lit alloc sbuf !
+400 lit alloc pbuf !  400 lit alloc sbuf !  2000 lit alloc hbuf !  0 lit hn !
 -1 lit kvinit
 begin
 	pbuf @ 200 lit spwd dup 0< if drop 0 lit then pbuf @ swap ssay  "$ " say
-	getline  llen @ if cmd then
+	getline  llen @ if hpush cmd then
 0 lit until

@@ -27,7 +27,7 @@ if [ -t 0 ]; then
 	while IFS= read -r -n1 -d '' c; do
 		[ "$c" = $'\x1d' ] && break
 		[ -z "$c" ] && c=$'\n'
-		printf '%s' "$c" >&3
+		printf '%s' "$c" >&3 2>/dev/null || break          # the node is gone
 	done
 else
 	cat >&3 &                         # stdin to the console for as long as the node runs

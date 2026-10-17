@@ -6,54 +6,60 @@
 \ ports programs hold go to the programs: src/ports.fam; the kernel's own TCP
 \ only answers strays), serves the programs' requests (src/ksrv.fam), and
 \ sleeps until a doorbell or 100 ms.  The web server is prog/wm.fam on TCP
-\ 8080 and the UDP echo prog/udpecho.fam on 3737, both in user mode.
+\ 8080, in user mode.
 \ The store (src/store.fam) opens on the disk 32 MiB in, past the boot image;
 \ the programs appended to the image are installed in it (src/exec.fam) and
-\ bin/init is exec'd: it runs the programs the links under init.d name and
-\ restarts what gets killed.  The build's links (udpecho, wm and sh: the
-\ servers and the console's shell, each init.d/NAME = /bin/NAME) are written
+\ bin/init is exec'd: it runs the programs the links under init.d name, in
+\ their order, and restarts what gets killed.  The build's links (10-wm the web
+\ server, 90-sh the console's shell, last so the prompt comes after what the
+\ others say; init.d/NN-PROG = "/bin/PROG", "> KEY" after it sends the
+\ program's output to KEY) are written
 \ once; a link the node wrote is dropped when a later build's default no longer
 \ names it, one that was edited or added is left alone ("proc/init.default"
 \ remembers what was written).
 \ ──────────────────────────────────────────────────────────────────────────────
 
-: pblob variable ;  : idl variable ;  : ibuf variable ;  : stok variable ;  : itx variable ;
-: ita variable ;  : itn variable ;  : iti variable ;  : ik variable ;  : ikl variable ;  : iv variable ;  : ivl variable ;
-: idef ( -- s n )  "udpecho wm sh" D lit ;
+: pblob variable ;  : quiet variable ;  : idl variable ;  : ibuf variable ;  : stok variable ;  : itx variable ;
+: ita variable ;  : itn variable ;  : iti variable ;  : ipx variable ;  : ik variable ;  : ikl variable ;  : iv variable ;  : ivl variable ;
+: idef ( -- s n )  "10-wm 90-sh" B lit ;                  \ the links, in the order init runs them: the shell last
+: imark ( -- s n )  "10-wm 90-sh (3)" F lit ;        \ what proc/init.default records: changed when the links' form changes
 : isame ( a b n -- flag )  -1 lit swap 0 lit do 2 lit pick i + c@ 2 lit pick i + c@ <> if drop 0 lit then loop nip nip ;
 : itok ( a n -- a' n' t tl )                               \ the first name of a list and the rest
 	itn ! ita !  0 lit iti !
 	begin iti @ itn @ u< if ita @ iti @ + c@ 20 lit <> else 0 lit then while iti @ 1 lit + iti ! repeat
 	iti @ itn @ u< if ita @ iti @ + 1 lit + itn @ iti @ - 1 lit - else ita @ itn @ + 0 lit then
 	ita @ iti @ ;
-: ient ( t tl -- )                                         \ the link for a name: ik/ikl "init.d/NAME", iv/ivl "/bin/NAME"
+: ient ( t tl -- )                                         \ the link for a name: ik/ikl "init.d/NAME", iv/ivl "/bin/PROG" (PROG: the name after its "NN-")
 	"init.d/" ibuf @ 7 lit mcopy  2dup ibuf @ 7 lit + swap mcopy  dup 7 lit + ikl !  ibuf @ ik !
+	0 lit ipx !  dup ?dup if 0 lit do over i + c@ '-' lit = ipx @ 0= and if i 1 lit + ipx ! then loop then
+	ipx @ ?dup if tuck - swap rot + swap then
 	"/bin/" ibuf @ 80 lit + 5 lit mcopy  2dup ibuf @ 85 lit + swap mcopy  nip 5 lit + ivl !  ibuf @ 80 lit + iv ! ;
 
 0 lit alloc dup pblob ! progsize alloc drop                \ the programs blob sits at the heap base: keep it
 40 lit 18 lit 8 lit kinit                                  \ 64 x 128 KiB, 24 x 1 MiB, 8 x 8 MiB of regions: 96 MiB
 2710 lit quantum!                                          \ 1 ms slices: a program answering a packet is not kept waiting for the timer
 evinit
+10000005 lit c@ 1 lit and if getc 'q' lit = else 0 lit then quiet !   \ the 'q' scripts/boot.sh sends after the boot config: no request trace (TRACE=1 keeps it)
 evnet? @ if
 	0A00020F lit FFFFFF00 lit 0A000202 lit ethinit drop
 	evdsk @ if 10000 lit pgbase !  evdsk @ pgopen drop stinit  exinit  ksinit  -1 lit stok !  200 lit alloc ibuf !
-		"q: store open, 32 MiB into the disk; " puts pblob @ proginst dup u. " program(s) installed" puts
-		0= if " (no programs blob at the heap base " puts pblob @ u.x ": is the node loaded on a page boundary?)" puts then '\n' lit putc
+		pblob @ proginst
+		"q: store open, 32 MiB into the disk; " puts dup u. " program(s) installed\n" puts
+		0= if "q: no programs blob at the heap base " puts pblob @ u.x ": is the node loaded on a page boundary?\n" puts then
 		-1 lit txbeg dup "init" 4 lit del drop dup "init.default" C lit del drop txcommit             \ the list of earlier builds
 		0 lit txbeg dup "proc/init.default" 11 lit ibuf @ 100 lit + 100 lit get idl ! txcommit  idl @ 0< if 0 lit idl ! then
-		idl @ idef nip = if ibuf @ 100 lit + idef isame else 0 lit then 0= if                          \ this build's links are not yet there
+		idl @ imark nip = if ibuf @ 100 lit + imark isame else 0 lit then 0= if                        \ this build's links are not yet there
 			-1 lit txbeg itx !
 			ibuf @ 100 lit + idl @ begin dup while itok ient                                             \ the earlier default's links, if untouched: out
-				itx @ ik @ ikl @ ibuf @ 180 lit + 7F lit get ivl @ = if ibuf @ 180 lit + iv @ ivl @ isame else 0 lit then
+				itx @ ik @ ikl @ ibuf @ 180 lit + 7F lit get dup ivl @ u< 0= if drop ibuf @ 180 lit + iv @ ivl @ isame else drop 0 lit then   \ the node's own: it starts with /bin/PROG
 				if itx @ ik @ ikl @ del drop then
 			repeat 2drop
 			idef begin dup while itok ient itx @ ik @ ikl @ iv @ ivl @ put repeat 2drop                 \ this one's: in
-			itx @ "proc/init.default" 11 lit idef put  itx @ txcommit
+			itx @ "proc/init.default" 11 lit imark put  itx @ txcommit
 		then
 	else 0 lit stok !  "q: no disk: the store is off\n" puts then
 	udpinit  pinit  8 lit tcpinit  -1 lit dsnet !              \ from here a store wait for the disk serves the NIC (src/idle.fam)
 	1 lit 10000001 lit c!                                     \ the UART interrupts on input (its PLIC source is armed below, while a program waits)
-	10000005 lit c@ 1 lit and if getc drop then               \ the 'q' scripts/boot.sh QUIET=1 sends after the boot config
 	0 lit tlog !
 	stok @ if "bin/init" 8 lit 20000 lit 5 lit exec "q: exec bin/init: thread " puts u. '\n' lit putc then
 	begin

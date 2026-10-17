@@ -35,6 +35,7 @@
 \            otherwise a key is a pipe and a reader at its end waits
 \   10, 11   the loop thread's side of the UART emulation (src/proc.fam kuart):
 \            fill a thread's input buffer from its input, flush its output
+\   12 halt  ( -- )   the node stops (the console shell's exit)
 \   A scan   ( start slen buf cap -- n )   the keys from start on, in order, as
 \            many as fit cap: records of klen, vlen (words), the key and the
 \            value's first 64 bytes, each padded to 4.  An iterator: the
@@ -300,6 +301,7 @@
 		then
 	then ;
 : kflop ( -- r )  kst @ kflush  0 lit ;           \ op 11: the output buffer out (kuart's writes)
+: khalt? ( -- r )  bye 0 lit ;                      \ op 12: the node halts (the machine stops: scripts/boot.sh returns)
 : kbindp ( -- r )  kst @ ks1 @ ks2 @ ks3 @ ks4 @ pbind ;
 : kunbind ( -- r )  kst @ ks1 @ ks2 @ punbind 0 lit ;
 : ktxring ( -- r )  kst @ ks1 @ ks2 @ ptxset ;
@@ -344,8 +346,8 @@
 	kso @ 7 lit = if kunbind else kso @ 8 lit = if ktxring else kso @ 9 lit = if knetinf else
 	kso @ A lit = if kscan else kso @ B lit = if kread else kso @ C lit = if kwatch else
 	kso @ D lit = if kunwtch else kso @ E lit = if kkillop else kso @ F lit = if krewind else
-	kso @ 10 lit = if kfill else kso @ 11 lit = if kflop else -2 lit
-	then then then then then then then then then then then then then then then then then
+	kso @ 10 lit = if kfill else kso @ 11 lit = if kflop else kso @ 12 lit = if khalt? else -2 lit
+	then then then then then then then then then then then then then then then then then then
 	dup -3 lit = if drop else
 		kst @ rrec dup 78 lit + rot swap !  2 lit swap 7C lit + !  20000 lit kst @ kpostd
 	then ;

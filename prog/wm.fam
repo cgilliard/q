@@ -20,7 +20,7 @@
 					"term:" tmb @ 5 lit mcopy  tmb @ swap 5 lit + 1 lit wsend
 				else drop then
 			else drop  0 lit i tment 8 lit + !
-				tstate 0= if i hslot hsel  "term:\n[the shell has ended]\n" dup slen 1 lit wsend  i termclos then
+				tstate 0= if i hslot hsel  "term close" dup slen 1 lit wsend  i termclos then
 			then
 		else drop then then
 	loop ;
@@ -28,7 +28,7 @@
 40 lit pstack
 6 lit 1F90 lit pbind ?dup if "wm: cannot hold TCP port 8080: " puts u. '\n' lit putc texit then
 20 lit tcpinit  -1 lit kvinit  terminit  1F90 lit 20 lit httpinit  620 lit alloc tmb !  10 lit alloc tmblk !
-"wm: serving http on port 8080\n" puts
+"wm: http://127.0.0.1:8080\n" say
 begin
 	nbit wbit or F4240 lit wait                   \ frames, a watched key, or 100 ms for the timers
 	wbit and if 20 lit 0 lit do i tment @ if -1 lit i tment 8 lit + ! then loop then

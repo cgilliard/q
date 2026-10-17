@@ -115,6 +115,7 @@ B7121000 ,   \ lui t0,0x101
 : swatch ( key klen -- r )               sb ! sa !  C lit sa @ sb @ 0 lit 0 lit kreq ;
 : sunwatch ( key klen -- r )             sb ! sa !  D lit sa @ sb @ 0 lit 0 lit kreq ;
 : srewind ( key klen -- r )              sb ! sa !  F lit sa @ sb @ 0 lit 0 lit kreq ;    \ read from its start, as a file (its end is 0)
+: shalt  ( -- )                          12 lit 0 lit 0 lit 0 lit 0 lit kreq drop ;    \ the node halts
 : skill  ( tid -- r )                    sa !  E lit sa @ 0 lit 0 lit 0 lit kreq ;
 : wbit   ( -- mask )  100000 lit ;                                                       \ bit 20: a watched key was written
 : slen  ( s -- n )  dup begin dup c@ while 1 lit + repeat swap - ;
