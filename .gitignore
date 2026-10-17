@@ -3,3 +3,4 @@ data/**
 tmp/**
 tools/__pycache__/
 **/*.swp
+miner/target/

@@ -1,0 +1,4 @@
+# The miner runs on the machine that builds it: let the compiler use every
+# instruction this CPU has (AVX2 triples the Poseidon2 permutation rate).
+[build]
+rustflags = ["-C", "target-cpu=native"]

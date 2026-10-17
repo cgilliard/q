@@ -1,0 +1,4112 @@
+//! Chain-state-dependent block processing: resolving a block's inputs and
+//! outputs against the real `StateTree`/`UtxoIndex`, applying the
+//! resulting updates, and checking the header's claimed roots match what
+//! applying the block actually produced -- everything `block::Block`
+//! deliberately doesn't do on its own, since it has no access to (or need
+//! for) any chain state. See that module's docs for exactly where the
+//! line between the two sits.
+//!
+//! **No balance or authorization check lives here, now or later.** Once
+//! `inputs`/`outputs` are bare opaque commitments (see `block`'s docs),
+//! there's nothing left in plaintext to check a sum over -- that's
+//! permanently the future ZK proof's job, not a placeholder standing in
+//! for it.
+//!
+//! Timestamps must **strictly increase**: every block's `timestamp` is
+//! later than its parent's (`Error::TimestampNotAfterParent`). Checked
+//! here, in plaintext, by every full node -- it's cheap, and it keeps
+//! the chain's clock monotonic, so the retarget rule's measure of how
+//! far behind schedule the chain is can only be pushed one way (forward,
+//! and only as far as `MAX_FUTURE_DRIFT_MS` allows).
+//! A light client relying on the recursive proof instead will need the
+//! proof to attest the same rule; that's the proof's job on top of this,
+//! not instead of it.
+//!
+//! What this module *does* check is everything structural: does this
+//! block chain onto the current tip, does its `timestamp` claim to be
+//! further in the future than this node's own clock allows (the one
+//! timestamp rule that can *never* move into any proof, recursive or
+//! not -- it's about the relationship between a timestamp and whenever
+//! *this check* happens to run, not a fact fixed at proving time), does
+//! every input resolve to a real, currently-unspent output, does every
+//! output avoid colliding with one that's still live, and do the roots
+//! that result from applying it match what the header claims.
+//!
+//! # Atomicity
+//!
+//! `StateTree` and `UtxoIndex` hold no in-memory state of their own
+//! to desync -- every read and write they do goes through a caller-
+//! supplied LMDB transaction (see each module's docs). That's what lets
+//! `apply_block` update all of them through one shared `heed::RwTxn` and
+//! commit them together: if any check fails partway through, the
+//! function returns before ever calling `commit`, the transaction is
+//! simply dropped, and LMDB aborts it -- every write attempted so far is
+//! discarded, with nothing to roll back by hand.
+//!
+//! `build_block` leans on the exact same mechanism for a different
+//! purpose: it runs the identical resolve-and-apply logic `apply_block`
+//! uses, through its own write transaction, purely to compute the roots
+//! a prospective block *would* produce -- then deliberately never
+//! commits. There's no separate "simulate" code path to keep in sync
+//! with the real one; it's the same function, just discarded afterward.
+//!
+//! # Difficulty retargeting
+//!
+//! Whatever target a `Chain` opens with (`DifficultyConfig::
+//! initial_target`, see `Chain::open`) is only ever the *starting*
+//! one, not a fixed one -- `Chain` adjusts it over time to keep blocks
+//! landing roughly `DifficultyConfig::target_block_time_ms` apart,
+//! which is exactly why `Block::validate`/`pow::mine_block` take the
+//! target as an explicit parameter rather than assuming a constant
+//! (see `block`'s docs). `Chain` tracks two more small pieces of side
+//! state for this, on top of the tip header: the currently-active
+//! target (`current_target`), and the timestamp of the chain's first
+//! block (`anchor_timestamp`), which the rule measures from.
+//!
+//! The rule is **ASERT** (absolutely scheduled exponentially rising
+//! targets; Bitcoin Cash's aserti3-2d, `asert`): every block's target is
+//! the first block's, scaled by `2^(behind / half_life)`, where `behind`
+//! is how far the block's timestamp is past the schedule -- the first
+//! block's timestamp plus `target_block_time_ms` per block since. Each
+//! half-life behind schedule halves the difficulty; each one ahead
+//! doubles it. It adjusts every block, depends on nothing but the first
+//! block and the latest one (no window), and a skewed timestamp moves it
+//! only until the next honest one. All the knobs -- the starting target,
+//! the target block time, and the half-life -- are bundled into one
+//! `DifficultyConfig` the caller supplies to `Chain::open`, precisely
+//! because the right values for a test (fast, cheap to mine, so the
+//! suite stays quick) and for an actual run (slower, closer to a real
+//! target pace) are never the same numbers -- see
+//! `DifficultyConfig::for_tests`.
+
+#![allow(dead_code)]
+
+use crate::recovery::NONCE_LEN;
+use crate::block::{Block, BlockBody, BlockHeader, HEADER_LEN, UnprovenBlock, now_millis};
+use crate::state_tree::StateTree;
+use crate::pow;
+use crate::storage::Storage;
+use crate::transaction::Transaction;
+use crate::utxo::UtxoIndex;
+use heed::Database;
+use heed::types::Bytes;
+
+/// The `prev_hash` an empty chain's first block must declare -- there's
+/// no real prior header to point to, so this stands in for "no parent."
+pub const GENESIS_PARENT_HASH: [u8; 32] = [0u8; 32];
+
+/// How far ahead of this node's own clock a block's `timestamp` is
+/// allowed to claim to be, in milliseconds -- same order of magnitude
+/// as Bitcoin's 2-hour rule. This can never be part of any proof,
+/// recursive or otherwise: it's a statement about the relationship
+/// between a timestamp and whenever *this particular check* happens to
+/// run, not a fact fixed at proving time (see `docs/BLOCK_TODO.md` #3).
+/// Every verifier -- full node or light client -- has to check this
+/// locally, against its own clock, no matter how much of the rest of
+/// chain validity eventually gets folded into a recursive proof.
+const MAX_FUTURE_DRIFT_MS: u64 = 2 * 60 * 60 * 1000;
+
+/// How much easier than the current target an orphan's proof of work may
+/// be and still be pooled (`Chain::orphan_target`).
+const ORPHAN_TARGET_RELAX: u64 = 4;
+
+/// The tip's full header, the one thing `Chain` persists in its own
+/// `chain_meta` database beyond what `state`/`utxo` already
+/// track. Everything else `Chain` needs to know about the tip --
+/// its hash, its height -- is derived from this single stored value
+/// rather than kept as separate, independently-updated counters, so
+/// there's nothing for two pieces of tip metadata to ever drift out of
+/// sync with each other.
+const TIP_HEADER_KEY: &[u8] = b"tip_header";
+
+/// Every knob `Chain`'s difficulty retargeting needs, bundled into one
+/// struct rather than separate positional parameters to `Chain::open`
+/// -- partly so adding another knob later doesn't change that
+/// signature again, partly so a caller can't accidentally transpose
+/// two `u64`s that mean different things. See the module docs for what
+/// the rule actually does with these.
+#[derive(Clone, Copy, Debug)]
+pub struct DifficultyConfig {
+    /// The proof-of-work function's parameters (`pow::Params`): the
+    /// dataset's size, an item's cost, and reads per attempt.
+    pub pow: crate::pow::Params,
+    /// The PoW target the chain's first block sets for the second: the
+    /// target of a chain exactly on schedule (`asert`'s anchor).
+    pub initial_target: [u8; 32],
+    /// The real time a block is supposed to take, in **milliseconds**,
+    /// if mining is keeping pace with the target. Milliseconds rather
+    /// than seconds specifically so a test can set this small (tens of
+    /// milliseconds) and use genuinely real elapsed time -- actually
+    /// sleeping between mined blocks -- without the test suite paying
+    /// for it in wall-clock seconds; see `for_tests`.
+    pub target_block_time_ms: u64,
+    /// How far behind (ahead of) schedule halves (doubles) the
+    /// difficulty, in milliseconds (`asert`).
+    pub half_life_ms: u64,
+    /// The block reward by height, and the height the chain ends at
+    /// (`prover::Schedule`).
+    pub schedule: crate::prover::Schedule,
+}
+
+impl DifficultyConfig {
+    /// Fast, cheap-to-mine defaults for tests: `block::INITIAL_MAX_HASH`
+    /// (the easy target everything else in this crate's test suite is
+    /// already built around), a millisecond-scale target block time, and
+    /// a half-life of ten such blocks -- fast enough that a test
+    /// exercising genuinely real elapsed time (not hand-set
+    /// `timestamp`s) stays fast too.
+    pub fn for_tests() -> Self {
+        DifficultyConfig {
+            pow: crate::pow::Params::TEST,
+            initial_target: crate::block::INITIAL_MAX_HASH,
+            target_block_time_ms: 10,
+            half_life_ms: 100,
+            schedule: crate::prover::DEV_SCHEDULE,
+        }
+    }
+}
+
+/// The currently-active PoW target, the other piece of state `Chain`
+/// persists in `chain_meta` beyond the tip header.
+const CURRENT_TARGET_KEY: &[u8] = b"current_target";
+
+/// The timestamp of the chain's first block -- what `asert` measures the
+/// schedule from. Set by the block at height `0`, and never again.
+const ANCHOR_TIMESTAMP_KEY: &[u8] = b"anchor_timestamp";
+
+/// `chain_meta` key: the height of the block a fast sync started this
+/// chain at (u64 BE), if one did -- nothing below it is stored but the
+/// genesis block, so no reorg reaches below it (`reorg_floor`).
+const SYNC_BASE_KEY: &[u8] = b"sync_base";
+
+/// `chain_meta` key: the layout version of everything stored (u32 BE).
+/// Data written in another layout is refused (`Error::OldStorage`), not
+/// misread.
+const STORAGE_VERSION_KEY: &[u8] = b"storage_version";
+const STORAGE_VERSION: u32 = 5; // 5: undo data keeps spent records and replaced ones
+
+/// Database name: every applied block, in full (`Block::to_bytes`),
+/// keyed by its own header hash. The one place this module keeps
+/// actual block data around after applying it -- needed so a reorg
+/// can look back at what a block it's unwinding actually contained
+/// (`body.outputs`' commitments, specifically), and eventually so a
+/// fork-choice comparison has real headers to walk back through.
+const BLOCKS_DB: &str = "blocks";
+
+/// Database name: `UndoData` for every applied block, keyed by the
+/// same header hash as `BLOCKS_DB`. See `UndoData`'s own docs for why
+/// this has to be captured *at apply time*, not reconstructed later.
+const BLOCK_UNDO_DB: &str = "block_undo";
+
+/// Database name: cumulative chain work (`pow::work_for_target`,
+/// summed via `pow::add256`) up to and including each stored block,
+/// keyed by the same header hash as `BLOCKS_DB`. Tracked for *every*
+/// accepted block, not just the active chain's -- fork-choice needs
+/// to compare a side branch's total work against the active chain's
+/// before either has been touched, so this can't be computed lazily
+/// only when a reorg is already underway.
+const BLOCK_WORK_DB: &str = "block_work";
+
+/// Database name: hashes of blocks known to be invalid (value unused),
+/// recorded when a reorg replay fails on a block-level fault (see
+/// `Error::is_block_fault`). Without this, a side branch whose stored
+/// blocks merely *look* heavier would retrigger the same doomed reorg
+/// every time another block extending it arrived. Persisted rather
+/// than in-memory: the bad blocks themselves stay in `BLOCKS_DB`
+/// across restarts, so the verdict on them has to as well.
+const INVALID_BLOCKS_DB: &str = "invalid_blocks";
+
+/// Database name: the `RetargetState` in effect right *after* each
+/// stored block, keyed by the same header hash as `BLOCKS_DB`. Tracked
+/// for every accepted block, active or side branch, for the same reason
+/// as `BLOCK_WORK_DB`: a side-branch block has to be checked against
+/// the target *its own branch's* history implies, which can differ from
+/// the active chain's once the two straddle a retarget-window boundary.
+const BLOCK_RETARGET_DB: &str = "block_retarget";
+
+/// Database name: an index of every stored block by height -- key is
+/// `height` (big-endian) followed by the header hash, value unused --
+/// so pruning can find everything below a height without scanning
+/// `BLOCKS_DB`. See `Chain::prune`.
+const BLOCK_HEIGHTS_DB: &str = "block_heights";
+
+/// Database name: the active chain by height -- key is `height`
+/// (big-endian), value the active block's header hash. Maintained as
+/// blocks are applied and unwound, so it always describes exactly the
+/// active chain. What lets a peer ask for "your block at height N"
+/// (sync), and what `prune` uses to tell active-chain blocks (kept
+/// forever) from side-branch ones (dropped once out of reach).
+const ACTIVE_HEIGHTS_DB: &str = "active_heights";
+
+/// Every output the active chain has created, spent or not: commitment
+/// -> its block's height (u64 BE) ‖ its recovery nonce. Written when a
+/// block applies, removed only when that block is unwound -- spending
+/// doesn't touch it. What a wallet checks its outputs' nonces against,
+/// and what recovery scans (`docs/RECOVERY.md`).
+const OUTPUT_INDEX_DB: &str = crate::utxo::OUTPUTS_DB;
+
+/// How many blocks the orphan pool holds before evicting the oldest --
+/// a bound on how much memory a peer can make this node spend on
+/// blocks it can't place yet. Same number Bitcoin Core uses for its
+/// orphan *transaction* pool; not calibrated against anything here.
+const MAX_ORPHANS: usize = 100;
+
+#[derive(Debug)]
+pub enum Error {
+    Storage(crate::storage::Error),
+    Heed(heed::Error),
+    State(crate::state_tree::Error),
+    Utxo(crate::utxo::Error),
+    /// The on-disk tip entry wasn't a validly encoded hash.
+    Corrupt(&'static str),
+    /// The block failed `Block::validate()` -- unsound on its own terms,
+    /// before chain state even enters the picture.
+    InvalidBlock,
+    /// `header.prev_hash` doesn't match this chain's current tip (or
+    /// `GENESIS_PARENT_HASH`, for an empty chain).
+    WrongParent,
+    /// `header.height` isn't exactly one more than the current tip's
+    /// (or `0`, for an empty chain). Catches a bug or forged claim
+    /// independently of `WrongParent` -- see `block::HEADER_LEN`'s docs
+    /// on why `height` is trustworthy data in the first place.
+    WrongHeight,
+    /// `header.timestamp` claims to be further ahead of this node's own
+    /// clock than `MAX_FUTURE_DRIFT_MS` allows.
+    TimestampTooFarInFuture,
+    /// An input commitment doesn't resolve to a currently unspent output.
+    UnresolvedInput([u8; 32]),
+    /// An output's commitment collides with one that's already live
+    /// (created, and not yet spent).
+    DuplicateOutput([u8; 32]),
+    /// A fast sync's snapshot was refused: why.
+    Snapshot(&'static str),
+    /// The stored data is in another layout (an older version's).
+    OldStorage,
+    /// Applying the body produced a state root different from the one the
+    /// header claims.
+    StateRootMismatch,
+    /// Applying the body left a different number of outputs than the
+    /// header claims.
+    OutputCountMismatch,
+    /// One of the transactions handed to `build_block` failed its own
+    /// `Transaction::verify()` -- the index is its position in the slice
+    /// that was passed in.
+    InvalidTransaction(usize),
+    /// A transaction handed to `build_block` spends a policy output whose
+    /// timelocks don't hold yet at the block's height.
+    LockNotMet(usize),
+    /// A transaction handed to `build_block` has more inputs or outputs
+    /// than one chunk holds (`prover::CHUNK_SHAPE`) -- a consensus limit.
+    TransactionTooLarge,
+    /// The chain has reached its end height (`prover::Schedule::end`): no
+    /// further block is valid.
+    ChainEnded,
+    /// A side-branch block's own header is unsound -- `Block::validate`
+    /// against the target its own branch's history implies failed.
+    InvalidSideBranchBlock,
+    /// A side-branch block's claimed `prev_hash`/`height` doesn't
+    /// match the block it claims to extend.
+    InvalidSideBranchLineage,
+    /// A competing chain (or a block that could only ever belong to
+    /// one) would fork off the active chain further back than
+    /// `max_reorg_depth` allows -- see `Chain::open`'s docs.
+    ReorgTooDeep,
+    /// The block is, or descends from, one already recorded in
+    /// `INVALID_BLOCKS_DB`.
+    KnownInvalidBlock,
+    /// An orphan's proof of work doesn't even meet the active chain's
+    /// current target relaxed by `ORPHAN_TARGET_RELAX` -- see
+    /// `Chain::orphan_target`. Not a verdict on the block (its real
+    /// target is unknowable without its parent), just a refusal to
+    /// spend pool space on it; it can always be sent again once its
+    /// parent is known.
+    OrphanPowTooWeak,
+    /// `header.timestamp` isn't strictly later than its parent's.
+    TimestampNotAfterParent,
+    /// A block claiming to be the first one (`prev_hash` is
+    /// `GENESIS_PARENT_HASH`) that isn't this chain's genesis block -- or,
+    /// at `Chain::open`, stored data whose first block isn't.
+    WrongGenesis,
+    /// `build_block` was handed more than fits in `block::MAX_BLOCK_BYTES`.
+    BlockTooLarge,
+}
+
+impl Error {
+    /// Whether this error condemns the block itself -- as opposed to a
+    /// storage failure, which says nothing about the block, or
+    /// `TimestampTooFarInFuture`, which may stop being true just by
+    /// waiting. Only these get a block recorded in `INVALID_BLOCKS_DB`.
+    fn is_block_fault(&self) -> bool {
+        matches!(
+            self,
+            Error::InvalidBlock
+                | Error::WrongParent
+                | Error::WrongHeight
+                | Error::UnresolvedInput(_)
+                | Error::DuplicateOutput(_)
+                | Error::StateRootMismatch
+                | Error::OutputCountMismatch
+                | Error::TimestampNotAfterParent
+                | Error::WrongGenesis
+        )
+    }
+}
+
+impl From<crate::storage::Error> for Error {
+    fn from(e: crate::storage::Error) -> Self {
+        Error::Storage(e)
+    }
+}
+
+impl From<heed::Error> for Error {
+    fn from(e: heed::Error) -> Self {
+        Error::Heed(e)
+    }
+}
+
+impl From<crate::state_tree::Error> for Error {
+    fn from(e: crate::state_tree::Error) -> Self {
+        Error::State(e)
+    }
+}
+
+
+impl From<crate::utxo::Error> for Error {
+    fn from(e: crate::utxo::Error) -> Self {
+        Error::Utxo(e)
+    }
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::Storage(e) => write!(f, "storage error: {e}"),
+            Error::Heed(e) => write!(f, "LMDB error: {e}"),
+            Error::State(e) => write!(f, "state tree error: {e}"),
+            Error::Utxo(e) => write!(f, "utxo error: {e}"),
+            Error::Corrupt(msg) => write!(f, "corrupt chain metadata: {msg}"),
+            Error::InvalidBlock => write!(f, "block failed its own validate()"),
+            Error::WrongParent => write!(f, "block does not chain onto the current tip"),
+            Error::WrongHeight => write!(f, "block's height is not exactly one more than the current tip's"),
+            Error::TimestampTooFarInFuture => write!(f, "header timestamp is too far ahead of this node's clock"),
+            Error::UnresolvedInput(c) => write!(f, "input {} does not resolve to a live unspent output", hex(c)),
+            Error::DuplicateOutput(c) => write!(f, "output {} collides with a still-live output", hex(c)),
+            Error::Snapshot(why) => write!(f, "snapshot refused: {why}"),
+            Error::OldStorage => write!(f, "the stored chain is from an incompatible version of this software"),
+            Error::StateRootMismatch => write!(f, "header's state_root does not match the result of applying the body"),
+            Error::OutputCountMismatch => write!(f, "header's output_count does not match the result of applying the body"),
+            Error::InvalidTransaction(i) => write!(f, "transaction at index {i} failed verify()"),
+            Error::TransactionTooLarge => write!(f, "a transaction has more inputs, outputs or signatures than one chunk holds"),
+            Error::LockNotMet(i) => write!(f, "transaction at index {i} spends a policy output whose timelocks don't hold yet"),
+            Error::ChainEnded => write!(f, "the chain has reached its end height; no further block is valid"),
+            Error::InvalidSideBranchBlock => write!(f, "side-branch block failed validate() against the active target"),
+            Error::InvalidSideBranchLineage => write!(f, "side-branch block's prev_hash/height doesn't match its claimed parent"),
+            Error::ReorgTooDeep => write!(f, "competing chain's common ancestor is beyond max_reorg_depth"),
+            Error::KnownInvalidBlock => write!(f, "block is, or descends from, a block already known to be invalid"),
+            Error::OrphanPowTooWeak => write!(f, "orphan's proof of work is too weak to be worth pooling"),
+            Error::TimestampNotAfterParent => write!(f, "header timestamp is not later than its parent's"),
+            Error::WrongGenesis => write!(f, "block is not this chain's genesis block"),
+            Error::BlockTooLarge => write!(f, "transactions don't fit in the maximum block size"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+/// `resolve_and_apply`'s result: the resulting `(state_root,
+/// output_count)`, every spent input's `(commitment, position)` from
+/// before it was removed, and (if asked for) each chunk's state
+/// transition witness -- see that method's docs.
+type ResolveResult = ([u8; 32], u64, Undone, Vec<crate::aggregate::ChunkTransition>);
+
+/// What applying a body overwrote, for `UndoData`: each spent input's
+/// record as it was, and the earlier record of every output whose
+/// commitment had been created (and spent) before.
+#[derive(Default)]
+struct Undone {
+    spent_inputs: Vec<SpentInput>,
+    replaced: Vec<([u8; 32], [u8; crate::utxo::RECORD_LEN])>,
+}
+
+/// A spent input as it stood before the spend: enough to put it back
+/// exactly, whatever later blocks do to its commitment's record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SpentInput {
+    commitment: [u8; 32],
+    position: u64,
+    height: u64,
+    nonce: [u8; NONCE_LEN],
+}
+
+/// Which of a body's inputs and outputs each chunk holds, as indices
+/// into its lists (body order within each chunk).
+type ChunkIndices = Vec<(Vec<usize>, Vec<usize>)>;
+
+/// `BLOCK_HEIGHTS_DB`'s key for a block: big-endian height first, so
+/// keys sort by height, then the hash to keep same-height blocks apart.
+fn height_key(height: u64, hash: [u8; 32]) -> [u8; 40] {
+    let mut out = [0u8; 40];
+    out[..8].copy_from_slice(&height.to_be_bytes());
+    out[8..].copy_from_slice(&hash);
+    out
+}
+
+fn hex(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Difficulty retargeting's state as of right after some block: the
+/// target the *next* block must meet, and the first block's timestamp. What `chain_meta`'s
+/// `CURRENT_TARGET_KEY`/`ANCHOR_TIMESTAMP_KEY` hold for the
+/// active tip, and what `BLOCK_RETARGET_DB` holds for every stored block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RetargetState {
+    target: [u8; 32],
+    anchor_timestamp: u64,
+}
+
+impl RetargetState {
+    fn to_bytes(self) -> [u8; 40] {
+        let mut out = [0u8; 40];
+        out[..32].copy_from_slice(&self.target);
+        out[32..].copy_from_slice(&self.anchor_timestamp.to_be_bytes());
+        out
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != 40 {
+            return Err(Error::Corrupt("stored retarget state was not 40 bytes"));
+        }
+        Ok(RetargetState {
+            target: bytes[..32].try_into().unwrap(),
+            anchor_timestamp: u64::from_be_bytes(bytes[32..].try_into().unwrap()),
+        })
+    }
+
+    /// The state right after `header` lands on top of `self` -- the
+    /// retargeting rule itself, as a pure function of nothing but the
+    /// previous state and the new header, so it can be run for any
+    /// branch, not just the active one (`next_retarget`).
+    fn after(self, config: &DifficultyConfig, header: &BlockHeader) -> Self {
+        let (target, anchor_timestamp) = next_retarget(config, (self.target, self.anchor_timestamp), header.height, header.timestamp);
+        RetargetState { target, anchor_timestamp }
+    }
+}
+
+/// A block height as a state-tree leaf holds it (`state_tree::leaf`):
+/// below 2^31, as chain proofs require of every height.
+fn leaf_height(height: u64) -> Result<u32> {
+    u32::try_from(height).ok().filter(|h| *h < 1 << 31).ok_or(Error::InvalidBlock)
+}
+
+/// The retarget rule, on its own: the `(target, anchor timestamp)` in
+/// effect after a block at `height` with `timestamp`, given the anchor
+/// timestamp before it. The block at height `0` sets the anchor to its
+/// own timestamp; every block's next target is `asert`'s. (The target
+/// before doesn't matter: ASERT is absolute.) Shared with the
+/// chain-proof circuit (`chain_rules::retarget`), which proves the same
+/// rule.
+pub(crate) fn next_retarget(config: &DifficultyConfig, (_target, anchor): ([u8; 32], u64), height: u64, timestamp: u64) -> ([u8; 32], u64) {
+    let anchor = if height == 0 { timestamp } else { anchor };
+    (asert(config, anchor, height, timestamp), anchor)
+}
+
+/// aserti3-2d's cubic approximation: for `0 <= f < 2^16`,
+/// `2^16 · 2^(f / 2^16) ≈ 2^16 + (c1·f + c2·f² + c3·f³ + 2^47) >> 48`.
+pub(crate) const ASERT_POLY: [u64; 3] = [195_766_423_245_049, 971_821_376, 5_127];
+
+/// The target after a block at `height` with `timestamp`, the chain's
+/// first block having had `anchor` (ASERT, with aserti3-2d's integer
+/// arithmetic): `behind = timestamp - anchor - height · target_block_time`,
+/// `e = ⌊behind · 2^16 / half_life⌋` -- whole halvings `⌊e / 2^16⌋` and a
+/// fraction `e mod 2^16` -- and the target is `initial_target ·
+/// factor(fraction) · 2^(halvings - 16)`, rounded down, then clamped to
+/// `[1, 2^256 - 1]`. On schedule (`behind = 0`) it's `initial_target`
+/// exactly.
+pub(crate) fn asert(config: &DifficultyConfig, anchor: u64, height: u64, timestamp: u64) -> [u8; 32] {
+    let behind = timestamp as i128 - anchor as i128 - config.target_block_time_ms as i128 * height as i128;
+    let e = (behind << 16).div_euclid(config.half_life_ms as i128);
+    let (halvings, f) = (e >> 16, (e & 0xffff) as u128);
+    let [c1, c2, c3] = ASERT_POLY.map(|c| c as u128);
+    let factor = (1 << 16) + ((c1 * f + c2 * f * f + c3 * f * f * f + (1 << 47)) >> 48);
+    // initial_target · factor, little-endian: below 2^273, 35 bytes.
+    let mut x = [0u8; 35];
+    let mut carry = 0u128;
+    for (k, slot) in x.iter_mut().enumerate() {
+        let v = config.initial_target.get(31usize.wrapping_sub(k)).map_or(0, |&b| b as u128) * factor + carry;
+        *slot = v as u8;
+        carry = v >> 8;
+    }
+    const ONE: [u8; 32] = {
+        let mut t = [0u8; 32];
+        t[31] = 1;
+        t
+    };
+    // · 2^shift, rounded down.
+    let shift = halvings - 16;
+    if shift >= 256 {
+        return [0xff; 32];
+    }
+    if shift <= -(8 * 35) {
+        return ONE;
+    }
+    let bit = |i: i128| -> u8 { if (0..8 * 35).contains(&i) { (x[(i / 8) as usize] >> (i % 8)) & 1 } else { 0 } };
+    // Any bit at 256 or above overflows.
+    if (256 - shift..8 * 35).any(|i| bit(i) == 1) {
+        return [0xff; 32];
+    }
+    let mut out = [0u8; 32];
+    for k in 0..256 {
+        out[31 - k as usize / 8] |= bit(k - shift) << (k % 8);
+    }
+    if out == [0; 32] { ONE } else { out }
+}
+
+/// Everything `Chain::unwind_tip` needs to reverse exactly what
+/// `apply_block` did for one block, snapshotted *before* that block's
+/// own mutations ran. None of this is recoverable any other way once
+/// those mutations have happened: the tip header and retargeting
+/// state (`current_target`/`anchor_timestamp`) get overwritten
+/// in place, not appended, and a spent input's original position
+/// is deleted from `utxo` the moment it's spent -- the one instant
+/// `resolve_and_apply` has it in hand is the only chance to record it.
+/// This is genuinely the same "undo data" Bitcoin Core keeps per
+/// block, for the exact same reason.
+struct UndoData {
+    /// The tip header in effect immediately before this block was
+    /// applied -- `None` if this block was the very first ever
+    /// applied (there was no tip at all yet).
+    prev_tip_header: Option<BlockHeader>,
+    prev_current_target: [u8; 32],
+    prev_anchor_timestamp: u64,
+    /// Every input this block spent, with its record as it was.
+    spent_inputs: Vec<SpentInput>,
+    /// For each output whose commitment already had a (spent) record,
+    /// that record: unwinding puts it back instead of deleting it.
+    replaced: Vec<([u8; 32], [u8; crate::utxo::RECORD_LEN])>,
+}
+
+impl UndoData {
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        match &self.prev_tip_header {
+            Some(header) => {
+                out.push(1);
+                out.extend_from_slice(&header.to_bytes());
+            }
+            None => out.push(0),
+        }
+        out.extend_from_slice(&self.prev_current_target);
+        out.extend_from_slice(&self.prev_anchor_timestamp.to_be_bytes());
+        out.extend_from_slice(&(self.spent_inputs.len() as u32).to_be_bytes());
+        for input in &self.spent_inputs {
+            out.extend_from_slice(&input.commitment);
+            out.extend_from_slice(&input.position.to_be_bytes());
+            out.extend_from_slice(&input.height.to_be_bytes());
+            out.extend_from_slice(&input.nonce);
+        }
+        out.extend_from_slice(&(self.replaced.len() as u32).to_be_bytes());
+        for (commitment, record) in &self.replaced {
+            out.extend_from_slice(commitment);
+            out.extend_from_slice(record);
+        }
+        out
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        fn take<'a>(bytes: &'a [u8], offset: &mut usize, len: usize) -> Result<&'a [u8]> {
+            let slice = bytes.get(*offset..*offset + len).ok_or(Error::Corrupt("undo data was truncated"))?;
+            *offset += len;
+            Ok(slice)
+        }
+
+        let mut offset = 0;
+        let has_prev_tip_header = take(bytes, &mut offset, 1)?[0];
+        let prev_tip_header = match has_prev_tip_header {
+            0 => None,
+            1 => {
+                let header_bytes = take(bytes, &mut offset, HEADER_LEN)?;
+                Some(BlockHeader::from_bytes(header_bytes).map_err(|_| Error::Corrupt("undo data's tip header was corrupt"))?)
+            }
+            _ => return Err(Error::Corrupt("undo data's tip-header flag was neither 0 nor 1")),
+        };
+
+        let prev_current_target: [u8; 32] = take(bytes, &mut offset, 32)?.try_into().unwrap();
+        let prev_anchor_timestamp = u64::from_be_bytes(take(bytes, &mut offset, 8)?.try_into().unwrap());
+        let count = u32::from_be_bytes(take(bytes, &mut offset, 4)?.try_into().unwrap());
+
+        let mut spent_inputs = Vec::new();
+        for _ in 0..count {
+            let commitment: [u8; 32] = take(bytes, &mut offset, 32)?.try_into().unwrap();
+            let position = u64::from_be_bytes(take(bytes, &mut offset, 8)?.try_into().unwrap());
+            let height = u64::from_be_bytes(take(bytes, &mut offset, 8)?.try_into().unwrap());
+            let nonce: [u8; NONCE_LEN] = take(bytes, &mut offset, NONCE_LEN)?.try_into().unwrap();
+            spent_inputs.push(SpentInput { commitment, position, height, nonce });
+        }
+        let count = u32::from_be_bytes(take(bytes, &mut offset, 4)?.try_into().unwrap());
+        let mut replaced = Vec::new();
+        for _ in 0..count {
+            let commitment: [u8; 32] = take(bytes, &mut offset, 32)?.try_into().unwrap();
+            let record: [u8; crate::utxo::RECORD_LEN] = take(bytes, &mut offset, crate::utxo::RECORD_LEN)?.try_into().unwrap();
+            replaced.push((commitment, record));
+        }
+
+        if offset != bytes.len() {
+            return Err(Error::Corrupt("undo data had trailing bytes"));
+        }
+
+        Ok(UndoData {
+            prev_tip_header,
+            prev_current_target,
+            prev_anchor_timestamp,
+            spent_inputs,
+            replaced,
+        })
+    }
+}
+
+/// Where a candidate chain diverges from the active one -- what
+/// `find_fork_point` returns, and everything `accept_block`'s reorg
+/// path needs to actually carry one out.
+struct ForkPoint {
+    /// How many times `unwind_tip` must be called to bring the active
+    /// chain back to the common ancestor.
+    unwind_count: u64,
+    /// The candidate chain's own blocks, strictly after the common
+    /// ancestor, in apply order (oldest first) -- what gets replayed
+    /// through `apply_block_in_txn` once the active chain has been
+    /// unwound that far.
+    replay: Vec<Block>,
+}
+
+/// What `accept_block` actually did with a block -- distinct outcomes
+/// rather than just success/failure, since "accepted, but not applied
+/// yet" is a perfectly normal, expected result, not an error.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AcceptOutcome {
+    /// Extended the active chain directly.
+    Applied,
+    /// Stored as a side branch -- its chain doesn't (yet) have more
+    /// work than the active one.
+    StoredAsSideBranch,
+    /// Stored as a side branch whose chain turned out to have more
+    /// work than the active one, so a reorg happened: `unwound` blocks
+    /// were rolled back off the active chain, `applied` blocks from
+    /// the winning branch were replayed forward, atomically (see
+    /// `accept_block`'s docs).
+    Reorged { unwound: u64, applied: u64 },
+    /// This block's parent isn't known at all -- held in the orphan
+    /// pool, pending that parent (or an ancestor of it) arriving. See
+    /// `Chain::try_connect_orphans`.
+    Orphaned,
+    /// Already stored (active chain or side branch), or already
+    /// waiting in the orphan pool -- nothing was done.
+    AlreadyKnown,
+}
+
+/// Read-only access to stored blocks and the active chain, separate from
+/// `Chain` -- so another thread (the network's) can serve blocks to peers
+/// and see where the tip is, while `Chain` itself stays owned by whoever
+/// applies blocks. Cheap to clone. Sees exactly what's committed.
+#[derive(Clone)]
+pub struct BlockReader {
+    storage: Storage,
+    meta: Database<Bytes, Bytes>,
+    blocks: Database<Bytes, Bytes>,
+    active_heights: Database<Bytes, Bytes>,
+}
+
+impl BlockReader {
+    pub fn open(storage: &Storage) -> Result<Self> {
+        Ok(BlockReader {
+            storage: storage.clone(),
+            meta: storage.database("chain_meta")?,
+            blocks: storage.database(BLOCKS_DB)?,
+            active_heights: storage.database(ACTIVE_HEIGHTS_DB)?,
+        })
+    }
+
+    /// A stored block's encoding (`Block::to_bytes`), active chain or
+    /// side branch.
+    pub fn block_bytes(&self, hash: [u8; 32]) -> Result<Option<Vec<u8>>> {
+        let rtxn = self.storage.read_txn()?;
+        Ok(self.blocks.get(&rtxn, &hash)?.map(|bytes| bytes.to_vec()))
+    }
+
+    /// `len` bytes of a stored block's encoding starting at `start`
+    /// (fewer if it ends first), plus the encoding's total size -- one
+    /// chunk's worth, without copying out the whole (up to megabytes)
+    /// block. `None` if the block isn't stored or `start` is past its end.
+    pub fn block_range(&self, hash: [u8; 32], start: usize, len: usize) -> Result<Option<(usize, Vec<u8>)>> {
+        let rtxn = self.storage.read_txn()?;
+        let Some(bytes) = self.blocks.get(&rtxn, &hash)? else {
+            return Ok(None);
+        };
+        if start >= bytes.len() {
+            return Ok(None);
+        }
+        let end = start.saturating_add(len).min(bytes.len());
+        Ok(Some((bytes.len(), bytes[start..end].to_vec())))
+    }
+
+    pub fn has_block(&self, hash: [u8; 32]) -> Result<bool> {
+        let rtxn = self.storage.read_txn()?;
+        Ok(self.blocks.get(&rtxn, &hash)?.is_some())
+    }
+
+    /// The active chain's block hash at `height`, if it's that tall.
+    pub fn active_hash_at(&self, height: u64) -> Result<Option<[u8; 32]>> {
+        let rtxn = self.storage.read_txn()?;
+        match self.active_heights.get(&rtxn, &height.to_be_bytes())? {
+            Some(bytes) => Ok(Some(
+                bytes.try_into().map_err(|_| Error::Corrupt("active height entry was not 32 bytes"))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// The active tip's `(height, hash)`, or `None` for an empty chain.
+    pub fn tip(&self) -> Result<Option<(u64, [u8; 32])>> {
+        let rtxn = self.storage.read_txn()?;
+        match self.meta.get(&rtxn, TIP_HEADER_KEY)? {
+            Some(bytes) => {
+                let header = BlockHeader::from_bytes(bytes).map_err(|_| Error::Corrupt("tip header was corrupt"))?;
+                Ok(Some((header.height, header.hash())))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
+/// Whether `outcome` means the block is now stored -- on the active
+/// chain or a side branch -- so anything waiting on it can connect too.
+fn is_connected(outcome: &AcceptOutcome) -> bool {
+    matches!(
+        outcome,
+        AcceptOutcome::Applied | AcceptOutcome::StoredAsSideBranch | AcceptOutcome::Reorged { .. }
+    )
+}
+
+/// A full node's chain state: the real `StateTree` and `UtxoIndex`,
+/// plus the metadata none of those three know about on their own -- which
+/// header is the current tip, and at what height.
+/// The active chain at one moment, for the wallet (`Chain::view`).
+pub struct ChainState<'a> {
+    chain: &'a Chain,
+    txn: heed::RoTxn<'a>,
+}
+
+/// An output the active chain created: where, and its recovery nonce.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OutputRecord {
+    pub commitment: [u8; 32],
+    pub height: u64,
+    pub nonce: [u8; NONCE_LEN],
+}
+
+impl OutputRecord {
+    fn decode(commitment: [u8; 32], bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != crate::utxo::RECORD_LEN {
+            return Err(Error::Corrupt("output index entry was the wrong size"));
+        }
+        Ok(OutputRecord {
+            commitment,
+            height: u64::from_be_bytes(bytes[..8].try_into().unwrap()),
+            nonce: bytes[8..8 + NONCE_LEN].try_into().unwrap(),
+        })
+    }
+}
+
+impl crate::wallet::ChainView for ChainState<'_> {
+    fn tip_height(&self) -> u64 {
+        self.chain.height(&self.txn).ok().flatten().unwrap_or(0)
+    }
+
+    fn is_unspent(&self, commitment: &[u8; 32]) -> bool {
+        self.chain.is_unspent(&self.txn, commitment).unwrap_or(false)
+    }
+
+    fn output_record(&self, commitment: &[u8; 32]) -> Option<(u64, [u8; NONCE_LEN])> {
+        let record = self.chain.output_record(&self.txn, commitment).ok()??;
+        Some((record.height, record.nonce))
+    }
+
+    fn for_each_output(&self, f: &mut dyn FnMut([u8; 32], u64, [u8; NONCE_LEN], bool)) -> bool {
+        self.chain
+            .for_each_output(&self.txn, |r, unspent| f(r.commitment, r.height, r.nonce, unspent))
+            .is_ok()
+    }
+
+    fn has_full_history(&self) -> bool {
+        matches!(self.chain.sync_base(&self.txn), Ok(None))
+    }
+}
+
+/// Read-only access to what fast-syncing peers ask for -- the state as of
+/// a recent block, in pieces (`snapshot`), and the rest of what the chain
+/// proof of that block attests -- for the network's thread, like
+/// `BlockReader`. Serves any active-chain block from the reorg floor up:
+/// the state then is the current tree with every later block undone
+/// (their undo data says what they spent), computed on the fly, not
+/// stored.
+#[derive(Clone)]
+pub struct StateReader {
+    storage: Storage,
+    state: std::sync::Arc<StateTree>,
+    meta: Database<Bytes, Bytes>,
+    blocks: Database<Bytes, Bytes>,
+    block_undo: Database<Bytes, Bytes>,
+    block_work: Database<Bytes, Bytes>,
+    block_retarget: Database<Bytes, Bytes>,
+    active_heights: Database<Bytes, Bytes>,
+    output_index: Database<Bytes, Bytes>,
+    /// The last view computed: for which block, at which tip.
+    cache: std::sync::Arc<std::sync::Mutex<Option<CachedView>>>,
+}
+
+/// A state view (`StateReader::as_of`): the block it's as of, the tip it
+/// was computed at, and the view.
+type CachedView = ([u8; 32], [u8; 32], std::sync::Arc<crate::state_tree::AsOf>);
+
+impl StateReader {
+    pub fn open(storage: &Storage) -> Result<Self> {
+        Ok(StateReader {
+            storage: storage.clone(),
+            state: std::sync::Arc::new(StateTree::open(storage)?),
+            meta: storage.database("chain_meta")?,
+            blocks: storage.database(BLOCKS_DB)?,
+            block_undo: storage.database(BLOCK_UNDO_DB)?,
+            block_work: storage.database(BLOCK_WORK_DB)?,
+            block_retarget: storage.database(BLOCK_RETARGET_DB)?,
+            active_heights: storage.database(ACTIVE_HEIGHTS_DB)?,
+            output_index: storage.database(OUTPUT_INDEX_DB)?,
+            cache: Default::default(),
+        })
+    }
+
+    fn header(&self, txn: &heed::RoTxn, hash: [u8; 32]) -> Result<Option<BlockHeader>> {
+        match self.blocks.get(txn, &hash)? {
+            Some(bytes) => Ok(Some(
+                BlockHeader::from_bytes(&bytes[..HEADER_LEN.min(bytes.len())]).map_err(|_| Error::Corrupt("a stored block was corrupt"))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// The active tip's header, and `hash`'s if it's on the active chain.
+    fn active(&self, txn: &heed::RoTxn, hash: [u8; 32]) -> Result<Option<(BlockHeader, BlockHeader)>> {
+        let Some(header) = self.header(txn, hash)? else {
+            return Ok(None);
+        };
+        if self.active_heights.get(txn, &header.height.to_be_bytes())? != Some(&hash[..]) {
+            return Ok(None);
+        }
+        let tip = match self.meta.get(txn, TIP_HEADER_KEY)? {
+            Some(bytes) => BlockHeader::from_bytes(bytes).map_err(|_| Error::Corrupt("stored tip header was corrupt"))?,
+            None => return Ok(None),
+        };
+        Ok(Some((tip, header)))
+    }
+
+    /// What the chain proof of active-chain block `hash` attests besides
+    /// its header, if this node still has it.
+    pub fn sync_point(&self, hash: [u8; 32]) -> Result<Option<crate::snapshot::SyncPoint>> {
+        let rtxn = self.storage.read_txn()?;
+        if self.active(&rtxn, hash)?.is_none() {
+            return Ok(None);
+        }
+        let (Some(work), Some(retarget)) = (self.block_work.get(&rtxn, &hash)?, self.block_retarget.get(&rtxn, &hash)?) else {
+            return Ok(None);
+        };
+        let retarget = RetargetState::from_bytes(retarget)?;
+        Ok(Some(crate::snapshot::SyncPoint {
+            target: retarget.target,
+            anchor_timestamp: retarget.anchor_timestamp,
+            work: work.try_into().map_err(|_| Error::Corrupt("stored chain work was not 32 bytes"))?,
+        }))
+    }
+
+    /// The state as of active-chain block `hash`, from the current tree:
+    /// `None` if it's not on the active chain, or too old to undo to.
+    fn as_of(&self, txn: &heed::RoTxn, hash: [u8; 32]) -> Result<Option<std::sync::Arc<crate::state_tree::AsOf>>> {
+        let Some((tip, header)) = self.active(txn, hash)? else {
+            return Ok(None);
+        };
+        let tip_hash = tip.hash();
+        if let Some((at, cached_tip, as_of)) = &*self.cache.lock().unwrap()
+            && *at == hash
+            && *cached_tip == tip_hash
+        {
+            return Ok(Some(as_of.clone()));
+        }
+        let mut as_of = crate::state_tree::AsOf {
+            count: header.output_count,
+            ..Default::default()
+        };
+        for height in header.height + 1..=tip.height {
+            let Some(block) = self.active_heights.get(txn, &height.to_be_bytes())? else {
+                return Ok(None);
+            };
+            let Some(undo) = self.block_undo.get(txn, block)? else {
+                return Ok(None);
+            };
+            for input in UndoData::from_bytes(undo)?.spent_inputs {
+                if input.position < as_of.count {
+                    // the record as it was spent, not the commitment's
+                    // current one (a later block may have re-created it)
+                    as_of.restored.insert(input.position, (input.commitment, input.nonce, leaf_height(input.height)?));
+                }
+            }
+        }
+        let as_of = std::sync::Arc::new(as_of);
+        *self.cache.lock().unwrap() = Some((hash, tip_hash, as_of.clone()));
+        Ok(Some(as_of))
+    }
+
+    /// Piece `(level, index)` of the state as of active-chain block `hash`
+    /// (`snapshot`), if this node can serve it.
+    pub fn piece(&self, hash: [u8; 32], level: usize, index: u64) -> Result<Option<Vec<u8>>> {
+        use crate::snapshot::{LEAF_LEVEL, child_level};
+        if !crate::snapshot::is_piece(level, index) {
+            return Ok(None);
+        }
+        let rtxn = self.storage.read_txn()?;
+        let Some(as_of) = self.as_of(&rtxn, hash)? else {
+            return Ok(None);
+        };
+        if level == LEAF_LEVEL {
+            let entries = self.state.unspent_as_of(&rtxn, &as_of, index << level, (index + 1) << level)?;
+            return Ok(Some(crate::snapshot::encode_leaves(index, &entries)));
+        }
+        let below = child_level(level);
+        let children = (0..1u64 << (level - below))
+            .map(|j| self.state.node_as_of(&rtxn, &as_of, below, (index << (level - below)) + j))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(Some(crate::snapshot::encode_inner(&children)))
+    }
+}
+
+pub struct Chain {
+    storage: Storage,
+    /// Every output ever created, by position: commitment while unspent,
+    /// then spent (`state_tree`).
+    state: StateTree,
+    utxo: UtxoIndex,
+    meta: Database<Bytes, Bytes>,
+    blocks: Database<Bytes, Bytes>,
+    block_undo: Database<Bytes, Bytes>,
+    block_work: Database<Bytes, Bytes>,
+    invalid_blocks: Database<Bytes, Bytes>,
+    block_retarget: Database<Bytes, Bytes>,
+    block_heights: Database<Bytes, Bytes>,
+    active_heights: Database<Bytes, Bytes>,
+    output_index: Database<Bytes, Bytes>,
+    /// The one block allowed to have no parent, if this chain has a
+    /// fixed one -- see `Chain::open`.
+    genesis_hash: Option<[u8; 32]>,
+    /// When set, every block after the first must carry its parent's chain
+    /// proof (`chain_step`), checked against the parent as this chain
+    /// records it. Set by nodes (`require_chain_proofs`); off for tests
+    /// about other things.
+    chain_proofs: Option<crate::chain_step::ChainVerifier>,
+    /// Whether blocks' proofs are verified -- always, except in tests that
+    /// opt out (`skip_proof_checks`) because they're about something else.
+    check_proofs: bool,
+    difficulty: DifficultyConfig,
+    /// How many blocks a reorg is ever allowed to unwind -- see
+    /// `Chain::open`'s docs. Also how far back stored blocks are kept
+    /// at all; see `prune`.
+    max_reorg_depth: u64,
+    /// Blocks whose parent isn't known at all yet, each with its own
+    /// header hash, oldest first -- purely in-memory, not persisted.
+    /// This is inherently about a transient "still waiting on the
+    /// network" state; if this process restarts, there's nothing to
+    /// resume, the orphan would just arrive again (or get re-requested)
+    /// the same way it did the first time. A plain `Vec` rather than a
+    /// map keyed by parent: it never holds more than `max_orphans`
+    /// entries, so a linear scan is cheap, and arrival order is exactly
+    /// what eviction needs.
+    orphans: Vec<([u8; 32], Block)>,
+    /// `MAX_ORPHANS`, as a field only so tests can shrink it.
+    max_orphans: usize,
+}
+
+impl Chain {
+    /// Open (creating if absent) a chain's full state within the given
+    /// storage context, retargeting according to `difficulty` (see
+    /// `DifficultyConfig`'s docs -- in particular, why the right
+    /// values for a test and for an actual run are never the same
+    /// numbers). `max_reorg_depth` is the deepest a reorg is ever
+    /// allowed to unwind, in blocks -- deeper competing chains are
+    /// refused outright (`Error::ReorgTooDeep`) rather than attempted
+    /// (see `docs/BLOCK_TODO.md` on why: resolving a deeper divergence
+    /// correctly needs a resync-from-genesis fallback this crate
+    /// doesn't have yet). Like `difficulty`, the right value for a
+    /// test (small, so the "too deep" path is actually exercisable
+    /// without mining hundreds of blocks) and for an actual run
+    /// (1000, say) are never the same number.
+    ///
+    /// `genesis`, if given, is this chain's fixed first block: applied
+    /// right away if the chain is empty, and from then on the only block
+    /// ever accepted at height 0 (`Error::WrongGenesis` for any other) --
+    /// so every node on a network starts from the same block, and can't
+    /// be fed a wholly different chain. Stored data whose first block
+    /// isn't `genesis` (left over from a different network, say) fails
+    /// to open with `Error::WrongGenesis`. `None` means no fixed first
+    /// block -- for tests, which build their own chains from scratch.
+    pub fn open(
+        storage: &Storage,
+        difficulty: DifficultyConfig,
+        max_reorg_depth: u64,
+        genesis: Option<&Block>,
+    ) -> Result<Self> {
+        let state = StateTree::open(storage)?;
+        let utxo = UtxoIndex::open(storage)?;
+        let meta = storage.database("chain_meta")?;
+        let blocks = storage.database(BLOCKS_DB)?;
+        let block_undo = storage.database(BLOCK_UNDO_DB)?;
+        let block_work = storage.database(BLOCK_WORK_DB)?;
+        let invalid_blocks = storage.database(INVALID_BLOCKS_DB)?;
+        let block_retarget = storage.database(BLOCK_RETARGET_DB)?;
+        let block_heights = storage.database(BLOCK_HEIGHTS_DB)?;
+        let active_heights = storage.database(ACTIVE_HEIGHTS_DB)?;
+        let output_index = storage.database(OUTPUT_INDEX_DB)?;
+        let mut chain = Chain {
+            storage: storage.clone(),
+            state,
+            utxo,
+            meta,
+            blocks,
+            block_undo,
+            block_work,
+            invalid_blocks,
+            block_retarget,
+            block_heights,
+            active_heights,
+            output_index,
+            genesis_hash: genesis.map(|g| g.header.hash()),
+            chain_proofs: None,
+            check_proofs: true,
+            difficulty,
+            max_reorg_depth,
+            orphans: Vec::new(),
+            max_orphans: MAX_ORPHANS,
+        };
+
+        {
+            let mut wtxn = storage.write_txn()?;
+            match chain.meta.get(&wtxn, STORAGE_VERSION_KEY)? {
+                Some(v) if v == STORAGE_VERSION.to_be_bytes() => {}
+                Some(_) => return Err(Error::OldStorage),
+                None if chain.meta.get(&wtxn, TIP_HEADER_KEY)?.is_some() => return Err(Error::OldStorage),
+                None => {
+                    chain.meta.put(&mut wtxn, STORAGE_VERSION_KEY, &STORAGE_VERSION.to_be_bytes())?;
+                    wtxn.commit()?;
+                }
+            }
+        }
+        if let Some(genesis) = genesis {
+            let rtxn = storage.read_txn()?;
+            let first = chain.active_heights.get(&rtxn, &0u64.to_be_bytes())?.map(|h| h.to_vec());
+            drop(rtxn);
+            match first {
+                None => chain.apply_block(genesis)?,
+                Some(hash) if hash[..] == genesis.header.hash()[..] => {}
+                Some(_) => return Err(Error::WrongGenesis),
+            }
+        }
+        Ok(chain)
+    }
+
+    /// Stop verifying blocks' proofs (block and chain proofs both) -- for
+    /// tests about forks, retargeting, or sync, whose blocks carry
+    /// placeholder proofs, since real ones take seconds each to make; and
+    /// for a node run with `--debug-disable-verification`, to time
+    /// everything else a block costs. Everything but the proofs is still
+    /// checked: proof of work, structure, the body hash, and the state the
+    /// body makes against the header's.
+    pub fn skip_proof_checks(&mut self) {
+        self.check_proofs = false;
+    }
+
+    /// `Block::validate`: every structural rule, then the proof -- unless
+    /// proofs are being skipped, or this is the chain's fixed genesis,
+    /// which is trusted by consensus (it's hardcoded) and couldn't prove
+    /// anything anyway: its empty body claims no reward.
+    fn block_is_valid(&self, txn: &heed::RoTxn, block: &Block, target: &[u8; 32]) -> Result<bool> {
+        if !block.validate_structure(target, &self.difficulty.pow) {
+            return Ok(false);
+        }
+        // Past the schedule's end, nothing is valid.
+        let Some(reward) = self.difficulty.schedule.reward(block.header.height) else {
+            return Ok(false);
+        };
+        let is_genesis = self.genesis_hash == Some(block.header.hash());
+        if !self.check_proofs || is_genesis {
+            return Ok(true);
+        }
+        let parent = self.parent_state(txn, block.header.prev_hash)?;
+        let Ok(height) = leaf_height(block.header.height) else {
+            return Ok(false);
+        };
+        if !block.body.proof_is_valid(&block.state_change(parent), height, reward) {
+            return Ok(false);
+        }
+        // The parent's chain proof: that the parent is the tip of a valid
+        // chain, as this chain records it.
+        if let Some(verifier) = &self.chain_proofs
+            && block.header.prev_hash != GENESIS_PARENT_HASH
+        {
+            let parent_tip = self.chain_tip(txn, block.header.prev_hash)?;
+            return Ok(verifier.verify(&parent_tip, &block.body.chain_proof));
+        }
+        Ok(true)
+    }
+
+    /// The `(state_root, output_count)` after the block `prev_hash` --
+    /// the state a block extending it starts from.
+    fn parent_state(&self, txn: &heed::RoTxn, prev_hash: [u8; 32]) -> Result<([u8; 32], u64)> {
+        if prev_hash == GENESIS_PARENT_HASH {
+            return Ok((crate::state_tree::empty_root(), 0));
+        }
+        let bytes = self.blocks.get(txn, &prev_hash)?.ok_or(Error::Corrupt("a parent block is not stored"))?;
+        let header = BlockHeader::from_bytes(&bytes[..HEADER_LEN.min(bytes.len())]).map_err(|_| Error::Corrupt("a stored block was corrupt"))?;
+        Ok((header.state_root, header.output_count))
+    }
+
+    /// `Error::WrongGenesis` if `header` claims to be a first block but
+    /// isn't this chain's fixed genesis (when it has one).
+    fn check_genesis(&self, header: &BlockHeader) -> Result<()> {
+        match self.genesis_hash {
+            Some(genesis) if header.prev_hash == GENESIS_PARENT_HASH && header.hash() != genesis => {
+                Err(Error::WrongGenesis)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// The tip's full header, or `None` if no block has ever been
+    /// applied. Everything else this type reports about the tip
+    /// (`tip_hash`, `height`) is derived from this one stored value --
+    /// see `TIP_HEADER_KEY`'s docs.
+    fn tip_header(&self, txn: &heed::RoTxn) -> Result<Option<BlockHeader>> {
+        match self.meta.get(txn, TIP_HEADER_KEY)? {
+            Some(bytes) => {
+                let header = BlockHeader::from_bytes(bytes).map_err(|_| Error::Corrupt("stored tip header was corrupt"))?;
+                Ok(Some(header))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// A previously-accepted block, by hash -- active chain or side
+    /// branch, `BLOCKS_DB` doesn't distinguish. `Error::Corrupt` if
+    /// it's not there at all, which should only happen for a hash
+    /// nothing in this module ever actually stored.
+    fn get_stored_block(&self, txn: &heed::RoTxn, hash: [u8; 32]) -> Result<Block> {
+        let bytes = self.blocks.get(txn, &hash)?.ok_or(Error::Corrupt("referenced block is not stored"))?;
+        Block::from_bytes(bytes).map_err(|_| Error::Corrupt("stored block was corrupt"))
+    }
+
+    fn is_known_invalid(&self, txn: &heed::RoTxn, hash: [u8; 32]) -> Result<bool> {
+        Ok(self.invalid_blocks.get(txn, &hash)?.is_some())
+    }
+
+    /// Record every block in `blocks` as invalid, in its own committed
+    /// transaction -- the reorg transaction that discovered the fault
+    /// has already been aborted by the time this runs.
+    fn mark_invalid(&mut self, blocks: &[Block]) -> Result<()> {
+        let storage = self.storage.clone();
+        let mut wtxn = storage.write_txn()?;
+        for block in blocks {
+            self.invalid_blocks.put(&mut wtxn, &block.header.hash(), &[])?;
+        }
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Cumulative work up to and including `hash` -- `[0; 32]` for
+    /// `GENESIS_PARENT_HASH` (the "chain" before any real block
+    /// exists has no work at all), otherwise whatever was snapshotted
+    /// for that block when it was accepted (`BLOCK_WORK_DB`).
+    /// `Error::Corrupt` for any other hash with no stored work, which
+    /// should only happen for one this module never actually accepted.
+    fn chain_work(&self, txn: &heed::RoTxn, hash: [u8; 32]) -> Result<[u8; 32]> {
+        if hash == GENESIS_PARENT_HASH {
+            return Ok([0u8; 32]);
+        }
+        let bytes = self.block_work.get(txn, &hash)?.ok_or(Error::Corrupt("no stored chain work for this block"))?;
+        bytes.try_into().map_err(|_| Error::Corrupt("stored chain work was not 32 bytes"))
+    }
+
+    /// What a chain proof of block `hash` attests besides its header: the
+    /// `(target, window start)` in effect after it, and the cumulative
+    /// work up to it.
+    pub(crate) fn proof_state(&self, hash: [u8; 32]) -> Result<([u8; 32], u64, [u8; 32])> {
+        let rtxn = self.storage.read_txn()?;
+        self.proof_state_in(&rtxn, hash)
+    }
+
+    fn proof_state_in(&self, txn: &heed::RoTxn, hash: [u8; 32]) -> Result<([u8; 32], u64, [u8; 32])> {
+        let retarget = self.retarget_state_after(txn, hash)?;
+        Ok((retarget.target, retarget.anchor_timestamp, self.chain_work(txn, hash)?))
+    }
+
+    /// The tip a chain proof of block `hash` attests: its header, and what
+    /// this chain records after it.
+    fn chain_tip(&self, txn: &heed::RoTxn, hash: [u8; 32]) -> Result<crate::chain_step::Tip> {
+        let header = self.get_stored_block(txn, hash)?.header;
+        Ok(crate::chain_step::Tip::new(&header, self.proof_state_in(txn, hash)?))
+    }
+
+    /// Require every block after the first to carry its parent's chain
+    /// proof, checked by `verifier`.
+    pub fn require_chain_proofs(&mut self, verifier: crate::chain_step::ChainVerifier) {
+        self.chain_proofs = Some(verifier);
+    }
+
+    /// Everything needed to prove block `hash`'s chain proof -- which the
+    /// next block on it carries -- from this chain's records.
+    pub fn chain_proof_inputs(&self, hash: [u8; 32]) -> Result<crate::chain_step::ChainProofInputs> {
+        let rtxn = self.storage.read_txn()?;
+        let block = self.get_stored_block(&rtxn, hash)?;
+        let tip = crate::chain_step::Tip::new(&block.header, self.proof_state_in(&rtxn, hash)?);
+        let inputs = if block.header.prev_hash == GENESIS_PARENT_HASH {
+            None
+        } else {
+            let parent_tip = self.chain_tip(&rtxn, block.header.prev_hash)?;
+            let state = block.state_change((parent_tip.state_root, parent_tip.output_count));
+            Some(crate::chain_step::BlockInputs {
+                inputs: block.body.inputs.clone(),
+                outputs: block.body.outputs.clone(),
+                nonces: block.body.nonces.clone(),
+                proof: block.body.proof.clone(),
+                state,
+                parent_tip,
+                parent_chain_proof: block.body.chain_proof.clone(),
+            })
+        };
+        Ok(crate::chain_step::ChainProofInputs {
+            header: block.header,
+            tip,
+            block: inputs,
+        })
+    }
+
+    /// The `RetargetState` right after `hash` -- the initial state for
+    /// `GENESIS_PARENT_HASH`, otherwise whatever was recorded for that
+    /// block when it was accepted (`BLOCK_RETARGET_DB`).
+    fn retarget_state_after(&self, txn: &heed::RoTxn, hash: [u8; 32]) -> Result<RetargetState> {
+        if hash == GENESIS_PARENT_HASH {
+            return Ok(RetargetState {
+                target: self.difficulty.initial_target,
+                anchor_timestamp: 0,
+            });
+        }
+        let bytes = self
+            .block_retarget
+            .get(txn, &hash)?
+            .ok_or(Error::Corrupt("no stored retarget state for this block"))?;
+        RetargetState::from_bytes(bytes)
+    }
+
+    /// Record `block` in every per-block store -- the block itself, its
+    /// cumulative work, the retargeting state after it, and the height
+    /// index -- active chain or side branch alike.
+    fn store_block_records(
+        &self,
+        wtxn: &mut heed::RwTxn,
+        block: &Block,
+        work: [u8; 32],
+        retarget: RetargetState,
+    ) -> Result<()> {
+        let hash = block.header.hash();
+        self.blocks.put(wtxn, &hash, &block.to_bytes())?;
+        self.block_work.put(wtxn, &hash, &work)?;
+        self.block_retarget.put(wtxn, &hash, &retarget.to_bytes())?;
+        self.block_heights.put(wtxn, &height_key(block.header.height, hash), &[])?;
+        Ok(())
+    }
+
+    /// The height at or below which no block can matter any more: a
+    /// block at this height or lower could only ever be part of a
+    /// branch forking off the active chain further back than
+    /// `max_reorg_depth` allows. `None` while the active chain is still
+    /// shallower than that (every height, back to genesis, is fair game).
+    /// The single number `accept_block`'s early rejection,
+    /// `find_fork_point`'s search bound, and `prune`'s cutoff all share.
+    fn reorg_floor(&self, txn: &heed::RoTxn) -> Result<Option<u64>> {
+        let by_depth = self
+            .height(txn)?
+            .and_then(|tip_height| tip_height.checked_sub(self.max_reorg_depth));
+        Ok(match (by_depth, self.sync_base(txn)?) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        })
+    }
+
+    /// The proof-of-work parameters this chain checks (and is mined at).
+    pub fn pow_params(&self) -> crate::pow::Params {
+        self.difficulty.pow
+    }
+
+    /// The height a fast sync started this chain at, if one did.
+    fn sync_base(&self, txn: &heed::RoTxn) -> Result<Option<u64>> {
+        match self.meta.get(txn, SYNC_BASE_KEY)? {
+            Some(b) => Ok(Some(u64::from_be_bytes(b.try_into().map_err(|_| Error::Corrupt("sync base was not 8 bytes"))?))),
+            None => Ok(None),
+        }
+    }
+
+    /// Start this chain, holding nothing yet but (possibly) its genesis,
+    /// at block `base` -- a fast sync (`snapshot`): `point` is what the
+    /// chain proof of `base` (`chain_proof`, from the block after it)
+    /// attests along with its header, and `unspent` the state tree's
+    /// unspent outputs then (positions in order). Checked: the chain
+    /// proof (when this chain requires them), the body against the
+    /// header, and the snapshot against the header's state root and
+    /// count, with no two unspent outputs alike. Blocks before `base`
+    /// aren't stored, so nothing reorgs below it, and outputs spent
+    /// before it are unknown (`has_full_history`). Imported outputs are
+    /// recorded at `base`'s height: their real heights are older, which
+    /// only matters for the coinbase maturity of outputs younger than
+    /// that, and syncing far enough back leaves none.
+    /// Whether `chain_proof` (from the block after `base`) attests `base`
+    /// with `point` -- a fast sync's sync point, checked before its state
+    /// is downloaded. Only the body's hash is checked when this chain
+    /// doesn't require chain proofs.
+    pub fn check_sync_point(&self, base: &Block, point: &crate::snapshot::SyncPoint, chain_proof: &[u8]) -> Result<()> {
+        let header = &base.header;
+        if header.height == 0 || base.body.body_hash() != header.body_hash {
+            return Err(Error::Snapshot("not a valid base block"));
+        }
+        if let Some(verifier) = &self.chain_proofs {
+            let tip = crate::chain_step::Tip::new(header, (point.target, point.anchor_timestamp, point.work));
+            if !verifier.verify(&tip, chain_proof) {
+                return Err(Error::Snapshot("the chain proof doesn't attest this block"));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn import_snapshot(&mut self, base: &Block, point: &crate::snapshot::SyncPoint, chain_proof: &[u8], unspent: &[crate::state_tree::Entry]) -> Result<()> {
+        let storage = self.storage.clone();
+        let mut wtxn = storage.write_txn()?;
+        if self.height(&wtxn)?.unwrap_or(0) != 0 || self.state.count(&wtxn)? != 0 {
+            return Err(Error::Snapshot("this chain isn't empty"));
+        }
+        self.check_sync_point(base, point, chain_proof)?;
+        let header = &base.header;
+        let root = self.state.import(&mut wtxn, header.output_count, unspent).map_err(|_| Error::Snapshot("malformed unspent set"))?;
+        if root != header.state_root {
+            return Err(Error::StateRootMismatch);
+        }
+        // In commitment order, so the records' pages fill.
+        let mut by_commitment: Vec<&crate::state_tree::Entry> = unspent.iter().collect();
+        by_commitment.sort_unstable_by_key(|e| e.1);
+        for pair in by_commitment.windows(2) {
+            if pair[0].1 == pair[1].1 {
+                return Err(Error::DuplicateOutput(pair[0].1));
+            }
+        }
+        for (position, commitment, nonce, height) in by_commitment {
+            self.utxo.create(&mut wtxn, *commitment, *position, *height as u64, nonce)?;
+        }
+        self.meta.put(&mut wtxn, TIP_HEADER_KEY, &header.to_bytes())?;
+        self.meta.put(&mut wtxn, CURRENT_TARGET_KEY, &point.target)?;
+        self.meta.put(&mut wtxn, ANCHOR_TIMESTAMP_KEY, &point.anchor_timestamp.to_be_bytes())?;
+        self.meta.put(&mut wtxn, SYNC_BASE_KEY, &header.height.to_be_bytes())?;
+        let retarget = RetargetState {
+            target: point.target,
+            anchor_timestamp: point.anchor_timestamp,
+        };
+        self.store_block_records(&mut wtxn, base, point.work, retarget)?;
+        self.active_heights.put(&mut wtxn, &header.height.to_be_bytes(), &header.hash())?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// For every block strictly below `reorg_floor`, drop what only a
+    /// reorg could ever need -- undo data, work, retarget state, invalid
+    /// marker, height index entry -- and, for side-branch blocks, the
+    /// block itself. Nothing below that height can ever be unwound to,
+    /// replayed, or extended by an acceptable block again. Active-chain
+    /// blocks themselves are kept forever: they're what a new node
+    /// syncing from genesis has to download from someone, and until
+    /// state-snapshot sync exists, that someone is every node. The floor
+    /// block keeps everything: a side branch forking right at it still
+    /// needs its work and retarget state.
+    fn prune(&self, wtxn: &mut heed::RwTxn) -> Result<()> {
+        let Some(floor) = self.reorg_floor(wtxn)? else {
+            return Ok(());
+        };
+        let end = floor.to_be_bytes();
+        let mut doomed = Vec::new();
+        // A `(Bound, Bound)` pair rather than `..&end[..]`: `Bytes`' key
+        // type is the unsized `[u8]`, which only the tuple form of
+        // `RangeBounds` accepts.
+        let below_floor = (std::ops::Bound::Unbounded, std::ops::Bound::Excluded(&end[..]));
+        for entry in self.block_heights.range(wtxn, &below_floor)? {
+            let (key, _) = entry?;
+            doomed.push(key.to_vec());
+        }
+        for key in doomed {
+            let hash: [u8; 32] = key[8..].try_into().map_err(|_| Error::Corrupt("height index key was not 40 bytes"))?;
+            let active = self.active_heights.get(wtxn, &key[..8])? == Some(&hash[..]);
+            if !active {
+                self.blocks.delete(wtxn, &hash)?;
+            }
+            self.block_undo.delete(wtxn, &hash)?;
+            self.block_work.delete(wtxn, &hash)?;
+            self.block_retarget.delete(wtxn, &hash)?;
+            self.invalid_blocks.delete(wtxn, &hash)?;
+            self.block_heights.delete(wtxn, &key)?;
+        }
+        Ok(())
+    }
+
+    /// The least proof of work an orphan must show to be pooled: the
+    /// active chain's current target, made easier by
+    /// `ORPHAN_TARGET_RELAX`. An orphan's real target can't be known
+    /// without its parent, so this is a heuristic, not consensus -- it
+    /// only has to make junk orphans expensive (each costs a real
+    /// fraction of a block's work, rather than nothing) without turning
+    /// away legitimate ones: a few blocks on, the target has moved by a
+    /// small fraction of a half-life's factor of two. Rejecting a
+    /// legitimate orphan is cheap anyway: it just gets accepted
+    /// normally once its parent arrives and it's sent again.
+    fn orphan_target(&self, txn: &heed::RoTxn) -> Result<[u8; 32]> {
+        let current = self.current_target(txn)?;
+        Ok(pow::scale(current, ORPHAN_TARGET_RELAX, 1))
+    }
+
+    /// The current tip's header hash, or `GENESIS_PARENT_HASH` if no
+    /// block has ever been applied.
+    pub fn tip_hash(&self, txn: &heed::RoTxn) -> Result<[u8; 32]> {
+        Ok(self.tip_header(txn)?.map(|h| h.hash()).unwrap_or(GENESIS_PARENT_HASH))
+    }
+
+    /// The current tip's height, or `None` if no block has ever been
+    /// applied (there is no height to report yet).
+    pub fn height(&self, txn: &heed::RoTxn) -> Result<Option<u64>> {
+        Ok(self.tip_header(txn)?.map(|h| h.height))
+    }
+
+    /// Whether `commitment` is an unspent output of the active chain.
+    pub fn is_unspent(&self, txn: &heed::RoTxn, commitment: &[u8; 32]) -> Result<bool> {
+        Ok(self.utxo.get(txn, *commitment)?.is_some())
+    }
+
+    /// The height and recovery nonce of an output the active chain
+    /// created (spent or not), if it did.
+    pub fn output_record(&self, txn: &heed::RoTxn, commitment: &[u8; 32]) -> Result<Option<OutputRecord>> {
+        match self.output_index.get(txn, commitment)? {
+            Some(bytes) => Ok(Some(OutputRecord::decode(*commitment, bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Call `f` with every output the active chain has created, spent or
+    /// not (in commitment order), and whether it's still unspent -- what
+    /// wallet recovery scans. One pass, one read transaction.
+    pub fn for_each_output(&self, txn: &heed::RoTxn, mut f: impl FnMut(&OutputRecord, bool)) -> Result<()> {
+        for item in self.output_index.iter(txn)? {
+            let (key, bytes) = item?;
+            let commitment: [u8; 32] = key.try_into().map_err(|_| Error::Corrupt("output index key was not 32 bytes"))?;
+            let record = OutputRecord::decode(commitment, bytes)?;
+            f(&record, self.is_unspent(txn, &commitment)?);
+        }
+        Ok(())
+    }
+
+    /// A read-only view of the active chain as it is now (see
+    /// `wallet::ChainView`).
+    pub fn view(&self) -> Result<ChainState<'_>> {
+        Ok(ChainState {
+            chain: self,
+            txn: self.storage.read_txn()?,
+        })
+    }
+
+    /// The `(prev_hash, height)` the next block must declare to extend
+    /// this chain's current tip -- `(GENESIS_PARENT_HASH, 0)` for an
+    /// empty chain.
+    fn next_prev_hash_and_height(&self, txn: &heed::RoTxn) -> Result<([u8; 32], u64)> {
+        match self.tip_header(txn)? {
+            Some(tip) => Ok((tip.hash(), tip.height + 1)),
+            None => Ok((GENESIS_PARENT_HASH, 0)),
+        }
+    }
+
+    /// The PoW target the next block must meet -- `self.difficulty.
+    /// initial_target` until the first retarget happens. See the
+    /// module docs on difficulty retargeting.
+    pub fn current_target(&self, txn: &heed::RoTxn) -> Result<[u8; 32]> {
+        match self.meta.get(txn, CURRENT_TARGET_KEY)? {
+            Some(bytes) => bytes
+                .try_into()
+                .map_err(|_| Error::Corrupt("current target was not 32 bytes")),
+            None => Ok(self.difficulty.initial_target),
+        }
+    }
+
+    fn anchor_timestamp(&self, txn: &heed::RoTxn) -> Result<u64> {
+        match self.meta.get(txn, ANCHOR_TIMESTAMP_KEY)? {
+            Some(bytes) => bytes
+                .try_into()
+                .map(u64::from_be_bytes)
+                .map_err(|_| Error::Corrupt("window start timestamp was not 8 bytes")),
+            None => Ok(0),
+        }
+    }
+
+    /// Advance the active chain's retargeting state past
+    /// `applied_header` (see `RetargetState::after` for the rule
+    /// itself), through `wtxn` -- called once a block has already
+    /// passed every other check in `apply_block`, right before it's
+    /// committed. Returns the new state, for `BLOCK_RETARGET_DB`.
+    fn retarget_if_due(&mut self, wtxn: &mut heed::RwTxn, applied_header: &BlockHeader) -> Result<RetargetState> {
+        let prev = RetargetState {
+            target: self.current_target(wtxn)?,
+            anchor_timestamp: self.anchor_timestamp(wtxn)?,
+        };
+        let next = prev.after(&self.difficulty, applied_header);
+        self.meta.put(wtxn, CURRENT_TARGET_KEY, &next.target)?;
+        self.meta
+            .put(wtxn, ANCHOR_TIMESTAMP_KEY, &next.anchor_timestamp.to_be_bytes())?;
+        Ok(next)
+    }
+
+    /// Resolve and apply `body`'s inputs and outputs against real chain
+    /// state, through `wtxn`: every input must resolve to a currently
+    /// live (unspent) output, which is then marked spent in the state
+    /// tree and removed from `utxo`; every output must not collide with
+    /// one still live, and is then appended to the state tree and recorded
+    /// in `utxo`. Returns the resulting `(state_root, output_count,
+    /// spent_inputs)` --
+    /// the third element is each input's `(commitment, position)`
+    /// *before* it was removed, which is exactly `UndoData` needs to
+    /// undo this later (see that type's docs); `build_block` just
+    /// discards it, since it never commits anything in the first
+    /// place. Nothing here is specific to a real header -- `apply_block`
+    /// checks the roots against one, `build_block` just wants them --
+    /// and nothing here commits `wtxn`; that's always the caller's job.
+    ///
+    /// Applied in body order: every input spent, then every output
+    /// appended -- so a block's outputs take the positions `count..count +
+    /// outputs` in the order the body lists them, however its proof groups
+    /// them. With `chunks` (each chunk's commitments, as indices into the
+    /// body's lists), also returns each chunk's state transition witness
+    /// for proving (`aggregate::ChunkTransition`): the chunks applied in
+    /// turn, in memory (`state_tree::Overlay`), each output at its own
+    /// position.
+    fn resolve_and_apply(&mut self, wtxn: &mut heed::RwTxn, body: &BlockBody, height: u64, chunks: Option<&ChunkIndices>) -> Result<ResolveResult> {
+        let height = leaf_height(height)?;
+        let transitions = match chunks {
+            Some(chunks) => self.chunk_transitions(wtxn, body, height, chunks)?,
+            None => Vec::new(),
+        };
+        // The state's records, then its tree once for the whole block
+        // (`StateTree::apply`).
+        let mut undone = Undone { spent_inputs: Vec::with_capacity(body.inputs.len()), replaced: Vec::new() };
+        for &commitment in &body.inputs {
+            let position = self
+                .utxo
+                .get(wtxn, commitment)?
+                .ok_or(Error::UnresolvedInput(commitment))?;
+            let record = self
+                .output_record(wtxn, &commitment)?
+                .ok_or(Error::Corrupt("an unspent output's record is missing"))?;
+            self.utxo.remove(wtxn, commitment)?;
+            undone.spent_inputs.push(SpentInput { commitment, position, height: record.height, nonce: record.nonce });
+        }
+        let base = self.state.count(wtxn)?;
+        let mut appended = Vec::with_capacity(body.outputs.len());
+        for (i, (commitment, nonce)) in body.outputs.iter().zip(&body.nonces).enumerate() {
+            if self.utxo.get(wtxn, *commitment)?.is_some() {
+                return Err(Error::DuplicateOutput(*commitment));
+            }
+            // a commitment created (and spent) before: keep its record for unwinding
+            if let Some(previous) = self.utxo.raw(wtxn, commitment)? {
+                undone.replaced.push((*commitment, previous));
+            }
+            self.utxo.create(wtxn, *commitment, base + i as u64, 0, &[0; NONCE_LEN])?;
+            appended.push((*commitment, *nonce, height));
+        }
+        let positions: Vec<u64> = undone.spent_inputs.iter().map(|i| i.position).collect();
+        self.state.apply(wtxn, &positions, &appended)?;
+        let root = self.state.root(wtxn)?;
+        if let Some(last) = transitions.last()
+            && crate::poseidon2::digest_to_bytes(last.change.root_out) != root
+        {
+            return Err(Error::Corrupt("a block's chunks don't reach the state its body does"));
+        }
+        Ok((root, self.state.count(wtxn)?, undone, transitions))
+    }
+
+    /// Each chunk's state transition (`resolve_and_apply`), before the
+    /// body is applied.
+    fn chunk_transitions(&self, wtxn: &heed::RwTxn, body: &BlockBody, height: u32, chunks: &ChunkIndices) -> Result<Vec<crate::aggregate::ChunkTransition>> {
+        use crate::aggregate::{ChunkTransition, StateChange};
+        use crate::prover::CHUNK_SHAPE;
+        let base = self.state.count(wtxn)?;
+        let end = base + body.outputs.len() as u64;
+        let mut overlay = crate::state_tree::Overlay::new(&self.state, wtxn);
+        let mut transitions = Vec::with_capacity(chunks.len());
+        let mut count = base;
+        let (mut seen_inputs, mut seen_outputs) = (0, 0);
+        for (ins, outs) in chunks {
+            if ins.len() > CHUNK_SHAPE.inputs || outs.len() > CHUNK_SHAPE.outputs {
+                return Err(Error::TransactionTooLarge);
+            }
+            (seen_inputs, seen_outputs) = (seen_inputs + ins.len(), seen_outputs + outs.len());
+            let (root_in, count_in) = (overlay.root()?, count);
+            let mut inputs = Vec::with_capacity(CHUNK_SHAPE.inputs);
+            for &i in ins {
+                let commitment = body.inputs[i];
+                let position = self.utxo.get(wtxn, commitment)?.ok_or(Error::UnresolvedInput(commitment))?;
+                let record = self
+                    .output_record(wtxn, &commitment)?
+                    .ok_or(Error::Corrupt("an unspent output's record is missing"))?;
+                inputs.push((position, record.nonce, leaf_height(record.height)?, overlay.path(position)?));
+                overlay.set(position, crate::state_tree::SPENT)?;
+            }
+            while inputs.len() < CHUNK_SHAPE.inputs {
+                inputs.push((end, [0; crate::recovery::NONCE_LEN], 0, overlay.path(end)?));
+            }
+            let mut outputs = Vec::with_capacity(CHUNK_SHAPE.outputs);
+            for &o in outs {
+                let position = base + o as u64;
+                outputs.push((position, overlay.path(position)?));
+                overlay.set(position, crate::state_tree::leaf(&body.outputs[o], &body.nonces[o], height))?;
+                count += 1;
+            }
+            while outputs.len() < CHUNK_SHAPE.outputs {
+                outputs.push((end, overlay.path(end)?));
+            }
+            transitions.push(ChunkTransition {
+                change: StateChange { root_in, count_in, root_out: overlay.root()?, count_out: count },
+                window: (base, end),
+                height,
+                inputs,
+                outputs,
+            });
+        }
+        if seen_inputs != body.inputs.len() || seen_outputs != body.outputs.len() {
+            return Err(Error::InvalidBlock);
+        }
+        Ok(transitions)
+    }
+
+    /// Apply `block` to the chain: resolve its inputs/outputs against
+    /// real state, update `state`/`utxo`, and advance the tip --
+    /// all in one LMDB write transaction, committed only once every check
+    /// passes. On any error, the transaction is simply never committed
+    /// (see the module docs on atomicity): every store is left exactly
+    /// as it was before this call.
+    ///
+    /// Checked, in order: that `header.timestamp` isn't too far in this
+    /// node's future; `block.validate()` against this node's own idea
+    /// of the current PoW target (proof of work, canonical ordering, no
+    /// same-block spend, `body_hash` matches); that `prev_hash`/
+    /// `height` chain onto the current tip; that every input resolves
+    /// and every output avoids colliding with a live one; and that the
+    /// roots applying the body actually produces match what the header
+    /// claims. Difficulty retargeting's side state is updated last,
+    /// right before committing -- see the module docs.
+    pub fn apply_block(&mut self, block: &Block) -> Result<()> {
+        // A local, cloned handle (just an `Arc` bump -- see `Storage`'s
+        // docs) rather than `self.storage.write_txn()` directly: that
+        // would tie `wtxn`'s lifetime to a borrow of `self` itself,
+        // which would then conflict with the `&mut self` calls below.
+        let storage = self.storage.clone();
+        let mut wtxn = storage.write_txn()?;
+        self.apply_block_in_txn(&mut wtxn, block)?;
+        self.prune(&mut wtxn)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// `apply_block`'s actual work, through a caller-supplied `wtxn`
+    /// rather than one this method opens and commits itself -- what
+    /// lets `accept_block`'s reorg path replay several blocks (plus
+    /// whatever `unwind_tip` calls preceded them) inside one shared
+    /// transaction, atomically, instead of each block committing on
+    /// its own as it would through the public `apply_block`.
+    fn apply_block_in_txn(&mut self, wtxn: &mut heed::RwTxn, block: &Block) -> Result<()> {
+        if block.header.timestamp > now_millis() + MAX_FUTURE_DRIFT_MS {
+            return Err(Error::TimestampTooFarInFuture);
+        }
+
+        let target = self.current_target(wtxn)?;
+        if !self.block_is_valid(wtxn, block, &target)? {
+            return Err(Error::InvalidBlock);
+        }
+
+        let (expected_prev_hash, expected_height) = self.next_prev_hash_and_height(wtxn)?;
+        if block.header.prev_hash != expected_prev_hash {
+            return Err(Error::WrongParent);
+        }
+        if block.header.height != expected_height {
+            return Err(Error::WrongHeight);
+        }
+        self.check_genesis(&block.header)?;
+        if let Some(parent) = self.tip_header(wtxn)?
+            && block.header.timestamp <= parent.timestamp
+        {
+            return Err(Error::TimestampNotAfterParent);
+        }
+
+        // Snapshot everything `unwind_tip` will need to restore, before
+        // any of it gets overwritten below -- see `UndoData`'s docs on
+        // why this is the only chance to capture it.
+        let prev_tip_header = self.tip_header(wtxn)?;
+        let prev_current_target = target;
+        let prev_anchor_timestamp = self.anchor_timestamp(wtxn)?;
+        let parent_work = self.chain_work(wtxn, block.header.prev_hash)?;
+
+        let (state_root, output_count, undone, _) = self.resolve_and_apply(wtxn, &block.body, block.header.height, None)?;
+        for (commitment, nonce) in block.body.outputs.iter().zip(&block.body.nonces) {
+            self.utxo.set_origin(wtxn, *commitment, block.header.height, nonce)?;
+        }
+        if state_root != block.header.state_root {
+            return Err(Error::StateRootMismatch);
+        }
+        if output_count != block.header.output_count {
+            return Err(Error::OutputCountMismatch);
+        }
+
+        let retarget = self.retarget_if_due(wtxn, &block.header)?;
+        self.meta.put(wtxn, TIP_HEADER_KEY, &block.header.to_bytes())?;
+
+        let undo = UndoData {
+            prev_tip_header,
+            prev_current_target,
+            prev_anchor_timestamp,
+            spent_inputs: undone.spent_inputs,
+            replaced: undone.replaced,
+        };
+        self.block_undo.put(wtxn, &block.header.hash(), &undo.to_bytes())?;
+        let this_work = pow::add256(parent_work, pow::work_for_target(target));
+        self.store_block_records(wtxn, block, this_work, retarget)?;
+        self.active_heights
+            .put(wtxn, &block.header.height.to_be_bytes(), &block.header.hash())?;
+
+        Ok(())
+    }
+
+    /// Undo the current tip, through `wtxn`, restoring the chain to
+    /// exactly the state it was in right before that block was ever
+    /// applied -- the state-tree/utxo effects reversed using the
+    /// block's own stored `UndoData`, and the tip header/retargeting
+    /// state restored from the same snapshot. Nothing is committed
+    /// here; that's the caller's job, same as everywhere else in this
+    /// module. Returns the unwound block.
+    ///
+    /// Fails with `Error::Corrupt` if there's no tip at all, or if its
+    /// stored block/undo data is missing. The latter shouldn't happen
+    /// for anything `apply_block` itself persisted -- but once a
+    /// retention limit or pruning exists, "we don't have that block
+    /// anymore" is exactly the condition that should surface here,
+    /// rather than this method guessing at a substitute.
+    ///
+    /// Only ever moves the tip back one block. The orchestration that
+    /// decides *how many* times to call this, and what to do if it
+    /// would need to go back further than retained data allows (see
+    /// `max_reorg_depth`), is `accept_block`'s concern -- this is
+    /// deliberately just the one-block primitive.
+    pub(crate) fn unwind_tip(&mut self, wtxn: &mut heed::RwTxn) -> Result<Block> {
+        let tip_header = self.tip_header(wtxn)?.ok_or(Error::Corrupt("no tip to unwind"))?;
+        let hash = tip_header.hash();
+
+        let block_bytes = self.blocks.get(wtxn, &hash)?.ok_or(Error::Corrupt("tip block is not stored"))?;
+        let block = Block::from_bytes(block_bytes).map_err(|_| Error::Corrupt("stored tip block was corrupt"))?;
+
+        let undo_bytes = self.block_undo.get(wtxn, &hash)?.ok_or(Error::Corrupt("tip undo data is not stored"))?;
+        let undo = UndoData::from_bytes(undo_bytes)?;
+
+        // Reverse the inputs: every spent output goes back to live, at
+        // exactly the position it occupied before.
+        // Reverse the outputs first: each one this block created
+        // disappears again, or gets back the record of the earlier output
+        // with its commitment (spent, or spent by this very block).
+        for commitment in &block.body.outputs {
+            match undo.replaced.iter().find(|(c, _)| c == commitment) {
+                Some((_, previous)) => self.utxo.put_raw(wtxn, *commitment, previous)?,
+                None => self.utxo.forget(wtxn, *commitment)?,
+            }
+        }
+        // Then the inputs: every spent output goes back to live, at
+        // exactly the position, height and nonce it had.
+        let mut unspent = Vec::with_capacity(undo.spent_inputs.len());
+        for input in &undo.spent_inputs {
+            unspent.push((input.position, (input.commitment, input.nonce, leaf_height(input.height)?)));
+            self.utxo.create(wtxn, input.commitment, input.position, input.height, &input.nonce)?;
+        }
+        // Reverse the appends -- this block appended exactly
+        // `body.outputs.len()` outputs, the last ones, and nothing else
+        // has been appended since (we're unwinding the tip) -- and the
+        // spends, the tree updated once (`StateTree::unapply`).
+        self.state.unapply(wtxn, block.body.outputs.len() as u64, &unspent)?;
+
+        self.active_heights.delete(wtxn, &block.header.height.to_be_bytes())?;
+
+        // Restore the tip and retargeting state exactly as snapshotted.
+        match &undo.prev_tip_header {
+            Some(header) => {
+                self.meta.put(wtxn, TIP_HEADER_KEY, &header.to_bytes())?;
+            }
+            None => {
+                self.meta.delete(wtxn, TIP_HEADER_KEY)?;
+            }
+        }
+        self.meta.put(wtxn, CURRENT_TARGET_KEY, &undo.prev_current_target)?;
+        self.meta
+            .put(wtxn, ANCHOR_TIMESTAMP_KEY, &undo.prev_anchor_timestamp.to_be_bytes())?;
+
+        Ok(block)
+    }
+
+    /// Find where `candidate_tip_hash`'s chain and the active chain
+    /// diverge, searching the active side back at most
+    /// `self.max_reorg_depth` blocks, and the candidate side back until
+    /// it either meets the active side or drops to `reorg_floor` (below
+    /// which it can't possibly meet it any more). The candidate side is
+    /// bounded by height, not by a step count: a branch can be longer
+    /// than `max_reorg_depth` past the fork point without the *unwind*
+    /// being any deeper -- two miners neck and neck for a while, say.
+    /// `None` if no common ancestor turns up within those bounds -- the
+    /// caller should treat that as `Error::ReorgTooDeep`, not keep
+    /// searching (see `Chain::open`'s docs on why this crate refuses
+    /// rather than attempting a deeper reorg).
+    fn find_fork_point(&self, txn: &heed::RoTxn, candidate_tip_hash: [u8; 32]) -> Result<Option<ForkPoint>> {
+        let max_depth = self.max_reorg_depth;
+        let floor = self.reorg_floor(txn)?;
+
+        // Hash -> how many `unwind_tip` calls reach it from the active tip.
+        let mut active_depth: std::collections::HashMap<[u8; 32], u64> = std::collections::HashMap::new();
+        let mut hash = self.tip_hash(txn)?;
+        let mut depth = 0u64;
+        loop {
+            active_depth.insert(hash, depth);
+            if hash == GENESIS_PARENT_HASH || depth >= max_depth {
+                break;
+            }
+            let block = self.get_stored_block(txn, hash)?;
+            if floor.is_some_and(|floor| block.header.height <= floor) {
+                break;
+            }
+            hash = block.header.prev_hash;
+            depth += 1;
+        }
+
+        // Walk back from the candidate tip, collecting its own blocks,
+        // until landing on a hash the active side already knows about.
+        let mut replay = Vec::new();
+        let mut hash = candidate_tip_hash;
+        loop {
+            if let Some(&unwind_count) = active_depth.get(&hash) {
+                replay.reverse();
+                return Ok(Some(ForkPoint { unwind_count, replay }));
+            }
+            if hash == GENESIS_PARENT_HASH {
+                return Ok(None);
+            }
+            let block = self.get_stored_block(txn, hash)?;
+            if floor.is_some_and(|floor| block.header.height <= floor) {
+                return Ok(None);
+            }
+            hash = block.header.prev_hash;
+            replay.push(block);
+        }
+    }
+
+    /// Validate and store `block` as a side-branch candidate, through
+    /// `wtxn` -- *not* applied to live `state`/`utxo` state
+    /// (it might not even be valid relative to that state -- it could
+    /// spend an output only its own branch believes exists, or double
+    /// spend one the active chain already spent differently; there's
+    /// no separate UTXO snapshot per branch to check that against
+    /// yet). That check only actually happens if/when this block is
+    /// replayed for real, through `apply_block_in_txn`, inside one
+    /// shared, all-or-nothing reorg transaction -- which is exactly
+    /// what makes skipping it here safe rather than a hole: a bad
+    /// side-branch block just fails *then*, aborting the whole reorg
+    /// attempt and leaving the active chain untouched.
+    ///
+    /// What *is* checked here: the block's own `Block::validate`
+    /// (proof of work, canonical ordering, body_hash, proof), against
+    /// the target its own branch's history implies -- the parent's
+    /// recorded `RetargetState`, not the active chain's, since the two
+    /// differ once a fork straddles a retarget-window boundary. Also
+    /// checked: that `prev_hash`/`height` actually match the parent
+    /// block it claims to extend.
+    fn store_side_branch_block(&mut self, wtxn: &mut heed::RwTxn, block: &Block) -> Result<()> {
+        // As on the active chain, and before its work counts: a branch
+        // stamped far ahead would otherwise win fork choice, fail the
+        // reorg (not a block fault: it may become valid by waiting) and
+        // be retried with every block built on it.
+        if block.header.timestamp > now_millis() + MAX_FUTURE_DRIFT_MS {
+            return Err(Error::TimestampTooFarInFuture);
+        }
+        let parent_retarget = self.retarget_state_after(wtxn, block.header.prev_hash)?;
+        if !self.block_is_valid(wtxn, block, &parent_retarget.target)? {
+            return Err(Error::InvalidSideBranchBlock);
+        }
+
+        self.check_genesis(&block.header)?;
+        let (expected_height, parent_work) = if block.header.prev_hash == GENESIS_PARENT_HASH {
+            (0, [0u8; 32])
+        } else {
+            let parent = self.get_stored_block(wtxn, block.header.prev_hash)?;
+            if block.header.timestamp <= parent.header.timestamp {
+                return Err(Error::TimestampNotAfterParent);
+            }
+            let parent_work = self.chain_work(wtxn, block.header.prev_hash)?;
+            (parent.header.height + 1, parent_work)
+        };
+        if block.header.height != expected_height {
+            return Err(Error::InvalidSideBranchLineage);
+        }
+
+        let this_work = pow::add256(parent_work, pow::work_for_target(parent_retarget.target));
+        let retarget = parent_retarget.after(&self.difficulty, &block.header);
+        self.store_block_records(wtxn, block, this_work, retarget)
+    }
+
+    /// Accept `block`, whatever it turns out to be relative to the
+    /// active chain -- the general entry point a real node would call
+    /// for every block it receives, one at a time, in whatever order
+    /// they arrive. Three things can happen:
+    ///
+    /// - It extends the active tip directly: applied immediately
+    ///   (`apply_block`), same as always.
+    /// - It extends some other block this `Chain` already knows about
+    ///   (active-chain history or another side branch): validated and
+    ///   stored as a side branch (`store_side_branch_block`), in its
+    ///   own transaction -- always safe to commit regardless of what
+    ///   happens next, since nothing live is touched. Then, in a
+    ///   *separate* transaction, fork-choice runs: if this branch's
+    ///   total work now exceeds the active chain's, the chain reorgs
+    ///   onto it -- `find_fork_point` locates the common ancestor
+    ///   (bounded by `max_reorg_depth`; `Error::ReorgTooDeep` if
+    ///   that's not enough), then `unwind_tip` and `apply_block_in_txn`
+    ///   run in one shared transaction, committed only if every
+    ///   replayed block actually validates -- so a bad block deep in
+    ///   a heavier-looking branch aborts the whole reorg, leaving the
+    ///   active chain exactly as it was.
+    /// - Its parent isn't known at all: held in the orphan pool (at
+    ///   most `max_orphans` of them, oldest evicted first), provided
+    ///   its proof of work meets `orphan_target` -- `Error::
+    ///   OrphanPowTooWeak` otherwise.
+    ///
+    /// Before any of that, a block already stored or already waiting
+    /// as an orphan is reported as `AlreadyKnown` and otherwise
+    /// ignored; one that is, or extends, a block recorded in
+    /// `INVALID_BLOCKS_DB` is refused with `Error::KnownInvalidBlock`;
+    /// and one at or below `reorg_floor` is refused with `Error::
+    /// ReorgTooDeep` -- nothing that low can ever win, so it isn't
+    /// worth storing or pooling. A reorg that fails on a block-level
+    /// fault (`Error::is_block_fault`) records the failing block and
+    /// everything after it in that branch as invalid, so the same
+    /// branch never triggers another attempt.
+    ///
+    /// Whenever `block` ends up connected (applied, stored, or reorged
+    /// onto), any orphans that were waiting on it are retried right
+    /// away, transitively -- see `connect_orphans`. The returned
+    /// outcome is `block`'s own; theirs aren't reported (an orphan that
+    /// fails is just dropped), but anything they did to the active
+    /// chain is visible through `tip_hash` like any other change.
+    pub fn accept_block(&mut self, block: Block) -> Result<AcceptOutcome> {
+        let hash = block.header.hash();
+        let outcome = self.accept_one(block)?;
+        if is_connected(&outcome) {
+            self.connect_orphans(hash);
+        }
+        Ok(outcome)
+    }
+
+    /// `accept_block` for exactly one block, without touching the
+    /// orphan pool beyond (possibly) adding `block` to it.
+    fn accept_one(&mut self, block: Block) -> Result<AcceptOutcome> {
+        let storage = self.storage.clone();
+        let hash = block.header.hash();
+
+        let rtxn = storage.read_txn()?;
+        if self.is_known_invalid(&rtxn, hash)? || self.is_known_invalid(&rtxn, block.header.prev_hash)? {
+            drop(rtxn);
+            self.mark_invalid(std::slice::from_ref(&block))?;
+            return Err(Error::KnownInvalidBlock);
+        }
+        if self.orphans.iter().any(|(orphan_hash, _)| *orphan_hash == hash) || self.blocks.get(&rtxn, &hash)?.is_some() {
+            return Ok(AcceptOutcome::AlreadyKnown);
+        }
+        if self.reorg_floor(&rtxn)?.is_some_and(|floor| block.header.height <= floor) {
+            return Err(Error::ReorgTooDeep);
+        }
+
+        let tip_hash = self.tip_hash(&rtxn)?;
+        if block.header.prev_hash == tip_hash {
+            drop(rtxn);
+            self.apply_block(&block)?;
+            return Ok(AcceptOutcome::Applied);
+        }
+
+        let parent_known =
+            block.header.prev_hash == GENESIS_PARENT_HASH || self.blocks.get(&rtxn, &block.header.prev_hash)?.is_some();
+        let orphan_target = self.orphan_target(&rtxn)?;
+        drop(rtxn);
+
+        if !parent_known {
+            // Only the proof of work, and only against a relaxed
+            // target: everything else (and the real target) is checked
+            // once the parent is known and this is accepted for real.
+            if !block.header.pow_valid(&orphan_target, &self.difficulty.pow) {
+                return Err(Error::OrphanPowTooWeak);
+            }
+            if self.orphans.len() >= self.max_orphans {
+                self.orphans.remove(0);
+            }
+            self.orphans.push((hash, block));
+            return Ok(AcceptOutcome::Orphaned);
+        }
+
+        let mut wtxn = storage.write_txn()?;
+        self.store_side_branch_block(&mut wtxn, &block)?;
+        wtxn.commit()?;
+
+        let mut wtxn = storage.write_txn()?;
+        let candidate_work = self.chain_work(&wtxn, hash)?;
+        let active_work = self.chain_work(&wtxn, self.tip_hash(&wtxn)?)?;
+        if candidate_work <= active_work {
+            return Ok(AcceptOutcome::StoredAsSideBranch);
+        }
+
+        let fork_point = self.find_fork_point(&wtxn, hash)?.ok_or(Error::ReorgTooDeep)?;
+
+        // A block stored before one of its ancestors was found invalid
+        // (a sibling branch off the bad block, say) gets past the
+        // parent check above -- catch it here, before unwinding anything.
+        let mut first_invalid = None;
+        for (i, replay_block) in fork_point.replay.iter().enumerate() {
+            if self.is_known_invalid(&wtxn, replay_block.header.hash())? {
+                first_invalid = Some(i);
+                break;
+            }
+        }
+        if let Some(i) = first_invalid {
+            drop(wtxn);
+            self.mark_invalid(&fork_point.replay[i..])?;
+            return Err(Error::KnownInvalidBlock);
+        }
+
+        for _ in 0..fork_point.unwind_count {
+            self.unwind_tip(&mut wtxn)?;
+        }
+        let applied = fork_point.replay.len() as u64;
+        for (i, replay_block) in fork_point.replay.iter().enumerate() {
+            if let Err(e) = self.apply_block_in_txn(&mut wtxn, replay_block) {
+                // Abort the reorg first -- the active chain must come
+                // out of this exactly as it went in.
+                drop(wtxn);
+                if e.is_block_fault() {
+                    self.mark_invalid(&fork_point.replay[i..])?;
+                }
+                return Err(e);
+            }
+        }
+        self.prune(&mut wtxn)?;
+        wtxn.commit()?;
+
+        Ok(AcceptOutcome::Reorged {
+            unwound: fork_point.unwind_count,
+            applied,
+        })
+    }
+
+    /// Retry every orphan waiting on `newly_known_hash`, now that it's
+    /// actually known -- and, transitively, anything that in turn was
+    /// waiting on one of *those* once they're connected. Returns each
+    /// retried orphan's outcome, in the order they were retried; only
+    /// tests look at them (`accept_block` discards them).
+    fn connect_orphans(&mut self, newly_known_hash: [u8; 32]) -> Vec<Result<AcceptOutcome>> {
+        let mut outcomes = Vec::new();
+        let mut queue = vec![newly_known_hash];
+        while let Some(parent_hash) = queue.pop() {
+            let (waiting, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.orphans)
+                .into_iter()
+                .partition(|(_, orphan)| orphan.header.prev_hash == parent_hash);
+            self.orphans = rest;
+            for (orphan_hash, orphan) in waiting {
+                let outcome = self.accept_one(orphan);
+                if outcome.as_ref().is_ok_and(is_connected) {
+                    queue.push(orphan_hash);
+                }
+                outcomes.push(outcome);
+            }
+        }
+        outcomes
+    }
+
+    /// Build a prospective block out of `transactions`: fold each into a
+    /// fresh `BlockBody` (failing if any doesn't verify on its own
+    /// terms), then resolve and speculatively apply that body against
+    /// real chain state -- in its own write transaction, deliberately
+    /// never committed -- to compute the `state_root`/`output_count` it
+    /// would actually produce.
+    ///
+    /// Returns an `UnprovenBlock`, not a `Block`: there's no proof yet
+    /// (that's `prover::prove_block`'s job, needing the same
+    /// `transactions`), and no `Block` can exist without one (see
+    /// `BlockBody`'s docs) -- which is exactly what keeps
+    /// `pow::mine_block`-ing something from happening before proving
+    /// does. Mining itself is also not this function's job either way:
+    /// it's chain-state-independent work, usually a hot loop, that
+    /// doesn't need to re-resolve anything per attempt.
+    pub fn build_block(&mut self, transactions: &[Transaction]) -> Result<UnprovenBlock> {
+        let body = BlockBody::from_transactions(transactions).map_err(Error::InvalidTransaction)?;
+        // Without the proof, which doesn't exist yet -- `Block::validate`
+        // checks the finished block, proof included.
+        if crate::block::HEADER_LEN + body.encoded_len() > crate::block::MAX_BLOCK_BYTES {
+            return Err(Error::BlockTooLarge);
+        }
+
+        let storage = self.storage.clone();
+        let mut wtxn = storage.write_txn()?;
+        let (prev_hash, height) = self.next_prev_hash_and_height(&wtxn)?;
+        let min_timestamp = self.tip_header(&wtxn)?.map_or(0, |parent| parent.timestamp + 1);
+        let target = self.current_target(&wtxn)?;
+        let reward = self.difficulty.schedule.reward(height).ok_or(Error::ChainEnded)?;
+        // The chunks to prove it in: each chunk's transactions'
+        // commitments, by their place in the body.
+        let plan_chunks = crate::prover::plan_chunks(transactions).ok_or(Error::TransactionTooLarge)?;
+        let index = |list: &[[u8; 32]], c: &[u8; 32]| list.binary_search(c).map_err(|_| Error::InvalidBlock);
+        let mut chunks: ChunkIndices = Vec::with_capacity(plan_chunks.len());
+        for txs in &plan_chunks {
+            let (mut ins, mut outs) = (Vec::new(), Vec::new());
+            for &t in txs {
+                for input in &transactions[t].inputs {
+                    ins.push(index(&body.inputs, &input.commitment())?);
+                }
+                for output in &transactions[t].outputs {
+                    outs.push(index(&body.outputs, &output.commitment())?);
+                }
+            }
+            ins.sort_unstable();
+            outs.sort_unstable();
+            chunks.push((ins, outs));
+        }
+        // The heights its proof publishes, and its inputs' timelocks
+        // checked against them.
+        let mut created = std::collections::HashMap::new();
+        for commitment in &body.inputs {
+            if let Some(record) = self.output_record(&wtxn, commitment)? {
+                created.insert(*commitment, leaf_height(record.height)?);
+            }
+        }
+        let heights = crate::block_air::Heights { block: leaf_height(height)?, created };
+        for (t, tx) in transactions.iter().enumerate() {
+            if !tx.locks_hold(heights.block, |c| heights.created.get(c).copied()) {
+                return Err(Error::LockNotMet(t));
+            }
+        }
+        let (state_root, output_count, _spent_inputs, transitions) = self.resolve_and_apply(&mut wtxn, &body, height, Some(&chunks))?;
+        // Deliberately never committed -- see the module docs. `wtxn`
+        // drops here, and LMDB aborts it.
+
+        Ok(UnprovenBlock {
+            prev_hash,
+            height,
+            target,
+            min_timestamp,
+            state_root,
+            output_count,
+            inputs: body.inputs,
+            outputs: body.outputs,
+            nonces: body.nonces,
+            aux_hash: [0; 32],
+            plan: crate::prover::BlockPlan {
+                chunks: plan_chunks,
+                transitions,
+                reward,
+                heights,
+            },
+        })
+    }
+}
+
+impl Chain {
+    /// Every live output's position and commitment, by position -- for
+    /// `--debug-disable-verification`'s fabricated spends.
+    pub fn debug_unspent(&self) -> Result<Vec<(u64, [u8; 32])>> {
+        let txn = self.storage.read_txn()?;
+        Ok(self.state.unspent_in(&txn, 0, u64::MAX)?.into_iter().map(|(p, c, _, _)| (p, c)).collect())
+    }
+
+    /// `build_block` for `--debug-disable-verification`: `transactions`,
+    /// plus bare commitments -- `spend` (unspent outputs, which must
+    /// exist) and `create` (new outputs, with their nonces) -- that no
+    /// transaction accounts for. Nothing can prove such a block: it's only
+    /// for nodes that skip proofs, to time a block of any size. The state
+    /// root and output count are the real ones, so those nodes apply it as
+    /// any other.
+    pub fn build_debug_block(&mut self, transactions: &[Transaction], spend: &[[u8; 32]], create: &[([u8; 32], [u8; NONCE_LEN])]) -> Result<UnprovenBlock> {
+        let mut body = BlockBody::from_transactions(transactions).map_err(Error::InvalidTransaction)?;
+        body.inputs.extend_from_slice(spend);
+        body.inputs.sort_unstable();
+        let mut outputs: Vec<_> = body.outputs.iter().copied().zip(body.nonces.iter().copied()).chain(create.iter().copied()).collect();
+        outputs.sort_unstable_by_key(|o| o.0);
+        (body.outputs, body.nonces) = outputs.into_iter().unzip();
+        if !body.is_canonically_ordered() {
+            return Err(Error::InvalidBlock);
+        }
+        if crate::block::HEADER_LEN + body.encoded_len() > crate::block::MAX_BLOCK_BYTES {
+            return Err(Error::BlockTooLarge);
+        }
+        let storage = self.storage.clone();
+        let mut wtxn = storage.write_txn()?;
+        let (prev_hash, height) = self.next_prev_hash_and_height(&wtxn)?;
+        let min_timestamp = self.tip_header(&wtxn)?.map_or(0, |parent| parent.timestamp + 1);
+        let target = self.current_target(&wtxn)?;
+        let reward = self.difficulty.schedule.reward(height).ok_or(Error::ChainEnded)?;
+        let (state_root, output_count, _, _) = self.resolve_and_apply(&mut wtxn, &body, height, None)?;
+        // Never committed, as in `build_block`.
+        Ok(UnprovenBlock {
+            prev_hash,
+            height,
+            target,
+            min_timestamp,
+            state_root,
+            output_count,
+            inputs: body.inputs,
+            outputs: body.outputs,
+            nonces: body.nonces,
+            aux_hash: [0; 32],
+            plan: crate::prover::BlockPlan {
+                chunks: Vec::new(),
+                transitions: Vec::new(),
+                reward,
+                heights: crate::block_air::Heights { block: leaf_height(height)?, created: Default::default() },
+            },
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::block::{BlockHeader, INITIAL_MAX_HASH, mine_block};
+    use crate::output::Output;
+    use crate::prover;
+    use crate::wots::{self, PublicKey, SecretKey};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("chain-test-{}-{n}", std::process::id()));
+            std::fs::create_dir_all(&path).unwrap();
+            TempDir(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Deliberately small -- so a test can actually build past it
+    /// (exercising `Error::ReorgTooDeep`) without mining hundreds of
+    /// blocks to get there. Same reasoning as `DifficultyConfig::
+    /// for_tests`'s own numbers.
+    const TEST_MAX_REORG_DEPTH: u64 = 5;
+
+    fn open() -> (TempDir, Storage, Chain) {
+        let dir = TempDir::new();
+        let storage = Storage::open(&dir.0).unwrap();
+        let mut chain = Chain::open(&storage, DifficultyConfig::for_tests(), TEST_MAX_REORG_DEPTH, None).unwrap();
+        chain.skip_proof_checks();
+        (dir, storage, chain)
+    }
+
+    fn keypair(byte: u8) -> (SecretKey, PublicKey) {
+        wots::keygen(&[byte; 32])
+    }
+
+    fn commitment_of(pubkey: &PublicKey, amount: u64) -> [u8; 32] {
+        Output::new(pubkey, amount).commitment()
+    }
+
+    /// A one-output, zero-input transaction -- the shape a miner's
+    /// reward claim takes (see `block`'s module docs: there's no
+    /// separate "coinbase" concept, it's just an ordinary transaction
+    /// with no inputs).
+    fn reward_transaction(pubkey: &PublicKey, amount: u64) -> Transaction {
+        let mut tx = Transaction::new();
+        tx.add_output(Output::new(pubkey, amount)).unwrap();
+        tx
+    }
+
+    /// A one-input, one-output transaction spending `(from_sk, from_pk,
+    /// amount)` entirely to `to_pk`, fully signed.
+    fn spend_transaction(
+        from_sk: &SecretKey,
+        from_pk: &PublicKey,
+        amount: u64,
+        to_pk: &PublicKey,
+    ) -> Transaction {
+        let mut tx = Transaction::new();
+        tx.add_input(from_pk, amount).unwrap();
+        tx.add_output(Output::new(to_pk, amount)).unwrap();
+        assert!(tx.sign_input(from_pk, from_sk));
+        tx
+    }
+
+    /// Run the real `build_block` -> `prover::prove_block` ->
+    /// `UnprovenBlock::finish` -> `mine_block` pipeline end to end,
+    /// panicking if any stage fails -- for tests that just want a real,
+    /// minable `Block` out of `transactions` without re-deriving all four
+    /// steps inline every time.
+    ///
+    /// Each block after the first is stamped exactly one target block
+    /// time after its parent: on schedule, so every target stays the
+    /// initial one and branches of equal length weigh the same (tests
+    /// about retargeting set timestamps themselves).
+    fn built_proved_and_mined(chain: &mut Chain, transactions: &[Transaction]) -> Block {
+        let unproven = chain.build_block(transactions).unwrap();
+        let target = unproven.target;
+        let on_schedule = (unproven.height > 0).then(|| unproven.min_timestamp - 1 + DifficultyConfig::for_tests().target_block_time_ms);
+        let proof = prover::Proof::placeholder();
+        let mut block = unproven.finish(proof);
+        if let Some(timestamp) = on_schedule {
+            block.header.timestamp = timestamp;
+        }
+        assert!(mine_block(&mut block, &target, 100_000, &crate::pow::Params::TEST), "should find a nonce quickly");
+        block
+    }
+
+    /// A fully independent chain of `length` blocks, from its own
+    /// genesis -- a fresh, throwaway `Chain`/`Storage` entirely
+    /// separate from whatever's under test, used to build a
+    /// competing branch to feed into it via `accept_block`.
+    /// `key_offset` just needs to differ from whatever keys the
+    /// caller's own chain used, so the two don't coincidentally reuse
+    /// the exact same (pubkey, amount) commitment.
+    fn build_chain(length: u64, key_offset: u8) -> Vec<Block> {
+        let (_dir, _storage, mut chain) = open();
+        let mut blocks = Vec::new();
+        for i in 0..length {
+            let (_sk, pk) = keypair(key_offset.wrapping_add(i as u8));
+            let block = built_proved_and_mined(&mut chain, &[reward_transaction(&pk, 50)]);
+            chain.apply_block(&block).unwrap();
+            blocks.push(block);
+        }
+        blocks
+    }
+
+    fn unwind_committed(storage: &Storage, chain: &mut Chain) -> Block {
+        let mut wtxn = storage.write_txn().unwrap();
+        let block = chain.unwind_tip(&mut wtxn).unwrap();
+        wtxn.commit().unwrap();
+        block
+    }
+
+    /// Download the state as of active-chain block `hash` from `reader`,
+    /// piece by piece, as a fast-syncing node does.
+    fn download_state(reader: &StateReader, hash: [u8; 32], header: &BlockHeader) -> Vec<crate::state_tree::Entry> {
+        let mut plan = crate::snapshot::Plan::new(header.state_root, header.output_count);
+        while let Some(piece) = plan.next() {
+            let bytes = reader.piece(hash, piece.level, piece.index).unwrap().unwrap();
+            assert!(plan.accept(&piece, &bytes));
+        }
+        plan.finish()
+    }
+
+    /// Fast sync, natively (`docs/CHAIN_RECURSION.md`, 5d): chain A, with
+    /// spends scattered through its history, serves its state as of block
+    /// H (a few blocks back) from its current tree and undo data; chain B
+    /// downloads it piece by piece, starts at H, then applies H+1 .. tip
+    /// as any node does -- and ends in exactly A's state. B then serves
+    /// the same state itself, and refuses anything below H.
+    #[test]
+    fn fast_sync_from_a_state_snapshot() {
+        let (_da, storage_a, mut a) = open();
+        let mut blocks = Vec::new();
+        let mut live: Vec<(SecretKey, PublicKey)> = Vec::new();
+        for i in 0..12u8 {
+            let mut txs = Vec::new();
+            for j in 0..3u8 {
+                let (sk, pk) = wots::keygen(&std::array::from_fn(|n| [1, i, j].get(n).copied().unwrap_or(0)));
+                txs.push(reward_transaction(&pk, 50));
+                live.push((sk, pk));
+            }
+            // Spend two older outputs: one ancient, one recent.
+            if i >= 3 {
+                for k in [0, live.len() - 5] {
+                    let (sk, pk) = live.remove(k);
+                    let (_, to) = wots::keygen(&std::array::from_fn(|n| [2, i, k as u8].get(n).copied().unwrap_or(0)));
+                    txs.push(spend_transaction(&sk, &pk, 50, &to));
+                }
+            }
+            let block = built_proved_and_mined(&mut a, &txs);
+            a.apply_block(&block).unwrap();
+            blocks.push(block);
+        }
+        let h = 8usize;
+        let base = &blocks[h];
+        let reader_a = StateReader::open(&storage_a).unwrap();
+        let point = reader_a.sync_point(base.header.hash()).unwrap().unwrap();
+        let unspent = download_state(&reader_a, base.header.hash(), &base.header);
+        assert!(!unspent.is_empty());
+
+        // A snapshot missing an output is refused.
+        let (_dc, _sc, mut c) = open();
+        assert!(matches!(c.import_snapshot(base, &point, &[], &unspent[1..]), Err(Error::StateRootMismatch)));
+
+        let (_db, storage_b, mut b) = open();
+        b.import_snapshot(base, &point, &[], &unspent).unwrap();
+        assert!(!crate::wallet::ChainView::has_full_history(&b.view().unwrap()));
+        for block in &blocks[h + 1..] {
+            assert_eq!(b.accept_block(block.clone()).unwrap(), AcceptOutcome::Applied);
+        }
+        let (ra, rb) = (storage_a.read_txn().unwrap(), storage_b.read_txn().unwrap());
+        assert_eq!(b.tip_hash(&rb).unwrap(), a.tip_hash(&ra).unwrap());
+        assert_eq!(b.state.root(&rb).unwrap(), a.state.root(&ra).unwrap());
+        assert_eq!(b.current_target(&rb).unwrap(), a.current_target(&ra).unwrap());
+        assert_eq!(b.chain_work(&rb, b.tip_hash(&rb).unwrap()).unwrap(), a.chain_work(&ra, a.tip_hash(&ra).unwrap()).unwrap());
+        assert_eq!(b.state.unspent_in(&rb, 0, 1 << 40).unwrap(), a.state.unspent_in(&ra, 0, 1 << 40).unwrap());
+        for (_, pk) in &live {
+            let c = commitment_of(pk, 50);
+            assert_eq!(b.utxo.get(&rb, c).unwrap(), a.utxo.get(&ra, c).unwrap());
+        }
+        drop((ra, rb));
+
+        // B serves the state as of H+1 just as A does.
+        let reader_b = StateReader::open(&storage_b).unwrap();
+        let next = &blocks[h + 1];
+        assert_eq!(download_state(&reader_b, next.header.hash(), &next.header), download_state(&reader_a, next.header.hash(), &next.header));
+        assert_eq!(reader_b.sync_point(next.header.hash()).unwrap(), reader_a.sync_point(next.header.hash()).unwrap());
+        // Nothing below the sync point: not served, not accepted.
+        assert_eq!(reader_b.piece(blocks[h - 1].header.hash(), 32, 0).unwrap(), None);
+        assert!(matches!(b.accept_block(blocks[h - 1].clone()), Err(Error::ReorgTooDeep)));
+        // A fresh chain only.
+        assert!(matches!(b.import_snapshot(base, &point, &[], &unspent), Err(Error::Snapshot(_))));
+    }
+
+    /// What a fast-synced state costs on disk, per unspent output: a
+    /// synthetic state of `UNSPENT` unspent outputs (default 1M) scattered
+    /// among `OUTPUTS` ever created (default 10×), imported as a fast sync
+    /// does, then every database's pages counted.
+    /// `cargo test --release -- --ignored --nocapture snapshot_storage_cost`.
+    #[test]
+    #[ignore]
+    fn snapshot_storage_cost() {
+        let var = |name: &str, default: u64| std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default);
+        let unspent_count = var("UNSPENT", 1_000_000);
+        let outputs = var("OUTPUTS", 10 * unspent_count);
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut random = move || {
+            seed = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = seed;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        };
+        let stride = outputs / unspent_count;
+        let unspent: Vec<crate::state_tree::Entry> = (0..unspent_count)
+            .map(|i| {
+                let position = i * stride + random() % stride;
+                let mut commitment = [0u8; 32];
+                for c in commitment.chunks_mut(4) {
+                    c.copy_from_slice(&((random() % crate::poseidon2::P as u64) as u32).to_le_bytes());
+                }
+                let nonce: [u8; 16] = [random().to_le_bytes(), random().to_le_bytes()].concat().try_into().unwrap();
+                (position, commitment, nonce, (random() % 1_000_000) as u32)
+            })
+            .collect();
+        let (empty, spent) = (crate::state_tree::empty_hashes(), crate::state_tree::spent_hashes());
+        let root = crate::poseidon2::digest_to_bytes(crate::state_tree::subtree_hash(crate::state_tree::DEPTH, 0, outputs, &unspent, &empty, &spent));
+        let body = BlockBody {
+            inputs: vec![],
+            outputs: vec![],
+            nonces: vec![],
+            proof: prover::Proof::placeholder(),
+            chain_proof: vec![],
+        };
+        let header = BlockHeader {
+            prev_hash: [1; 32],
+            state_root: root,
+            body_hash: body.body_hash(),
+            aux_hash: [0; 32],
+            version: crate::block::BLOCK_VERSION,
+            output_count: outputs,
+            height: 1,
+            timestamp: 1,
+            nonce: [0; 32],
+        };
+        let base = Block { header, body };
+        let point = crate::snapshot::SyncPoint {
+            target: [0xff; 32],
+            anchor_timestamp: 0,
+            work: [0; 32],
+        };
+        let dir = std::env::temp_dir().join(format!("storage-cost-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = Storage::open_with_map_size(&dir, 1 << 40).unwrap();
+        let mut chain = Chain::open(&storage, DifficultyConfig::for_tests(), 5, None).unwrap();
+        let start = std::time::Instant::now();
+        chain.import_snapshot(&base, &point, &[], &unspent).unwrap();
+        println!("{unspent_count} unspent of {outputs} outputs: imported in {:.1?}", start.elapsed());
+        let rtxn = storage.read_txn().unwrap();
+        let mut total = 0;
+        for name in ["state_tree", "state_leaves", "outputs", "state_meta", "chain_meta", "blocks"] {
+            let Ok(db) = storage.database(name) else { continue };
+            let stat = db.stat(&rtxn).unwrap();
+            let bytes = (stat.branch_pages + stat.leaf_pages + stat.overflow_pages) * stat.page_size as usize;
+            total += bytes;
+            println!("  {name:<14} {:>12} entries {:>14} bytes  {:>7.1} B per unspent output", stat.entries, bytes, bytes as f64 / unspent_count as f64);
+        }
+        println!("  total {total} bytes: {:.1} B per unspent output", total as f64 / unspent_count as f64);
+        drop(rtxn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The key correctness property, same spirit as `state_tree`'s undo
+    /// round-trip tests: unwinding the tip must restore *exactly* the
+    /// state that existed right before that block was ever applied --
+    /// not just a plausible-looking state.
+    #[test]
+    fn unwind_tip_restores_state_to_right_before_that_block() {
+        let (_dir, storage, mut chain) = open();
+        let (_sk_a, pk_a) = keypair(1);
+        let block1 = built_proved_and_mined(&mut chain, &[reward_transaction(&pk_a, 50)]);
+        chain.apply_block(&block1).unwrap();
+
+        let rtxn = storage.read_txn().unwrap();
+        let tip_after_block1 = chain.tip_hash(&rtxn).unwrap();
+        let height_after_block1 = chain.height(&rtxn).unwrap();
+        let root_after_block1 = chain.state.root(&rtxn).unwrap();
+        let count_after_block1 = chain.state.count(&rtxn).unwrap();
+        let target_after_block1 = chain.current_target(&rtxn).unwrap();
+        drop(rtxn);
+
+        let (_sk_b, pk_b) = keypair(2);
+        let block2 = built_proved_and_mined(&mut chain, &[reward_transaction(&pk_b, 50)]);
+        chain.apply_block(&block2).unwrap();
+
+        let unwound = unwind_committed(&storage, &mut chain);
+        assert_eq!(unwound.header.hash(), block2.header.hash());
+
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.tip_hash(&rtxn).unwrap(), tip_after_block1);
+        assert_eq!(chain.height(&rtxn).unwrap(), height_after_block1);
+        assert_eq!(chain.state.root(&rtxn).unwrap(), root_after_block1);
+        assert_eq!(chain.state.count(&rtxn).unwrap(), count_after_block1);
+        assert_eq!(chain.current_target(&rtxn).unwrap(), target_after_block1);
+        // block2's own output must be gone again.
+        assert_eq!(chain.utxo.get(&rtxn, commitment_of(&pk_b, 50)).unwrap(), None);
+        // block1's output must still be exactly where it was.
+        assert!(chain.utxo.get(&rtxn, commitment_of(&pk_a, 50)).unwrap().is_some());
+    }
+
+    #[test]
+    fn unwind_tip_all_the_way_to_genesis_restores_empty_state() {
+        let (_dir, storage, mut chain) = open();
+        let (_sk, pk) = keypair(1);
+        let block = built_proved_and_mined(&mut chain, &[reward_transaction(&pk, 50)]);
+        chain.apply_block(&block).unwrap();
+
+        unwind_committed(&storage, &mut chain);
+
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.tip_hash(&rtxn).unwrap(), GENESIS_PARENT_HASH);
+        assert_eq!(chain.height(&rtxn).unwrap(), None);
+        assert_eq!(chain.state.count(&rtxn).unwrap(), 0);
+        assert_eq!(chain.current_target(&rtxn).unwrap(), DifficultyConfig::for_tests().initial_target);
+        assert_eq!(chain.utxo.get(&rtxn, commitment_of(&pk, 50)).unwrap(), None);
+    }
+
+    /// The property that actually matters for a reorg: unwinding a
+    /// spend must make the spent output live again, at the exact same
+    /// position, not just remove the record that it was ever spent.
+    #[test]
+    fn unwind_tip_reverses_a_spend() {
+        let (_dir, storage, mut chain) = open();
+        let (sk_a, pk_a) = keypair(1);
+        let block1 = built_proved_and_mined(&mut chain, &[reward_transaction(&pk_a, 50)]);
+        chain.apply_block(&block1).unwrap();
+
+        let rtxn = storage.read_txn().unwrap();
+        let position_a = chain.utxo.get(&rtxn, commitment_of(&pk_a, 50)).unwrap().unwrap();
+        drop(rtxn);
+
+        let (_sk_b, pk_b) = keypair(2);
+        let spend = spend_transaction(&sk_a, &pk_a, 50, &pk_b);
+        let block2 = built_proved_and_mined(&mut chain, &[spend]);
+        chain.apply_block(&block2).unwrap();
+
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.utxo.get(&rtxn, commitment_of(&pk_a, 50)).unwrap(), None);
+        assert!((chain.state.leaf_at(&rtxn, position_a).unwrap() == crate::state_tree::SPENT));
+        drop(rtxn);
+
+        unwind_committed(&storage, &mut chain);
+
+        let rtxn = storage.read_txn().unwrap();
+        // pk_a's output is live again, at the exact same position.
+        assert_eq!(
+            chain.utxo.get(&rtxn, commitment_of(&pk_a, 50)).unwrap(),
+            Some(position_a)
+        );
+        assert!(!(chain.state.leaf_at(&rtxn, position_a).unwrap() == crate::state_tree::SPENT));
+        // pk_b's output (created by the now-undone block) is gone.
+        assert_eq!(chain.utxo.get(&rtxn, commitment_of(&pk_b, 50)).unwrap(), None);
+    }
+
+    /// The output index records every output with its height and nonce;
+    /// spending leaves the record (recovery needs spent outputs too);
+    /// unwinding the block that created an output removes it.
+    #[test]
+    fn the_output_index_follows_the_active_chain() {
+        let (_dir, storage, mut chain) = open();
+        let (sk_a, pk_a) = keypair(1);
+        let mut reward = Transaction::new();
+        reward.add_output(Output::new(&pk_a, 50).with_nonce([7; NONCE_LEN])).unwrap();
+        let block0 = built_proved_and_mined(&mut chain, &[reward]);
+        assert_eq!(block0.body.nonces, vec![[7; NONCE_LEN]]);
+        chain.apply_block(&block0).unwrap();
+
+        let (_sk_b, pk_b) = keypair(2);
+        let mut spend = Transaction::new();
+        spend.add_input(&pk_a, 50).unwrap();
+        spend.add_output(Output::new(&pk_b, 50).with_nonce([9; NONCE_LEN])).unwrap();
+        assert!(spend.sign_input(&pk_a, &sk_a));
+        let block1 = built_proved_and_mined(&mut chain, &[spend]);
+        chain.apply_block(&block1).unwrap();
+
+        let (a, b) = (commitment_of(&pk_a, 50), commitment_of(&pk_b, 50));
+        let rtxn = storage.read_txn().unwrap();
+        let record = |c| chain.output_record(&rtxn, &c).unwrap();
+        assert_eq!(record(a), Some(OutputRecord { commitment: a, height: 0, nonce: [7; NONCE_LEN] }), "spent, still recorded");
+        assert_eq!(record(b), Some(OutputRecord { commitment: b, height: 1, nonce: [9; NONCE_LEN] }));
+        let mut seen = Vec::new();
+        chain.for_each_output(&rtxn, |r, unspent| seen.push((r.commitment, unspent))).unwrap();
+        seen.sort();
+        let mut expected = vec![(a, false), (b, true)];
+        expected.sort();
+        assert_eq!(seen, expected);
+        drop(rtxn);
+
+        unwind_committed(&storage, &mut chain);
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.output_record(&rtxn, &b).unwrap(), None, "its block was unwound");
+        assert!(chain.output_record(&rtxn, &a).unwrap().is_some());
+    }
+
+    /// Unwinding a block must restore `current_target` to what it was
+    /// *before* that block retargeted, not just leave it at whatever it
+    /// became.
+    #[test]
+    fn unwind_tip_restores_the_retargeting_state() {
+        let (_dir, storage, mut chain) = open();
+        apply_at(&mut chain, &[1_000_000, 1_000_010, 1_000_020]);
+        let rtxn = storage.read_txn().unwrap();
+        let before = chain.current_target(&rtxn).unwrap();
+        drop(rtxn);
+        // Well behind schedule: easier.
+        apply_at(&mut chain, &[1_000_500]);
+        let rtxn = storage.read_txn().unwrap();
+        let after = chain.current_target(&rtxn).unwrap();
+        drop(rtxn);
+        // The retarget is what this test is actually exercising -- if
+        // this doesn't hold, the rest is moot.
+        assert!(after > before);
+
+        unwind_committed(&storage, &mut chain);
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.current_target(&rtxn).unwrap(), before);
+        assert_eq!(chain.height(&rtxn).unwrap(), Some(2));
+    }
+
+    #[test]
+    fn chain_work_of_the_genesis_parent_is_zero() {
+        let (_dir, storage, chain) = open();
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.chain_work(&rtxn, GENESIS_PARENT_HASH).unwrap(), [0u8; 32]);
+    }
+
+    #[test]
+    fn chain_work_accumulates_across_blocks() {
+        let (_dir, storage, mut chain) = open();
+        let initial_target = DifficultyConfig::for_tests().initial_target;
+        let per_block_work = pow::work_for_target(initial_target);
+
+        let (_sk, pk) = keypair(1);
+        let block1 = built_proved_and_mined(&mut chain, &[reward_transaction(&pk, 50)]);
+        chain.apply_block(&block1).unwrap();
+
+        let rtxn = storage.read_txn().unwrap();
+        let work1 = chain.chain_work(&rtxn, block1.header.hash()).unwrap();
+        assert_eq!(work1, per_block_work);
+        drop(rtxn);
+
+        // The first block sets the target for the second to the initial
+        // one (`asert`'s anchor), so it's mined against the same target.
+        let (_sk2, pk2) = keypair(2);
+        let block2 = built_proved_and_mined(&mut chain, &[reward_transaction(&pk2, 50)]);
+        chain.apply_block(&block2).unwrap();
+
+        let rtxn = storage.read_txn().unwrap();
+        let work2 = chain.chain_work(&rtxn, block2.header.hash()).unwrap();
+        assert_eq!(work2, pow::add256(work1, per_block_work));
+    }
+
+    #[test]
+    fn empty_chain_has_the_genesis_parent_as_its_tip() {
+        let (_dir, storage, chain) = open();
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.tip_hash(&rtxn).unwrap(), GENESIS_PARENT_HASH);
+    }
+
+    #[test]
+    fn empty_chain_has_no_height() {
+        let (_dir, storage, chain) = open();
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.height(&rtxn).unwrap(), None);
+    }
+
+    #[test]
+    fn height_advances_by_one_with_every_applied_block() {
+        let (_dir, storage, mut chain) = open();
+        let (_sk, pk) = keypair(1);
+
+        let block1 = built_proved_and_mined(&mut chain, &[reward_transaction(&pk, 50)]);
+        chain.apply_block(&block1).unwrap();
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.height(&rtxn).unwrap(), Some(0));
+        drop(rtxn);
+
+        let (_sk2, pk2) = keypair(2);
+        let block2 = built_proved_and_mined(&mut chain, &[reward_transaction(&pk2, 50)]);
+        chain.apply_block(&block2).unwrap();
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.height(&rtxn).unwrap(), Some(1));
+    }
+
+    /// Mine and apply a block at each of `timestamps` in turn.
+    fn apply_at(chain: &mut Chain, timestamps: &[u64]) {
+        for &timestamp in timestamps {
+            // (A key per timestamp: no two rewards alike.)
+            let (_sk, pk) = keypair((timestamp % 251) as u8 + 1);
+            let unproven = chain.build_block(&[reward_transaction(&pk, 50)]).unwrap();
+            let target = unproven.target;
+            let proof = prover::Proof::placeholder();
+            let mut block = unproven.finish(proof);
+            block.header.timestamp = timestamp;
+            assert!(mine_block(&mut block, &target, 1_000_000, &crate::pow::Params::TEST), "should find a nonce quickly");
+            chain.apply_block(&block).unwrap();
+        }
+    }
+
+    /// Ten blocks from 1,000,000 ms on, `ms_apart` apart.
+    fn apply_ten(chain: &mut Chain, ms_apart: u64) {
+        let timestamps: Vec<u64> = (0..10).map(|i| 1_000_000 + i * ms_apart).collect();
+        apply_at(chain, &timestamps);
+    }
+
+    /// With `DifficultyConfig::for_tests()` (10 ms blocks, a 100 ms
+    /// half-life), ten blocks 1 ms apart end 81 ms ahead of schedule:
+    /// harder, by `2^0.81`.
+    #[test]
+    fn retargets_harder_when_blocks_come_faster_than_target() {
+        let (_dir, storage, mut chain) = open();
+        apply_ten(&mut chain, 1);
+
+        let rtxn = storage.read_txn().unwrap();
+        let target = chain.current_target(&rtxn).unwrap();
+        assert_eq!(target, asert(&DifficultyConfig::for_tests(), 1_000_000, 9, 1_000_009));
+        assert!(target < pow::scale(INITIAL_MAX_HASH, 100, 170) && target > pow::scale(INITIAL_MAX_HASH, 100, 180));
+    }
+
+    /// Ten blocks 30 ms apart end 180 ms (1.8 half-lives) behind: easier,
+    /// by `2^1.8`; ten 100 ms apart, 8.1 half-lives behind, saturate at
+    /// the easiest target there is.
+    #[test]
+    fn retargets_easier_when_blocks_come_slower_than_target() {
+        let (_dir, storage, mut chain) = open();
+        apply_ten(&mut chain, 30);
+        let rtxn = storage.read_txn().unwrap();
+        let target = chain.current_target(&rtxn).unwrap();
+        assert_eq!(target, asert(&DifficultyConfig::for_tests(), 1_000_000, 9, 1_000_270));
+        assert!(target > pow::scale(INITIAL_MAX_HASH, 34, 10) && target < pow::scale(INITIAL_MAX_HASH, 36, 10));
+        drop(rtxn);
+
+        let (_dir, storage, mut chain) = open();
+        apply_ten(&mut chain, 100);
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.current_target(&rtxn).unwrap(), [0xff; 32]);
+    }
+
+    /// Exactly one half-life behind schedule doubles the target; exactly
+    /// one ahead halves it; on schedule, it's the initial one.
+    #[test]
+    fn a_half_life_off_schedule_doubles_or_halves_the_target() {
+        let (_dir, storage, mut chain) = open();
+        apply_at(&mut chain, &[1_000_000, 1_000_110]);
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.current_target(&rtxn).unwrap(), pow::scale(INITIAL_MAX_HASH, 2, 1));
+        drop(rtxn);
+
+        let (_dir, storage, mut chain) = open();
+        let timestamps: Vec<u64> = (0..20).map(|i| 1_000_000 + i).chain([1_000_100]).collect();
+        apply_at(&mut chain, &timestamps);
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.current_target(&rtxn).unwrap(), pow::scale(INITIAL_MAX_HASH, 1, 2));
+        drop(rtxn);
+
+        let (_dir, storage, mut chain) = open();
+        apply_ten(&mut chain, 10);
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.current_target(&rtxn).unwrap(), INITIAL_MAX_HASH);
+    }
+
+    /// Unlike `apply_at`, which fakes `timestamp` by hand, this
+    /// never touches it at all -- `UnprovenBlock::finish` stamps every
+    /// block with the real clock (`block::now_millis`), so this
+    /// exercises retargeting against genuinely real elapsed time, not
+    /// a simulated stand-in for it. Only practical to do quickly
+    /// because `DifficultyConfig::for_tests()`'s blocks are
+    /// milliseconds, not seconds (see that method's docs): ten trivial
+    /// blocks, mined back to back with no injected delay, run in this
+    /// test in well under a second of wall-clock test time.
+    ///
+    /// The assertion deliberately doesn't predict a *direction*. The
+    /// first version of this test assumed ten trivial blocks would
+    /// obviously finish faster than the 90ms window and asserted the
+    /// target would harden -- and promptly failed, because
+    /// `apply_block` commits one real LMDB write transaction per
+    /// block, and `fsync`-on-commit durability makes that genuinely
+    /// slow and unpredictable in a sandboxed environment (slower, in
+    /// fact, than the 90ms budget here). That's a real example of
+    /// exactly why wall-clock-timing assertions are riskier than the
+    /// rest of this test suite: the *fact* that real elapsed time
+    /// drives retargeting is what's actually safe to assert, not which
+    /// way a given machine's disk happens to push it.
+    #[test]
+    fn retargeting_reacts_to_genuinely_real_elapsed_time() {
+        let (_dir, storage, mut chain) = open();
+
+        let rtxn = storage.read_txn().unwrap();
+        let initial_target = chain.current_target(&rtxn).unwrap();
+        drop(rtxn);
+
+        for i in 0..10 {
+            let (_sk, pk) = keypair((i + 1) as u8);
+            let unproven = chain.build_block(&[reward_transaction(&pk, 50)]).unwrap();
+            let target = unproven.target;
+            let proof = prover::Proof::placeholder();
+            let mut block = unproven.finish(proof); // timestamp: the real clock, untouched
+            assert!(mine_block(&mut block, &target, 100_000, &crate::pow::Params::TEST), "should find a nonce quickly");
+            chain.apply_block(&block).unwrap();
+        }
+
+        let rtxn = storage.read_txn().unwrap();
+        let new_target = chain.current_target(&rtxn).unwrap();
+        assert_ne!(
+            new_target, initial_target,
+            "expected ten real blocks to retarget away from the initial target in *some* direction"
+        );
+    }
+
+    /// Every unspent output's state-tree leaf records the height of the
+    /// block that created it -- and still does after a spend of another
+    /// output is unwound.
+    #[test]
+    fn every_leaf_records_its_outputs_creation_height() {
+        let (_dir, storage, mut chain) = open();
+        let (sk_a, pk_a) = keypair(1);
+        for (i, pk) in [pk_a.clone(), keypair(2).1, keypair(3).1].iter().enumerate() {
+            let block = built_proved_and_mined(&mut chain, &[reward_transaction(pk, 50 + i as u64)]);
+            chain.apply_block(&block).unwrap();
+        }
+        let (_sk, pk_b) = keypair(4);
+        let spend = spend_transaction(&sk_a, &pk_a, 50, &pk_b);
+        let block = built_proved_and_mined(&mut chain, &[spend]);
+        chain.apply_block(&block).unwrap();
+        let heights = |chain: &Chain| -> Vec<(u64, u32)> {
+            let rtxn = storage.read_txn().unwrap();
+            chain.state.unspent_in(&rtxn, 0, 1 << 40).unwrap().iter().map(|e| (e.0, e.3)).collect()
+        };
+        // Outputs at positions 0, 1, 2 from heights 0, 1, 2; position 0 spent
+        // at height 3, which created position 3.
+        assert_eq!(heights(&chain), [(1, 1), (2, 2), (3, 3)]);
+        // And the leaves hash it.
+        let rtxn = storage.read_txn().unwrap();
+        for (position, commitment, nonce, height) in chain.state.unspent_in(&rtxn, 0, 1 << 40).unwrap() {
+            assert_eq!(chain.state.leaf_at(&rtxn, position).unwrap(), crate::state_tree::leaf(&commitment, &nonce, height));
+        }
+        drop(rtxn);
+        unwind_committed(&storage, &mut chain);
+        assert_eq!(heights(&chain), [(0, 0), (1, 1), (2, 2)]);
+    }
+
+    /// An output locked to a policy (a 2-of-2, after an age of 3) is spent
+    /// by its branch -- refused by `build_block` while it's too young,
+    /// accepted once the lock holds.
+    #[test]
+    fn a_policy_output_is_spent_once_its_locks_hold() {
+        use crate::policy::{Branch, Policy};
+        let (_dir, _storage, mut chain) = open();
+        let (sk_a, pk_a) = keypair(1);
+        let first = built_proved_and_mined(&mut chain, &[reward_transaction(&pk_a, 50)]);
+        chain.apply_block(&first).unwrap();
+        let ((sk_b, pk_b), (sk_c, pk_c)) = (keypair(2), keypair(3));
+        let key = |pk: &PublicKey| crate::poseidon2::digest_to_bytes(pk.hash());
+        let branch = Branch { threshold: 2, keys: vec![key(&pk_b), key(&pk_c)], after_height: 0, after_age: 3, hashlock: None, rebind: None };
+        let policy = Policy { branches: vec![branch.clone()] };
+        let mut fund = Transaction::new();
+        fund.add_input(&pk_a, 50).unwrap();
+        fund.add_output(Output::locked(policy.lock(), 50)).unwrap();
+        assert!(fund.sign_input(&pk_a, &sk_a));
+        let funded = built_proved_and_mined(&mut chain, &[fund]);
+        chain.apply_block(&funded).unwrap(); // height 1: the policy output's creation
+
+        let spend = {
+            let mut tx = Transaction::new();
+            tx.add_policy_input(branch, 0, vec![], None, 50).unwrap();
+            tx.add_output(Output::new(&keypair(4).1, 50)).unwrap();
+            let commitment = Output::locked(policy.lock(), 50).commitment();
+            assert!(tx.sign_policy_input(&commitment, 0, &pk_b, crate::keytree::KeyProof::one_time(), &sk_b));
+            assert!(tx.sign_policy_input(&commitment, 1, &pk_c, crate::keytree::KeyProof::one_time(), &sk_c));
+            assert!(tx.verify());
+            tx
+        };
+        // Heights 2 and 3: too young (age 1, 2).
+        for k in 0..2u8 {
+            assert!(matches!(chain.build_block(std::slice::from_ref(&spend)), Err(Error::LockNotMet(0))));
+            let filler = built_proved_and_mined(&mut chain, &[reward_transaction(&keypair(10 + k).1, 50)]);
+            chain.apply_block(&filler).unwrap();
+        }
+        // Height 4: age 3.
+        let block = built_proved_and_mined(&mut chain, &[spend]);
+        assert_eq!(block.header.height, 4);
+        chain.apply_block(&block).unwrap();
+    }
+
+    #[test]
+    fn the_first_block_leaves_the_initial_target() {
+        let (_dir, storage, mut chain) = open();
+        let (_sk, pk) = keypair(1);
+        // The first block is the schedule's anchor: the next target is
+        // the initial one.
+        let block = built_proved_and_mined(&mut chain, &[reward_transaction(&pk, 50)]);
+        chain.apply_block(&block).unwrap();
+
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.current_target(&rtxn).unwrap(), INITIAL_MAX_HASH);
+    }
+
+    #[test]
+    fn build_block_produces_an_unproven_block_chaining_onto_the_tip() {
+        let (_dir, _storage, mut chain) = open();
+        let (_sk, pk) = keypair(1);
+        let tx = reward_transaction(&pk, 50);
+
+        let unproven = chain.build_block(&[tx]).unwrap();
+        assert_eq!(unproven.prev_hash, GENESIS_PARENT_HASH);
+        assert_eq!(unproven.outputs, vec![commitment_of(&pk, 50)]);
+    }
+
+    #[test]
+    fn finish_assembles_a_block_whose_body_hash_matches_but_is_not_yet_mined() {
+        let (_dir, _storage, mut chain) = open();
+        let (_sk, pk) = keypair(1);
+        let tx = reward_transaction(&pk, 50);
+
+        let unproven = chain.build_block(&[tx]).unwrap();
+        let proof = prover::Proof::placeholder();
+        let block = unproven.finish(proof);
+
+        assert_eq!(block.header.body_hash, block.body.body_hash());
+        // Not mined -- finish's job stops at assembling the fields, not
+        // finding a satisfying nonce.
+        assert!(!block.header.pow_valid(&INITIAL_MAX_HASH, &crate::pow::Params::TEST));
+    }
+
+    #[test]
+    fn build_block_rejects_a_transaction_that_does_not_verify() {
+        let (_dir, _storage, mut chain) = open();
+        let (_sk, pk) = keypair(1);
+        // An input with no signature at all: fails `Transaction::verify()`.
+        let mut bad = Transaction::new();
+        bad.add_input(&pk, 10).unwrap();
+
+        let err = chain.build_block(&[bad]).unwrap_err();
+        assert!(matches!(err, Error::InvalidTransaction(0)));
+    }
+
+    #[test]
+    fn build_then_apply_roundtrips_and_advances_the_tip() {
+        let (_dir, storage, mut chain) = open();
+        let (_sk, pk) = keypair(1);
+        let tx = reward_transaction(&pk, 50);
+
+        let block = built_proved_and_mined(&mut chain, &[tx]);
+        assert!(block.validate_structure(&INITIAL_MAX_HASH, &crate::pow::Params::TEST));
+
+        chain.apply_block(&block).unwrap();
+
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.tip_hash(&rtxn).unwrap(), block.header.hash());
+
+        let commitment = commitment_of(&pk, 50);
+        let position = chain.utxo.get(&rtxn, commitment).unwrap();
+        assert!(position.is_some());
+        assert_ne!(chain.state.leaf_at(&rtxn, position.unwrap()).unwrap(), crate::state_tree::SPENT);
+        assert_eq!(chain.state.root(&rtxn).unwrap(), block.header.state_root);
+        assert_eq!(chain.state.count(&rtxn).unwrap(), block.header.output_count);
+    }
+
+    #[test]
+    fn a_second_block_chains_onto_the_first_and_can_spend_its_output() {
+        let (_dir, storage, mut chain) = open();
+        let (sk_a, pk_a) = keypair(1);
+        let (_sk_b, pk_b) = keypair(2);
+
+        let block1 = built_proved_and_mined(&mut chain, &[reward_transaction(&pk_a, 50)]);
+        chain.apply_block(&block1).unwrap();
+
+        let spend = spend_transaction(&sk_a, &pk_a, 50, &pk_b);
+        let block2 = built_proved_and_mined(&mut chain, &[spend]);
+        assert_eq!(block2.header.prev_hash, block1.header.hash());
+
+        chain.apply_block(&block2).unwrap();
+
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.tip_hash(&rtxn).unwrap(), block2.header.hash());
+        // A's output is spent now: gone from the live utxo set.
+        assert_eq!(chain.utxo.get(&rtxn, commitment_of(&pk_a, 50)).unwrap(), None);
+        // B's output is live.
+        assert!(chain.utxo.get(&rtxn, commitment_of(&pk_b, 50)).unwrap().is_some());
+    }
+
+    #[test]
+    fn apply_block_rejects_a_block_that_fails_its_own_validate() {
+        let (_dir, _storage, mut chain) = open();
+        let (_sk, pk) = keypair(1);
+        let unproven = chain.build_block(&[reward_transaction(&pk, 50)]).unwrap();
+        let proof = prover::Proof::placeholder();
+        let target = unproven.target;
+        // Leave the nonce unmined -- pow_valid() will be false, so
+        // validate() fails before chain state is even consulted. (The
+        // tests' target is easy enough that an unmined header meets it
+        // one time in 256: move the timestamp until it doesn't.)
+        let mut block = unproven.finish(proof);
+        while block.header.pow_valid(&target, &crate::pow::Params::TEST) {
+            block.header.timestamp += 1;
+        }
+
+        let err = chain.apply_block(&block).unwrap_err();
+        assert!(matches!(err, Error::InvalidBlock));
+    }
+
+    #[test]
+    fn apply_block_rejects_a_wrong_parent_hash() {
+        let (_dir, _storage, mut chain) = open();
+        let (_sk, pk) = keypair(1);
+        let mut unproven = chain.build_block(&[reward_transaction(&pk, 50)]).unwrap();
+        unproven.prev_hash = [0xffu8; 32];
+        let target = unproven.target;
+        let proof = prover::Proof::placeholder();
+        let mut block = unproven.finish(proof);
+        assert!(mine_block(&mut block, &target, 100_000, &crate::pow::Params::TEST));
+
+        let err = chain.apply_block(&block).unwrap_err();
+        assert!(matches!(err, Error::WrongParent));
+    }
+
+    /// `prev_hash` can be made to match the real tip while `height`
+    /// still doesn't -- these are independent checks, and this confirms
+    /// `height` is actually enforced, not just carried along for show.
+    #[test]
+    fn apply_block_rejects_a_wrong_height() {
+        let (_dir, _storage, mut chain) = open();
+        let (_sk, pk) = keypair(1);
+        let mut unproven = chain.build_block(&[reward_transaction(&pk, 50)]).unwrap();
+        unproven.height = 1; // the real first block must be height 0
+        let target = unproven.target;
+        let proof = prover::Proof::placeholder();
+        let mut block = unproven.finish(proof);
+        assert!(mine_block(&mut block, &target, 100_000, &crate::pow::Params::TEST));
+
+        let err = chain.apply_block(&block).unwrap_err();
+        assert!(matches!(err, Error::WrongHeight));
+    }
+
+    #[test]
+    fn apply_block_rejects_a_timestamp_too_far_in_the_future() {
+        let (_dir, _storage, mut chain) = open();
+        let (_sk, pk) = keypair(1);
+        let unproven = chain.build_block(&[reward_transaction(&pk, 50)]).unwrap();
+        let target = unproven.target;
+        let proof = prover::Proof::placeholder();
+        let mut block = unproven.finish(proof);
+        // Comfortably past MAX_FUTURE_DRIFT_MS -- re-mined since
+        // changing `timestamp` changes the PoW preimage.
+        block.header.timestamp = now_millis() + MAX_FUTURE_DRIFT_MS + 3600;
+        assert!(mine_block(&mut block, &target, 100_000, &crate::pow::Params::TEST));
+
+        let err = chain.apply_block(&block).unwrap_err();
+        assert!(matches!(err, Error::TimestampTooFarInFuture));
+    }
+
+    #[test]
+    fn apply_block_accepts_a_timestamp_within_the_future_tolerance() {
+        let (_dir, _storage, mut chain) = open();
+        let (_sk, pk) = keypair(1);
+        let unproven = chain.build_block(&[reward_transaction(&pk, 50)]).unwrap();
+        let target = unproven.target;
+        let proof = prover::Proof::placeholder();
+        let mut block = unproven.finish(proof);
+        // Just inside the tolerance -- must not be rejected on that
+        // basis alone.
+        block.header.timestamp = now_millis() + MAX_FUTURE_DRIFT_MS - 1;
+        assert!(mine_block(&mut block, &target, 100_000, &crate::pow::Params::TEST));
+
+        chain.apply_block(&block).unwrap();
+    }
+
+    /// `build_block` runs the exact same resolution `apply_block` does
+    /// (see the module docs), so an unresolvable input is actually
+    /// caught right there, before a block even exists to apply.
+    #[test]
+    fn build_block_rejects_an_input_that_never_existed() {
+        let (_dir, _storage, mut chain) = open();
+        let (sk_a, pk_a) = keypair(1);
+        let (_sk_b, pk_b) = keypair(2);
+        // Nothing has ever created this output, so spending it can't
+        // resolve.
+        let spend = spend_transaction(&sk_a, &pk_a, 50, &pk_b);
+
+        let err = chain.build_block(&[spend]).unwrap_err();
+        assert!(matches!(err, Error::UnresolvedInput(c) if c == commitment_of(&pk_a, 50)));
+    }
+
+    /// Constructed by hand rather than via `build_block`, so this checks
+    /// `apply_block`'s own resolution independently -- not just that
+    /// `build_block` happens to catch the same thing first.
+    #[test]
+    fn apply_block_rejects_an_input_that_never_existed() {
+        let (_dir, _storage, mut chain) = open();
+        let (sk_a, pk_a) = keypair(1);
+        let (_sk_b, pk_b) = keypair(2);
+
+        let mut body = BlockBody::new();
+        assert!(body.add_transaction(&spend_transaction(&sk_a, &pk_a, 50, &pk_b)));
+        let header = BlockHeader {
+            prev_hash: GENESIS_PARENT_HASH,
+            state_root: [0u8; 32],
+            output_count: 0,
+            body_hash: body.body_hash(),
+            aux_hash: [0; 32],
+            version: crate::block::BLOCK_VERSION,
+            height: 0,
+            timestamp: 0,
+            nonce: [0u8; 32],
+        };
+        let mut block = Block { header, body };
+        assert!(mine_block(&mut block, &INITIAL_MAX_HASH, 100_000, &crate::pow::Params::TEST));
+
+        let err = chain.apply_block(&block).unwrap_err();
+        assert!(matches!(err, Error::UnresolvedInput(c) if c == commitment_of(&pk_a, 50)));
+    }
+
+    #[test]
+    fn apply_block_rejects_an_output_colliding_with_a_still_live_one() {
+        let (_dir, _storage, mut chain) = open();
+        let (_sk, pk) = keypair(1);
+
+        let block1 = built_proved_and_mined(&mut chain, &[reward_transaction(&pk, 50)]);
+        chain.apply_block(&block1).unwrap();
+
+        // The exact same (pubkey, amount) again -- same commitment,
+        // still live from block1, so this must be rejected rather than
+        // silently creating a second, indistinguishable entry.
+        let err = chain.build_block(&[reward_transaction(&pk, 50)]).unwrap_err();
+        assert!(matches!(err, Error::DuplicateOutput(c) if c == commitment_of(&pk, 50)));
+    }
+
+    #[test]
+    fn reusing_a_commitment_is_fine_once_the_original_is_spent() {
+        let (_dir, storage, mut chain) = open();
+        let (sk_a, pk_a) = keypair(1);
+        let (_sk_b, pk_b) = keypair(2);
+
+        let block1 = built_proved_and_mined(&mut chain, &[reward_transaction(&pk_a, 50)]);
+        chain.apply_block(&block1).unwrap();
+
+        let spend = spend_transaction(&sk_a, &pk_a, 50, &pk_b);
+        let block2 = built_proved_and_mined(&mut chain, &[spend]);
+        chain.apply_block(&block2).unwrap();
+
+        // pk_a/50 is spent now -- recreating the exact same commitment
+        // must be allowed, since there's nothing live to collide with.
+        let block3 = built_proved_and_mined(&mut chain, &[reward_transaction(&pk_a, 50)]);
+        chain.apply_block(&block3).unwrap();
+
+        let rtxn = storage.read_txn().unwrap();
+        assert!(chain.utxo.get(&rtxn, commitment_of(&pk_a, 50)).unwrap().is_some());
+    }
+
+    /// Unwinding across a commitment that was created, spent and created
+    /// again restores the first output exactly: live, at its position,
+    /// with its own height and nonce (once took the second's record, or
+    /// failed with `Corrupt` because unwinding the re-creation deleted it).
+    #[test]
+    fn unwinding_past_a_recreated_commitment_restores_the_original() {
+        let (_dir, storage, mut chain) = open();
+        let (sk_a, pk_a) = keypair(1);
+        let (_sk_b, pk_b) = keypair(2);
+        let c = commitment_of(&pk_a, 50);
+
+        let block1 = built_proved_and_mined(&mut chain, &[reward_transaction(&pk_a, 50)]);
+        chain.apply_block(&block1).unwrap();
+        let (root1, position1, record1) = {
+            let rtxn = storage.read_txn().unwrap();
+            (chain.state.root(&rtxn).unwrap(), chain.utxo.get(&rtxn, c).unwrap().unwrap(), chain.output_record(&rtxn, &c).unwrap().unwrap())
+        };
+        let block2 = built_proved_and_mined(&mut chain, &[spend_transaction(&sk_a, &pk_a, 50, &pk_b)]);
+        chain.apply_block(&block2).unwrap();
+        let block3 = built_proved_and_mined(&mut chain, &[reward_transaction(&pk_a, 50)]);
+        chain.apply_block(&block3).unwrap();
+        {
+            let rtxn = storage.read_txn().unwrap();
+            assert_ne!(chain.utxo.get(&rtxn, c).unwrap(), Some(position1), "the re-creation has its own position");
+        }
+
+        let mut wtxn = storage.write_txn().unwrap();
+        chain.unwind_tip(&mut wtxn).unwrap(); // block 3: c is spent again, its first record back
+        assert_eq!(chain.utxo.get(&wtxn, c).unwrap(), None);
+        assert_eq!(chain.output_record(&wtxn, &c).unwrap().unwrap().height, record1.height);
+        chain.unwind_tip(&mut wtxn).unwrap(); // block 2: c is live again, as block 1 made it
+        assert_eq!(chain.utxo.get(&wtxn, c).unwrap(), Some(position1));
+        let record = chain.output_record(&wtxn, &c).unwrap().unwrap();
+        assert_eq!((record.height, record.nonce), (record1.height, record1.nonce));
+        assert_eq!(chain.state.root(&wtxn).unwrap(), root1);
+        wtxn.commit().unwrap();
+    }
+
+    /// The whole point of the transactional restructuring: a failed
+    /// `apply_block` must leave every store exactly as it was, with
+    /// nothing partially written.
+    #[test]
+    fn a_failed_apply_block_leaves_every_store_untouched() {
+        let (_dir, storage, mut chain) = open();
+        let (_sk, pk) = keypair(1);
+
+        let mut unproven = chain.build_block(&[reward_transaction(&pk, 50)]).unwrap();
+        // Corrupt the claimed root after the fact so resolve_and_apply's
+        // real result won't match it -- this fails only after inputs/
+        // outputs have already been resolved and written against wtxn,
+        // exactly the partial-progress scenario atomicity has to cover.
+        unproven.state_root = [0xabu8; 32];
+        let target = unproven.target;
+        let proof = prover::Proof::placeholder();
+        let mut block = unproven.finish(proof);
+        assert!(mine_block(&mut block, &target, 100_000, &crate::pow::Params::TEST));
+
+        let err = chain.apply_block(&block).unwrap_err();
+        assert!(matches!(err, Error::StateRootMismatch));
+
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.tip_hash(&rtxn).unwrap(), GENESIS_PARENT_HASH);
+        assert_eq!(chain.utxo.get(&rtxn, commitment_of(&pk, 50)).unwrap(), None);
+        assert_eq!(chain.state.count(&rtxn).unwrap(), 0);
+    }
+
+    #[test]
+    fn accept_block_applies_a_block_that_extends_the_tip() {
+        let (_dir, storage, mut chain) = open();
+        let (_sk, pk) = keypair(1);
+        let block = built_proved_and_mined(&mut chain, &[reward_transaction(&pk, 50)]);
+
+        assert_eq!(chain.accept_block(block.clone()).unwrap(), AcceptOutcome::Applied);
+
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.tip_hash(&rtxn).unwrap(), block.header.hash());
+    }
+
+    #[test]
+    fn accept_block_stores_a_side_branch_without_switching_on_equal_work() {
+        let (_dir, storage, mut chain) = open();
+        let (_sk_a, pk_a) = keypair(1);
+        let active = built_proved_and_mined(&mut chain, &[reward_transaction(&pk_a, 50)]);
+        chain.apply_block(&active).unwrap();
+
+        // A single competing block, also extending genesis -- same
+        // height, same (default, since neither chain has retargeted)
+        // target, so equal work. Built against its own independent
+        // chain, never applied there.
+        let competing = build_chain(1, 99);
+        let competing = competing.into_iter().next().unwrap();
+
+        assert_eq!(chain.accept_block(competing).unwrap(), AcceptOutcome::StoredAsSideBranch);
+
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.tip_hash(&rtxn).unwrap(), active.header.hash());
+    }
+
+    #[test]
+    fn accept_block_reorgs_onto_a_heavier_competing_chain() {
+        let (_dir, storage, mut chain) = open();
+        let (_sk_a, pk_a) = keypair(1);
+        let active1 = built_proved_and_mined(&mut chain, &[reward_transaction(&pk_a, 50)]);
+        chain.apply_block(&active1).unwrap();
+        let (_sk_b, pk_b) = keypair(2);
+        let active2 = built_proved_and_mined(&mut chain, &[reward_transaction(&pk_b, 50)]);
+        chain.apply_block(&active2).unwrap();
+
+        // A fully independent competing chain, also from genesis, one
+        // block longer -- strictly more work (same target throughout;
+        // neither chain is anywhere near a retarget window).
+        let competing = build_chain(3, 100);
+
+        let mut last_outcome = None;
+        for block in competing.iter().cloned() {
+            last_outcome = Some(chain.accept_block(block).unwrap());
+        }
+        assert_eq!(last_outcome, Some(AcceptOutcome::Reorged { unwound: 2, applied: 3 }));
+
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.tip_hash(&rtxn).unwrap(), competing.last().unwrap().header.hash());
+        // The active chain's own outputs are genuinely gone, not just
+        // shadowed by the winning branch's.
+        assert_eq!(chain.utxo.get(&rtxn, commitment_of(&pk_a, 50)).unwrap(), None);
+        assert_eq!(chain.utxo.get(&rtxn, commitment_of(&pk_b, 50)).unwrap(), None);
+    }
+
+    /// A competing branch that was stored back when it was still
+    /// within reach, but whose fork point the active chain has since
+    /// moved more than `TEST_MAX_REORG_DEPTH` past: even once that
+    /// branch becomes strictly heavier, it must be refused rather than
+    /// attempted.
+    #[test]
+    fn accept_block_rejects_a_reorg_deeper_than_max_reorg_depth() {
+        let (_dir, storage, mut chain) = open();
+        let competing = build_chain(TEST_MAX_REORG_DEPTH + 3, 100);
+
+        let mut active_tip = None;
+        for i in 0..(TEST_MAX_REORG_DEPTH + 2) {
+            let (_sk, pk) = keypair((i + 1) as u8);
+            let block = built_proved_and_mined(&mut chain, &[reward_transaction(&pk, 50)]);
+            chain.apply_block(&block).unwrap();
+            active_tip = Some(block.header.hash());
+            // The competing branch's first two blocks arrive early,
+            // while genesis is still within reach.
+            if i < 2 {
+                let outcome = chain.accept_block(competing[i as usize].clone()).unwrap();
+                assert_eq!(outcome, AcceptOutcome::StoredAsSideBranch);
+            }
+        }
+
+        let mut last_outcome = None;
+        for block in competing.into_iter().skip(2) {
+            last_outcome = Some(chain.accept_block(block));
+        }
+        assert!(matches!(last_outcome, Some(Err(Error::ReorgTooDeep))));
+
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.tip_hash(&rtxn).unwrap(), active_tip.unwrap());
+    }
+
+    /// A block that could only ever fork off the active chain further
+    /// back than `TEST_MAX_REORG_DEPTH` is refused on arrival -- not
+    /// stored, and not pooled as an orphan either.
+    #[test]
+    fn accept_block_refuses_a_block_at_or_below_the_reorg_floor() {
+        let (_dir, storage, mut chain) = open();
+        for i in 0..(TEST_MAX_REORG_DEPTH + 2) {
+            let (_sk, pk) = keypair((i + 1) as u8);
+            let block = built_proved_and_mined(&mut chain, &[reward_transaction(&pk, 50)]);
+            chain.apply_block(&block).unwrap();
+        }
+
+        // Active tip is at height 6, so the floor is 1: heights 0 and 1
+        // are out of reach.
+        let competing = build_chain(2, 100);
+        for block in competing.iter().cloned() {
+            assert!(matches!(chain.accept_block(block), Err(Error::ReorgTooDeep)));
+        }
+
+        let rtxn = storage.read_txn().unwrap();
+        assert!(chain.blocks.get(&rtxn, &competing[0].header.hash()).unwrap().is_none());
+        assert!(chain.orphans.is_empty());
+    }
+
+    /// Two miners neck and neck: the competing branch keeps pace with
+    /// the active chain for `TEST_MAX_REORG_DEPTH` blocks, then pulls
+    /// ahead by one. The unwind is exactly `TEST_MAX_REORG_DEPTH`
+    /// (allowed) even though the branch being replayed is one longer --
+    /// the replay side mustn't be held to the unwind limit.
+    #[test]
+    fn accept_block_reorgs_onto_a_branch_longer_than_max_reorg_depth() {
+        let (_dir, storage, mut chain) = open();
+        let (_builder_dir, _builder_storage, mut builder) = open();
+
+        let (_sk, pk) = keypair(1);
+        let shared = built_proved_and_mined(&mut chain, &[reward_transaction(&pk, 50)]);
+        chain.apply_block(&shared).unwrap();
+        builder.apply_block(&shared).unwrap();
+
+        let mut competing = Vec::new();
+        for i in 0..=TEST_MAX_REORG_DEPTH {
+            let (_sk, pk) = keypair(100 + i as u8);
+            let block = built_proved_and_mined(&mut builder, &[reward_transaction(&pk, 50)]);
+            builder.apply_block(&block).unwrap();
+            competing.push(block);
+        }
+
+        for i in 0..TEST_MAX_REORG_DEPTH {
+            let (_sk, pk) = keypair(2 + i as u8);
+            let block = built_proved_and_mined(&mut chain, &[reward_transaction(&pk, 50)]);
+            chain.apply_block(&block).unwrap();
+            let outcome = chain.accept_block(competing[i as usize].clone()).unwrap();
+            assert_eq!(outcome, AcceptOutcome::StoredAsSideBranch);
+        }
+
+        let last = competing.last().unwrap().clone();
+        assert_eq!(
+            chain.accept_block(last.clone()).unwrap(),
+            AcceptOutcome::Reorged {
+                unwound: TEST_MAX_REORG_DEPTH,
+                applied: TEST_MAX_REORG_DEPTH + 1
+            }
+        );
+
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.tip_hash(&rtxn).unwrap(), last.header.hash());
+    }
+
+    #[test]
+    fn accept_block_orphans_a_block_with_an_unknown_parent() {
+        let (_dir, _storage, mut chain) = open();
+        let other = build_chain(2, 1);
+        let child = other.into_iter().nth(1).unwrap();
+
+        assert_eq!(chain.accept_block(child).unwrap(), AcceptOutcome::Orphaned);
+    }
+
+    #[test]
+    fn accepting_a_missing_parent_connects_the_orphans_waiting_on_it() {
+        let (_dir, storage, mut chain) = open();
+        let mut other = build_chain(3, 1).into_iter();
+        let parent = other.next().unwrap();
+        let child = other.next().unwrap();
+        let grandchild = other.next().unwrap();
+
+        // Out of order: the grandchild first, then the child.
+        assert_eq!(chain.accept_block(grandchild.clone()).unwrap(), AcceptOutcome::Orphaned);
+        assert_eq!(chain.accept_block(child).unwrap(), AcceptOutcome::Orphaned);
+        assert_eq!(chain.accept_block(parent).unwrap(), AcceptOutcome::Applied);
+
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.tip_hash(&rtxn).unwrap(), grandchild.header.hash());
+        assert!(chain.orphans.is_empty());
+    }
+
+    #[test]
+    fn connect_orphans_reports_each_retried_orphans_outcome() {
+        let (_dir, _storage, mut chain) = open();
+        let mut other = build_chain(2, 1).into_iter();
+        let parent = other.next().unwrap();
+        let child = other.next().unwrap();
+
+        assert_eq!(chain.accept_block(child).unwrap(), AcceptOutcome::Orphaned);
+        // Bypass `accept_block`'s automatic retry, to see it directly.
+        assert_eq!(chain.accept_one(parent.clone()).unwrap(), AcceptOutcome::Applied);
+
+        let outcomes = chain.connect_orphans(parent.header.hash());
+        assert_eq!(outcomes.len(), 1);
+        assert!(matches!(outcomes[0], Ok(AcceptOutcome::Applied)));
+    }
+
+    /// Past `max_orphans`, the *oldest* orphan is the one evicted.
+    #[test]
+    fn the_orphan_pool_evicts_its_oldest_entry_when_full() {
+        let (_dir, storage, mut chain) = open();
+        chain.max_orphans = 2;
+        let blocks = build_chain(4, 1);
+
+        for block in &blocks[1..] {
+            assert_eq!(chain.accept_block(block.clone()).unwrap(), AcceptOutcome::Orphaned);
+        }
+        // blocks[1] -- the oldest -- was evicted to make room for blocks[3].
+        assert_eq!(chain.orphans.len(), 2);
+
+        assert_eq!(chain.accept_block(blocks[0].clone()).unwrap(), AcceptOutcome::Applied);
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.tip_hash(&rtxn).unwrap(), blocks[0].header.hash());
+        drop(rtxn);
+
+        // Once blocks[1] arrives again, the rest connect behind it.
+        assert_eq!(chain.accept_block(blocks[1].clone()).unwrap(), AcceptOutcome::Applied);
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.tip_hash(&rtxn).unwrap(), blocks[3].header.hash());
+        assert!(chain.orphans.is_empty());
+    }
+
+    #[test]
+    fn accept_block_reports_an_already_applied_block_as_already_known() {
+        let (_dir, storage, mut chain) = open();
+        let (_sk, pk) = keypair(1);
+        let block = built_proved_and_mined(&mut chain, &[reward_transaction(&pk, 50)]);
+        assert_eq!(chain.accept_block(block.clone()).unwrap(), AcceptOutcome::Applied);
+
+        assert_eq!(chain.accept_block(block.clone()).unwrap(), AcceptOutcome::AlreadyKnown);
+
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.tip_hash(&rtxn).unwrap(), block.header.hash());
+    }
+
+    #[test]
+    fn accept_block_reports_an_already_stored_side_branch_block_as_already_known() {
+        let (_dir, _storage, mut chain) = open();
+        let (_sk, pk) = keypair(1);
+        let active = built_proved_and_mined(&mut chain, &[reward_transaction(&pk, 50)]);
+        chain.apply_block(&active).unwrap();
+
+        let competing = build_chain(1, 99).into_iter().next().unwrap();
+        assert_eq!(chain.accept_block(competing.clone()).unwrap(), AcceptOutcome::StoredAsSideBranch);
+        assert_eq!(chain.accept_block(competing).unwrap(), AcceptOutcome::AlreadyKnown);
+    }
+
+    #[test]
+    fn accept_block_does_not_pool_the_same_orphan_twice() {
+        let (_dir, _storage, mut chain) = open();
+        let mut other = build_chain(2, 1).into_iter();
+        let parent = other.next().unwrap();
+        let child = other.next().unwrap();
+
+        assert_eq!(chain.accept_block(child.clone()).unwrap(), AcceptOutcome::Orphaned);
+        assert_eq!(chain.accept_block(child).unwrap(), AcceptOutcome::AlreadyKnown);
+
+        chain.accept_block(parent).unwrap();
+        assert!(chain.orphans.is_empty());
+    }
+
+    /// The winning branch shares a real prefix with the active chain
+    /// (not just genesis) and spends that prefix's output *differently*
+    /// -- the reorg has to un-spend it from the active side and
+    /// re-spend it the branch's way, ending with exactly the state a
+    /// node that only ever saw the winning branch would have.
+    #[test]
+    fn accept_block_reorgs_a_mid_chain_fork_that_spends_differently() {
+        let (_dir, storage, mut chain) = open();
+        let (_builder_dir, builder_storage, mut builder) = open();
+
+        let (sk_a, pk_a) = keypair(1);
+        let shared = built_proved_and_mined(&mut chain, &[reward_transaction(&pk_a, 50)]);
+        chain.apply_block(&shared).unwrap();
+        builder.apply_block(&shared).unwrap();
+
+        let rtxn = storage.read_txn().unwrap();
+        let position_a = chain.utxo.get(&rtxn, commitment_of(&pk_a, 50)).unwrap().unwrap();
+        drop(rtxn);
+
+        // Active: A -> B.
+        let (_sk_b, pk_b) = keypair(2);
+        let active2 = built_proved_and_mined(&mut chain, &[spend_transaction(&sk_a, &pk_a, 50, &pk_b)]);
+        chain.apply_block(&active2).unwrap();
+
+        // Competing: A -> C, then a fresh reward to D.
+        let (_sk_c, pk_c) = keypair(3);
+        let competing2 = built_proved_and_mined(&mut builder, &[spend_transaction(&sk_a, &pk_a, 50, &pk_c)]);
+        builder.apply_block(&competing2).unwrap();
+        let (_sk_d, pk_d) = keypair(4);
+        let competing3 = built_proved_and_mined(&mut builder, &[reward_transaction(&pk_d, 50)]);
+        builder.apply_block(&competing3).unwrap();
+
+        assert_eq!(chain.accept_block(competing2).unwrap(), AcceptOutcome::StoredAsSideBranch);
+        assert_eq!(
+            chain.accept_block(competing3.clone()).unwrap(),
+            AcceptOutcome::Reorged { unwound: 1, applied: 2 }
+        );
+
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.tip_hash(&rtxn).unwrap(), competing3.header.hash());
+        assert_eq!(chain.utxo.get(&rtxn, commitment_of(&pk_a, 50)).unwrap(), None);
+        assert!((chain.state.leaf_at(&rtxn, position_a).unwrap() == crate::state_tree::SPENT));
+        assert_eq!(chain.utxo.get(&rtxn, commitment_of(&pk_b, 50)).unwrap(), None);
+        assert!(chain.utxo.get(&rtxn, commitment_of(&pk_c, 50)).unwrap().is_some());
+        assert!(chain.utxo.get(&rtxn, commitment_of(&pk_d, 50)).unwrap().is_some());
+
+        let builder_rtxn = builder_storage.read_txn().unwrap();
+        assert_eq!(chain.state.root(&rtxn).unwrap(), builder.state.root(&builder_rtxn).unwrap());
+        assert_eq!(chain.state.count(&rtxn).unwrap(), builder.state.count(&builder_rtxn).unwrap());
+    }
+
+    /// A heavier branch whose last block is bad (passes its own
+    /// `validate`, but claims the wrong `state_root`): the reorg gets as
+    /// far as replaying the branch's good blocks before hitting it, and
+    /// must then leave the active chain exactly as it was -- and record
+    /// the bad block, so a block built on top of it is refused outright
+    /// rather than triggering the same doomed reorg again.
+    #[test]
+    fn a_reorg_onto_a_branch_with_a_bad_block_aborts_and_is_not_retried() {
+        let (_dir, storage, mut chain) = open();
+        let (_sk_a, pk_a) = keypair(1);
+        let active1 = built_proved_and_mined(&mut chain, &[reward_transaction(&pk_a, 50)]);
+        chain.apply_block(&active1).unwrap();
+        let (_sk_b, pk_b) = keypair(2);
+        let active2 = built_proved_and_mined(&mut chain, &[reward_transaction(&pk_b, 50)]);
+        chain.apply_block(&active2).unwrap();
+
+        let rtxn = storage.read_txn().unwrap();
+        let root_before = chain.state.root(&rtxn).unwrap();
+        let count_before = chain.state.count(&rtxn).unwrap();
+        drop(rtxn);
+
+        let (_builder_dir, _builder_storage, mut builder) = open();
+        let mut good = Vec::new();
+        for i in 0..2u8 {
+            let (_sk, pk) = keypair(100 + i);
+            let block = built_proved_and_mined(&mut builder, &[reward_transaction(&pk, 50)]);
+            builder.apply_block(&block).unwrap();
+            good.push(block);
+        }
+
+        let (_sk_bad, pk_bad) = keypair(102);
+        let bad_txs = [reward_transaction(&pk_bad, 50)];
+        let mut unproven = builder.build_block(&bad_txs).unwrap();
+        unproven.state_root = [0xabu8; 32];
+        let target = unproven.target;
+        let proof = prover::Proof::placeholder();
+        let mut bad = unproven.finish(proof);
+        assert!(mine_block(&mut bad, &target, 100_000, &crate::pow::Params::TEST));
+
+        // Built on top of `bad`, which `builder` itself never applied --
+        // only its lineage matters; it should never get as far as
+        // having its roots checked.
+        let (_sk_after, pk_after) = keypair(103);
+        let after_txs = [reward_transaction(&pk_after, 50)];
+        let mut unproven = builder.build_block(&after_txs).unwrap();
+        unproven.prev_hash = bad.header.hash();
+        unproven.height = bad.header.height + 1;
+        let proof = prover::Proof::placeholder();
+        let mut after = unproven.finish(proof);
+        assert!(mine_block(&mut after, &target, 100_000, &crate::pow::Params::TEST));
+
+        for block in good {
+            assert_eq!(chain.accept_block(block).unwrap(), AcceptOutcome::StoredAsSideBranch);
+        }
+        let err = chain.accept_block(bad.clone()).unwrap_err();
+        assert!(matches!(err, Error::StateRootMismatch));
+
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.tip_hash(&rtxn).unwrap(), active2.header.hash());
+        assert_eq!(chain.state.root(&rtxn).unwrap(), root_before);
+        assert_eq!(chain.state.count(&rtxn).unwrap(), count_before);
+        assert!(chain.utxo.get(&rtxn, commitment_of(&pk_a, 50)).unwrap().is_some());
+        assert!(chain.utxo.get(&rtxn, commitment_of(&pk_b, 50)).unwrap().is_some());
+        assert!(chain.is_known_invalid(&rtxn, bad.header.hash()).unwrap());
+        drop(rtxn);
+
+        assert!(matches!(chain.accept_block(after), Err(Error::KnownInvalidBlock)));
+        assert!(matches!(chain.accept_block(bad), Err(Error::KnownInvalidBlock)));
+
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.tip_hash(&rtxn).unwrap(), active2.header.hash());
+    }
+
+    /// The real `build_block` -> prove -> finish -> mine pipeline, like
+    /// `built_proved_and_mined`, but with a hand-set `timestamp` -- for
+    /// tests that need to steer retargeting.
+    fn built_proved_and_mined_at(chain: &mut Chain, transactions: &[Transaction], timestamp: u64) -> Block {
+        let unproven = chain.build_block(transactions).unwrap();
+        let target = unproven.target;
+        let proof = prover::Proof::placeholder();
+        let mut block = unproven.finish(proof);
+        block.header.timestamp = timestamp;
+        assert!(mine_block(&mut block, &target, 100_000, &crate::pow::Params::TEST), "should find a nonce quickly");
+        block
+    }
+
+    /// A fork whose branches run at different speeds, so they end on
+    /// different targets. The competing branch's next block meets *its
+    /// own* (easier) target but deliberately not the active chain's --
+    /// it has to be accepted against the former.
+    #[test]
+    fn a_side_branch_block_is_checked_against_its_own_branchs_target() {
+        let (_dir, storage, mut chain) = open();
+        let (_builder_dir, builder_storage, mut builder) = open();
+        let interval = 10;
+        let start = 1_000_000u64;
+
+        // Heights 0..=5, shared.
+        for i in 0..6u64 {
+            let (_sk, pk) = keypair(1 + i as u8);
+            let block = built_proved_and_mined_at(&mut chain, &[reward_transaction(&pk, 50)], start + 10 * i);
+            chain.apply_block(&block).unwrap();
+            builder.apply_block(&block).unwrap();
+        }
+
+        // Heights 6..=9 on each side, on schedule (so equal work) but for
+        // the last: early on the active side (a harder target after it),
+        // late on the competing side (easier).
+        let at = |i: u64, last: u64| if i + 1 < interval { start + 10 * i } else { start + last };
+        for i in 6..interval {
+            let (_sk, pk) = keypair(1 + i as u8);
+            let block = built_proved_and_mined_at(&mut chain, &[reward_transaction(&pk, 50)], at(i, 81));
+            chain.apply_block(&block).unwrap();
+        }
+        let mut competing = Vec::new();
+        for i in 6..interval {
+            let (_sk, pk) = keypair(100 + i as u8);
+            let block = built_proved_and_mined_at(&mut builder, &[reward_transaction(&pk, 50)], at(i, 140));
+            builder.apply_block(&block).unwrap();
+            competing.push(block);
+        }
+
+        let rtxn = storage.read_txn().unwrap();
+        let active_target = chain.current_target(&rtxn).unwrap();
+        drop(rtxn);
+        let builder_rtxn = builder_storage.read_txn().unwrap();
+        let competing_target = builder.current_target(&builder_rtxn).unwrap();
+        drop(builder_rtxn);
+        assert!(competing_target > active_target, "competing branch should have retargeted easier");
+
+        // Height 10 on the competing side, re-mined until it meets only
+        // its easier target.
+        let (_sk, pk) = keypair(200);
+        let mut timestamp = start + 1_000;
+        let post_window = loop {
+            let block = built_proved_and_mined_at(&mut builder, &[reward_transaction(&pk, 50)], timestamp);
+            if !block.header.pow_valid(&active_target, &crate::pow::Params::TEST) {
+                break block;
+            }
+            timestamp += 1;
+        };
+        builder.apply_block(&post_window).unwrap();
+        competing.push(post_window.clone());
+
+        for block in &competing[..competing.len() - 1] {
+            assert_eq!(chain.accept_block(block.clone()).unwrap(), AcceptOutcome::StoredAsSideBranch);
+        }
+        assert_eq!(
+            chain.accept_block(post_window.clone()).unwrap(),
+            AcceptOutcome::Reorged { unwound: 4, applied: 5 }
+        );
+
+        let rtxn = storage.read_txn().unwrap();
+        let builder_rtxn = builder_storage.read_txn().unwrap();
+        assert_eq!(chain.tip_hash(&rtxn).unwrap(), post_window.header.hash());
+        assert_eq!(chain.current_target(&rtxn).unwrap(), builder.current_target(&builder_rtxn).unwrap());
+        assert_eq!(chain.state.root(&rtxn).unwrap(), builder.state.root(&builder_rtxn).unwrap());
+    }
+
+    /// Below `reorg_floor`, side-branch blocks are dropped entirely and
+    /// active-chain blocks keep only the block itself (for serving
+    /// sync); at or above it, everything is kept, and is exactly enough
+    /// to unwind the full `TEST_MAX_REORG_DEPTH`.
+    #[test]
+    fn blocks_below_the_reorg_floor_are_pruned() {
+        let (_dir, storage, mut chain) = open();
+        let mut active = Vec::new();
+        let (_sk, pk) = keypair(1);
+        let first = built_proved_and_mined(&mut chain, &[reward_transaction(&pk, 50)]);
+        chain.apply_block(&first).unwrap();
+        active.push(first);
+
+        let side = build_chain(1, 99).into_iter().next().unwrap();
+        assert_eq!(chain.accept_block(side.clone()).unwrap(), AcceptOutcome::StoredAsSideBranch);
+
+        for i in 1..8u8 {
+            let (_sk, pk) = keypair(1 + i);
+            let block = built_proved_and_mined(&mut chain, &[reward_transaction(&pk, 50)]);
+            chain.apply_block(&block).unwrap();
+            active.push(block);
+        }
+
+        // Tip at height 7, floor at 2: heights 0 and 1 are out of reach.
+        let rtxn = storage.read_txn().unwrap();
+        assert!(chain.blocks.get(&rtxn, &side.header.hash()).unwrap().is_none());
+        for block in active[..2].iter().chain(std::iter::once(&side)) {
+            let hash = block.header.hash();
+            assert!(chain.block_undo.get(&rtxn, &hash).unwrap().is_none());
+            assert!(chain.block_work.get(&rtxn, &hash).unwrap().is_none());
+            assert!(chain.block_retarget.get(&rtxn, &hash).unwrap().is_none());
+            let key = height_key(block.header.height, hash);
+            assert!(chain.block_heights.get(&rtxn, &key).unwrap().is_none());
+        }
+        // Every active-chain block is still there to be served.
+        for block in &active {
+            assert!(chain.blocks.get(&rtxn, &block.header.hash()).unwrap().is_some());
+        }
+        drop(rtxn);
+
+        for _ in 0..TEST_MAX_REORG_DEPTH {
+            unwind_committed(&storage, &mut chain);
+        }
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.tip_hash(&rtxn).unwrap(), active[2].header.hash());
+    }
+
+    /// `BlockReader` sees the active chain by height, follows unwinds,
+    /// and can fetch any stored block -- including a side branch's.
+    #[test]
+    fn block_reader_tracks_the_active_chain() {
+        let (_dir, storage, mut chain) = open();
+        let reader = BlockReader::open(&storage).unwrap();
+        assert_eq!(reader.tip().unwrap(), None);
+
+        let mut active = Vec::new();
+        for i in 0..3u8 {
+            let (_sk, pk) = keypair(1 + i);
+            let block = built_proved_and_mined(&mut chain, &[reward_transaction(&pk, 50)]);
+            chain.apply_block(&block).unwrap();
+            active.push(block);
+        }
+        let side = build_chain(1, 99).into_iter().next().unwrap();
+        chain.accept_block(side.clone()).unwrap();
+
+        assert_eq!(reader.tip().unwrap(), Some((2, active[2].header.hash())));
+        for (height, block) in active.iter().enumerate() {
+            assert_eq!(reader.active_hash_at(height as u64).unwrap(), Some(block.header.hash()));
+            assert_eq!(reader.block_bytes(block.header.hash()).unwrap(), Some(block.to_bytes()));
+        }
+        assert!(reader.has_block(side.header.hash()).unwrap());
+        assert_eq!(reader.active_hash_at(3).unwrap(), None);
+
+        unwind_committed(&storage, &mut chain);
+        assert_eq!(reader.tip().unwrap(), Some((1, active[1].header.hash())));
+        assert_eq!(reader.active_hash_at(2).unwrap(), None);
+    }
+
+    /// The retargeting rule, as a pure function, must agree with what
+    /// the active chain actually stores block by block.
+    #[test]
+    fn stored_retarget_state_matches_the_active_chains_own() {
+        let (_dir, storage, mut chain) = open();
+        apply_ten(&mut chain, 1);
+
+        let rtxn = storage.read_txn().unwrap();
+        let tip = chain.tip_hash(&rtxn).unwrap();
+        let stored = chain.retarget_state_after(&rtxn, tip).unwrap();
+        assert_eq!(stored.target, chain.current_target(&rtxn).unwrap());
+        assert_eq!(stored.anchor_timestamp, chain.anchor_timestamp(&rtxn).unwrap());
+    }
+
+    /// Overwrite `block`'s nonce with successive values until `accept`
+    /// says yes -- for crafting a header whose proof of work lands in a
+    /// specific band of targets.
+    fn renonce_until(block: &mut Block, accept: impl Fn(&BlockHeader) -> bool) {
+        for n in 0u64..1_000_000 {
+            block.header.nonce = [0u8; 32];
+            block.header.nonce[24..].copy_from_slice(&n.to_be_bytes());
+            if accept(&block.header) {
+                return;
+            }
+        }
+        panic!("no nonce found in range");
+    }
+
+    #[test]
+    fn an_orphan_with_too_little_work_is_refused_and_not_pooled() {
+        let (_dir, storage, mut chain) = open();
+        let rtxn = storage.read_txn().unwrap();
+        let orphan_target = chain.orphan_target(&rtxn).unwrap();
+        drop(rtxn);
+
+        let mut orphan = build_chain(2, 1).into_iter().nth(1).unwrap();
+        renonce_until(&mut orphan, |header| !header.pow_valid(&orphan_target, &crate::pow::Params::TEST));
+
+        assert!(matches!(chain.accept_block(orphan), Err(Error::OrphanPowTooWeak)));
+        assert!(chain.orphans.is_empty());
+    }
+
+    /// An orphan that misses the current target but meets the relaxed
+    /// one is still pooled -- the tolerance for a legitimately easier
+    /// chain just past a retarget.
+    #[test]
+    fn an_orphan_meeting_only_the_relaxed_target_is_still_pooled() {
+        let (_dir, storage, mut chain) = open();
+        let rtxn = storage.read_txn().unwrap();
+        let current_target = chain.current_target(&rtxn).unwrap();
+        let orphan_target = chain.orphan_target(&rtxn).unwrap();
+        drop(rtxn);
+        assert!(orphan_target > current_target);
+
+        let mut orphan = build_chain(2, 1).into_iter().nth(1).unwrap();
+        renonce_until(&mut orphan, |header| {
+            header.pow_valid(&orphan_target, &crate::pow::Params::TEST) && !header.pow_valid(&current_target, &crate::pow::Params::TEST)
+        });
+
+        assert_eq!(chain.accept_block(orphan).unwrap(), AcceptOutcome::Orphaned);
+    }
+
+    /// Each block's timestamp must be strictly later than its parent's:
+    /// equal or earlier is rejected, one millisecond later is fine.
+    #[test]
+    fn a_timestamp_must_be_strictly_later_than_the_parents() {
+        let (_dir, storage, mut chain) = open();
+        let (_sk, pk) = keypair(1);
+        let first = built_proved_and_mined_at(&mut chain, &[reward_transaction(&pk, 50)], 1_000_000);
+        chain.apply_block(&first).unwrap();
+
+        let (_sk2, pk2) = keypair(2);
+        for timestamp in [1_000_000, 999_999] {
+            let block = built_proved_and_mined_at(&mut chain, &[reward_transaction(&pk2, 50)], timestamp);
+            assert!(matches!(chain.apply_block(&block), Err(Error::TimestampNotAfterParent)), "at {timestamp}");
+        }
+        let block = built_proved_and_mined_at(&mut chain, &[reward_transaction(&pk2, 50)], 1_000_001);
+        chain.apply_block(&block).unwrap();
+
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.tip_hash(&rtxn).unwrap(), block.header.hash());
+    }
+
+    /// The same rule holds for a block arriving on a side branch.
+    #[test]
+    fn a_side_branch_block_must_also_be_later_than_its_parent() {
+        let (_dir, _storage, mut chain) = open();
+        let (_builder_dir, _builder_storage, mut builder) = open();
+        let (_sk, pk) = keypair(1);
+        let shared = built_proved_and_mined_at(&mut chain, &[reward_transaction(&pk, 50)], 1_000_000);
+        chain.apply_block(&shared).unwrap();
+        builder.apply_block(&shared).unwrap();
+        let (_sk2, pk2) = keypair(2);
+        let active = built_proved_and_mined_at(&mut chain, &[reward_transaction(&pk2, 50)], 1_000_010);
+        chain.apply_block(&active).unwrap();
+
+        // A competing child of `shared`, stamped before it. `builder`
+        // never applies it, only builds it.
+        let (_sk3, pk3) = keypair(3);
+        let backdated = built_proved_and_mined_at(&mut builder, &[reward_transaction(&pk3, 50)], 999_000);
+        assert!(matches!(chain.accept_block(backdated), Err(Error::TimestampNotAfterParent)));
+    }
+
+    /// `build_block` tells the miner the earliest timestamp it may use,
+    /// and `finish` never stamps anything earlier -- even when the parent
+    /// claims a time ahead of this node's clock.
+    #[test]
+    fn build_block_carries_the_minimum_timestamp_forward() {
+        let (_dir, _storage, mut chain) = open();
+        let (_sk, pk) = keypair(1);
+        let ahead = now_millis() + 60_000; // within MAX_FUTURE_DRIFT_MS
+        let first = built_proved_and_mined_at(&mut chain, &[reward_transaction(&pk, 50)], ahead);
+        chain.apply_block(&first).unwrap();
+
+        let (_sk2, pk2) = keypair(2);
+        let transactions = [reward_transaction(&pk2, 50)];
+        let unproven = chain.build_block(&transactions).unwrap();
+        assert_eq!(unproven.min_timestamp, ahead + 1);
+        let target = unproven.target;
+        let proof = prover::Proof::placeholder();
+        let mut block = unproven.finish(proof);
+        assert_eq!(block.header.timestamp, ahead + 1);
+        assert!(mine_block(&mut block, &target, 100_000, &crate::pow::Params::TEST));
+        chain.apply_block(&block).unwrap();
+    }
+
+    /// `build_debug_block` (`--debug-disable-verification`): a block of
+    /// bare new outputs, then one spending every one of them and making
+    /// as many more -- each applied by a chain skipping proofs, its state
+    /// what the header says. A commitment that isn't unspent can't be
+    /// spent.
+    #[test]
+    fn debug_blocks_fan_out_then_spend_it_all() {
+        let (_dir, _storage, mut chain) = open();
+        let made = |tag: u32| -> Vec<([u8; 32], [u8; NONCE_LEN])> {
+            (0..300u32)
+                .map(|i| {
+                    let mut c = [0u8; 32];
+                    c[..4].copy_from_slice(&(i + 1).to_le_bytes());
+                    c[4..8].copy_from_slice(&tag.to_le_bytes());
+                    (c, [i as u8; NONCE_LEN])
+                })
+                .collect()
+        };
+        let mine = |chain: &mut Chain, unproven: UnprovenBlock| {
+            let target = unproven.target;
+            let mut block = unproven.finish(prover::Proof::placeholder());
+            assert!(mine_block(&mut block, &target, 100_000, &crate::pow::Params::TEST));
+            chain.apply_block(&block).unwrap();
+            block
+        };
+        let (_sk, pk) = keypair(1);
+        let fan = chain.build_debug_block(&[reward_transaction(&pk, 50)], &[], &made(5)).unwrap();
+        let fan = mine(&mut chain, fan);
+        assert_eq!((fan.body.inputs.len(), fan.body.outputs.len()), (0, 301));
+
+        let spend: Vec<[u8; 32]> = made(5).iter().map(|(c, _)| *c).collect();
+        let (_sk2, pk2) = keypair(2);
+        let big = chain.build_debug_block(&[reward_transaction(&pk2, 50)], &spend, &made(6)).unwrap();
+        let big = mine(&mut chain, big);
+        assert_eq!((big.body.inputs.len(), big.body.outputs.len()), (300, 301));
+        assert_eq!(big.header.output_count, fan.header.output_count + 301);
+        assert!(big.body.is_canonically_ordered());
+
+        // Spent now: not again.
+        assert!(matches!(chain.build_debug_block(&[], &spend[..1], &[]), Err(Error::UnresolvedInput(_))));
+    }
+
+    /// With a fixed genesis, no other block is ever accepted at height 0
+    /// -- not even as a side branch.
+    #[test]
+    fn a_chain_with_a_fixed_genesis_refuses_any_other_first_block() {
+        let (_builder_dir, _builder_storage, mut builder) = open();
+        let (_sk, pk) = keypair(1);
+        let genesis = built_proved_and_mined(&mut builder, &[reward_transaction(&pk, 50)]);
+        let (_other_dir, _other_storage, mut other_builder) = open();
+        let (_sk2, pk2) = keypair(2);
+        let impostor = built_proved_and_mined(&mut other_builder, &[reward_transaction(&pk2, 50)]);
+
+        let dir = TempDir::new();
+        let storage = Storage::open(&dir.0).unwrap();
+        let mut chain = Chain::open(&storage, DifficultyConfig::for_tests(), TEST_MAX_REORG_DEPTH, Some(&genesis)).unwrap();
+        chain.skip_proof_checks();
+        let rtxn = storage.read_txn().unwrap();
+        assert_eq!(chain.tip_hash(&rtxn).unwrap(), genesis.header.hash());
+        drop(rtxn);
+
+        assert!(matches!(chain.accept_block(impostor), Err(Error::WrongGenesis)));
+        assert_eq!(chain.accept_block(genesis).unwrap(), AcceptOutcome::AlreadyKnown);
+    }
+
+    /// With proof checks on (as outside tests they always are), a block
+    /// carrying a real proof of its transactions is accepted, and the same
+    /// block with a placeholder proof in its place is refused.
+    /// Proves a real block (a chunk proof and its wrap): minutes; run
+    /// with `cargo test --release -- --ignored a_chain_checking_proofs`.
+    #[test]
+    #[ignore]
+    fn a_chain_checking_proofs_accepts_only_a_really_proven_block() {
+        let dir = TempDir::new();
+        let storage = Storage::open(&dir.0).unwrap();
+        let mut chain = Chain::open(&storage, DifficultyConfig::for_tests(), TEST_MAX_REORG_DEPTH, None).unwrap();
+        let (_sk, pk) = keypair(1);
+        let transactions = [reward_transaction(&pk, prover::REWARD)];
+
+        let unproven = chain.build_block(&transactions).unwrap();
+        let target = unproven.target;
+        let min_timestamp = unproven.min_timestamp;
+        let proof = prover::prove_block(&unproven.inputs, &unproven.outputs, &unproven.nonces, &transactions, &unproven.plan, [3; 32]).unwrap();
+        let mut real = unproven.finish(proof);
+        real.header.timestamp = real.header.timestamp.max(min_timestamp);
+        assert!(mine_block(&mut real, &target, 100_000, &crate::pow::Params::TEST));
+
+        let mut fake = real.clone();
+        fake.body.proof = prover::Proof::placeholder();
+        fake.header.body_hash = fake.body.body_hash();
+        assert!(mine_block(&mut fake, &target, 100_000, &crate::pow::Params::TEST));
+        assert!(matches!(chain.apply_block(&fake), Err(Error::InvalidBlock)));
+
+        chain.apply_block(&real).unwrap();
+    }
+}
