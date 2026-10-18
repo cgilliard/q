@@ -50,6 +50,15 @@ run() {
 	rm -f "$stream"
 }
 
+PROGS=""
+prog() {  # prog NAME SOURCES... — build bin/NAME.bin and add it to the store as NAME
+	name=$1; shift
+	out=bin/$name.bin
+	echo "Building $* → $out" >&2
+	./tools/fam --prog -o "$out" "$@"
+	PROGS="$PROGS $name=$out"
+}
+
 # fsize FILE — size in bytes.  Portable: GNU stat spells it `-c %s`, BSD/macOS
 # `-f %z`; `wc -c` works everywhere (tr strips BSD wc's leading padding).
 fsize() { wc -c < "$1" | tr -d ' \t'; }
@@ -111,19 +120,34 @@ run bin/gen_hash bin/fam lib/stdlib.fam lib/asm.fam src/gen_hash.fam
 run bin/tabernacle.uncompressed bin/fam0 src/tabernacle.fam0
 run bin/kernel.bin bin/fam lib/stdlib.fam lib/build.fam `cat scripts/files.txt`
 
-# the programs the node installs in its store at boot (src/exec.fam)
-./tools/fam --prog -o bin/init.bin prog/init.fam
-./tools/fam --prog -o bin/sh.bin lib/pkv.fam prog/sh.fam
-./tools/fam --prog -o bin/cat.bin prog/cat.fam
-./tools/fam --prog -o bin/echo.bin prog/echo.fam
-./tools/fam --prog -o bin/mkdir.bin prog/mkdir.fam
-./tools/fam --prog -o bin/rm.bin prog/rm.fam
-./tools/fam --prog -o bin/edit.bin lib/pvt.fam prog/edit.fam
-./tools/fam --prog -o bin/famw.bin prog/fam.fam
-./tools/fam --prog -o bin/uart.bin prog/uart.fam
-./tools/fam --prog -o bin/mv.bin prog/mv.fam
-./tools/fam --prog -o bin/wm.bin lib/pnet.fam src/eth.fam src/ip.fam src/udp.fam src/tcp.fam lib/pstack.fam lib/pkv.fam lib/pterm.fam prog/http.fam prog/wm.fam
-./scripts/progs.sh bin/progs.blob init=bin/init.bin wm=bin/wm.bin sh=bin/sh.bin cat=bin/cat.bin echo=bin/echo.bin mkdir=bin/mkdir.bin rm=bin/rm.bin edit=bin/edit.bin fam=bin/famw.bin uart=bin/uart.bin mv=bin/mv.bin cp=bin/mv.bin famc=bin/fam.uncompressed /lib/stdlib.fam=lib/stdlib.fam /lib/build.fam=lib/build.fam /lib/sys.fam=lib/sys.fam
+# the programs the node installs in its store at boot (src/exec.fam), in the
+# store's order
+prog init prog/init.fam
+prog wm lib/pnet.fam \
+	src/eth.fam \
+	src/ip.fam \
+	src/udp.fam \
+	src/tcp.fam \
+	lib/pstack.fam \
+	lib/pkv.fam \
+	lib/pterm.fam \
+	prog/http.fam \
+	prog/wm.fam
+prog sh lib/pkv.fam prog/sh.fam
+prog cat prog/cat.fam
+prog echo prog/echo.fam
+prog mkdir prog/mkdir.fam
+prog rm prog/rm.fam
+prog edit lib/pvt.fam prog/edit.fam
+prog fam prog/fam.fam
+prog uart prog/uart.fam
+prog mv prog/mv.fam
+./scripts/progs.sh bin/progs.blob $PROGS \
+	cp=bin/mv.bin \
+	famc=bin/fam.uncompressed \
+		/lib/stdlib.fam=lib/stdlib.fam \
+		/lib/build.fam=lib/build.fam \
+		/lib/sys.fam=lib/sys.fam
 
 # the image padded to a page (the stdlib's init starts the data on one), 20 KiB
 # of zeros over the node's RID stack and variables (the image is not loaded
